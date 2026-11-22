@@ -1,11 +1,16 @@
-"""Acta Compiler v1.5 Cryptographic Primitives & Offline Epistemic Notary Verifier.
+"""Acta Compiler v1.6.0 Cryptographic Primitives, RFC 6962 Merkle Verifier & Epistemic Notary.
 
 Bit-for-bit compatible with Rust `acta-crypto`:
 - RFC 8785 JSON Canonicalization Scheme (JCS) (`serde_jcs`)
 - 8-byte little-endian length-delimited BLAKE3 hashing (Invariant 5)
 - `ResolverManifest` threshold & policy root verification inside `ContextBundle`
 - Strip/tamper-proof `RefusalMetadata` (`b"acta:refusal_meta:v2"`) & `b"acta:evidence_event:v2"`
-- Signed `OverrideAttestation` (`b"acta:override:v1"` + `b"acta:override_sig:v1"`) verification
+- Signed `OverrideAttestation` (`b"acta:override:v1"`, `b"acta:override_sig:v1"`, `b"acta:override_client_sig:v1"`)
+  and `LapsedOverrideRef` provenance verification on re-escalated disputes
+- Principal-bound OAuth 2.1 tokens (`acta_tk_v1:<tenant>:<github_login>:<mac>`, `b"acta:tenant_user_token:v2"`)
+- RFC 6962 Merkle `SignedTreeHead` checkpoints (`b"acta:checkpoint:v1"`, `b"acta:checkpoint_sig:v1"`),
+  `O(log N)` inclusion & consistency proofs, external witness cosignatures (`b"acta:witness_sig:v1"`),
+  and `--dump-preimages` digest inspection
 - Strict Ed25519 signature verification rejecting all 8 torsion low-order keys
   and non-canonical `S >= L` signature scalars (`ed25519_dalek::verify_strict`).
 """
@@ -380,6 +385,50 @@ def compute_claim_content_hash(claim: Mapping[str, Any]) -> bytes:
     )
 
 
+def compute_override_client_intent_hash(
+    tenant_id: str,
+    scope: str,
+    winning_claim_id: str | uuid.UUID,
+    adjudicator_id: str,
+    justification: str,
+) -> bytes:
+    """Clock-free client-intent digest (`b"acta:override_client_sig:v1"`) for offline human/committee Ed25519 keys."""
+    winning_uid = (
+        winning_claim_id
+        if isinstance(winning_claim_id, uuid.UUID)
+        else uuid.UUID(str(winning_claim_id))
+    )
+    t_clean = tenant_id.strip()
+    adj_clean = adjudicator_id.strip()
+    eff_actor = adj_clean if "::" in adj_clean else f"{t_clean}::{adj_clean}"
+    return hash_length_delimited(
+        [
+            b"acta:override_client_sig:v1",
+            t_clean.encode("utf-8"),
+            scope.strip().encode("utf-8"),
+            winning_uid.bytes,
+            eff_actor.encode("utf-8"),
+            justification.strip().encode("utf-8"),
+        ]
+    )
+
+
+def sign_override_client_intent(
+    private_key_seed: bytes | str,
+    *,
+    tenant_id: str,
+    scope: str,
+    winning_claim_id: str | uuid.UUID,
+    adjudicator_id: str,
+    justification: str,
+) -> tuple[str, str]:
+    """Signs an offline human/committee override intent and returns `(client_signature_hex, client_public_key_hex)`."""
+    digest = compute_override_client_intent_hash(
+        tenant_id, scope, winning_claim_id, adjudicator_id, justification
+    )
+    return sign_client_content_hash(private_key_seed, digest)
+
+
 def compute_override_attestation_hash(att: Mapping[str, Any]) -> bytes:
     att_id = uuid.UUID(str(att["id"]))
     winning_id = uuid.UUID(str(att["winning_claim_id"]))
@@ -488,6 +537,202 @@ def compute_evidence_event_hash(
     )
 
 
+# ==============================================================================
+# Acta v1.6 RFC 6962 Binary Merkle Tree, Checkpoints & External Witness Anchors
+# ==============================================================================
+def merkle_empty_root() -> bytes:
+    return hash_length_delimited([b"acta:merkle_empty:v1"])
+
+
+def merkle_leaf_hash(seq_num: int, event_hash: bytes | str) -> bytes:
+    ev_raw = _as_hash32(event_hash)
+    return hash_length_delimited(
+        [b"acta:merkle_leaf:v1", struct.pack("<q", int(seq_num)), ev_raw]
+    )
+
+
+def merkle_node_hash(left: bytes | str, right: bytes | str) -> bytes:
+    return hash_length_delimited(
+        [b"acta:merkle_node:v1", _as_hash32(left), _as_hash32(right)]
+    )
+
+
+def _largest_pow2_lt(n: int) -> int:
+    return 1 << ((n - 1).bit_length() - 1)
+
+
+def compute_merkle_root_from_leaves(leaves: Sequence[bytes | str]) -> bytes:
+    norm = [_as_hash32(x) for x in leaves]
+    n = len(norm)
+    if n == 0:
+        return merkle_empty_root()
+    if n == 1:
+        return norm[0]
+    k = _largest_pow2_lt(n)
+    left = compute_merkle_root_from_leaves(norm[:k])
+    right = compute_merkle_root_from_leaves(norm[k:])
+    return merkle_node_hash(left, right)
+
+
+def _inclusion_path_slice(leaves: list[bytes], index: int, out: list[bytes]) -> None:
+    n = len(leaves)
+    if n <= 1:
+        return
+    k = _largest_pow2_lt(n)
+    if index < k:
+        _inclusion_path_slice(leaves[:k], index, out)
+        out.append(compute_merkle_root_from_leaves(leaves[k:]))
+    else:
+        _inclusion_path_slice(leaves[k:], index - k, out)
+        out.append(compute_merkle_root_from_leaves(leaves[:k]))
+
+
+def compute_merkle_inclusion_proof(
+    leaves: Sequence[bytes | str],
+    leaf_index: int,
+) -> list[bytes]:
+    norm = [_as_hash32(x) for x in leaves]
+    if not norm or leaf_index < 0 or leaf_index >= len(norm):
+        raise ValueError(f"leaf_index {leaf_index} out of bounds for tree_size {len(norm)}")
+    out: list[bytes] = []
+    _inclusion_path_slice(norm, leaf_index, out)
+    return out
+
+
+def verify_merkle_inclusion_proof(
+    seq_num: int,
+    event_hash: bytes | str,
+    tree_size: int,
+    audit_path: Sequence[bytes | str],
+    expected_root: bytes | str,
+) -> bool:
+    if seq_num < 1 or tree_size < 1 or seq_num > tree_size:
+        return False
+    r = merkle_leaf_hash(seq_num, event_hash)
+    exp_raw = _as_hash32(expected_root)
+    path_raw = [_as_hash32(node) for node in audit_path]
+    if tree_size == 1:
+        return len(path_raw) == 0 and r == exp_raw
+
+    fn_idx = seq_num - 1
+    sn = tree_size - 1
+    for sibling in path_raw:
+        if sn == 0:
+            return False
+        if (fn_idx & 1) == 1 or fn_idx == sn:
+            r = merkle_node_hash(sibling, r)
+            while (fn_idx & 1) == 0:
+                fn_idx >>= 1
+                sn >>= 1
+        else:
+            r = merkle_node_hash(r, sibling)
+        fn_idx >>= 1
+        sn >>= 1
+    return sn == 0 and r == exp_raw
+
+
+def _subproof_slice(
+    m: int,
+    leaves: list[bytes],
+    is_complete_subtree: bool,
+    out: list[bytes],
+) -> None:
+    n = len(leaves)
+    if m == n:
+        if not is_complete_subtree:
+            out.append(compute_merkle_root_from_leaves(leaves))
+        return
+    k = _largest_pow2_lt(n)
+    if m <= k:
+        _subproof_slice(m, leaves[:k], is_complete_subtree, out)
+        out.append(compute_merkle_root_from_leaves(leaves[k:]))
+    else:
+        _subproof_slice(m - k, leaves[k:], False, out)
+        out.append(compute_merkle_root_from_leaves(leaves[:k]))
+
+
+def compute_merkle_consistency_proof(
+    leaves: Sequence[bytes | str],
+    first_size: int,
+    second_size: int,
+) -> list[bytes]:
+    norm = [_as_hash32(x) for x in leaves]
+    if first_size < 1 or first_size > second_size or second_size > len(norm):
+        raise ValueError(
+            f"invalid consistency proof bounds: first={first_size}, second={second_size}, available={len(norm)}"
+        )
+    if first_size == second_size:
+        return []
+    out: list[bytes] = []
+    _subproof_slice(first_size, norm[:second_size], True, out)
+    return out
+
+
+def verify_merkle_consistency_proof(
+    first_size: int,
+    first_root: bytes | str,
+    second_size: int,
+    second_root: bytes | str,
+    proof: Sequence[bytes | str],
+) -> bool:
+    if first_size < 1 or second_size < first_size:
+        return False
+    f_raw = _as_hash32(first_root)
+    s_raw = _as_hash32(second_root)
+    p_raw = [_as_hash32(node) for node in proof]
+    if first_size == second_size:
+        return len(p_raw) == 0 and f_raw == s_raw
+    if not p_raw:
+        return False
+
+    is_pow2 = (first_size & (first_size - 1)) == 0
+    chain = ([f_raw] if is_pow2 else []) + p_raw
+
+    fn_idx = first_size - 1
+    sn = second_size - 1
+    while (fn_idx & 1) == 1:
+        fn_idx >>= 1
+        sn >>= 1
+
+    fr = chain[0]
+    sr = chain[0]
+    for node in chain[1:]:
+        if sn == 0:
+            return False
+        if (fn_idx & 1) == 1 or fn_idx == sn:
+            fr = merkle_node_hash(node, fr)
+            sr = merkle_node_hash(node, sr)
+            while (fn_idx & 1) == 0:
+                fn_idx >>= 1
+                sn >>= 1
+        else:
+            sr = merkle_node_hash(sr, node)
+        fn_idx >>= 1
+        sn >>= 1
+
+    return sn == 0 and fr == f_raw and sr == s_raw
+
+
+def compute_checkpoint_hash(
+    tenant_id: str,
+    tree_size: int,
+    head_event_hash: bytes | str,
+    merkle_root: bytes | str,
+    issued_at: int | str | datetime.datetime,
+) -> bytes:
+    micros = issued_at if isinstance(issued_at, int) else parse_rfc3339_micros(issued_at)
+    return hash_length_delimited(
+        [
+            b"acta:checkpoint:v1",
+            tenant_id.encode("utf-8"),
+            struct.pack("<q", int(tree_size)),
+            _as_hash32(head_event_hash),
+            _as_hash32(merkle_root),
+            struct.pack("<q", micros),
+        ]
+    )
+
+
 def evidence_signing_preimage(
     tenant: str,
     seq_num: int,
@@ -519,6 +764,31 @@ def override_signing_preimage(
             tenant.encode("utf-8"),
             struct.pack("<q", int(evidence_seq_num)),
             att_raw,
+        ]
+    )
+
+
+def checkpoint_signing_preimage(tenant: str, checkpoint_hash: bytes | str) -> bytes:
+    return hash_length_delimited(
+        [
+            b"acta:checkpoint_sig:v1",
+            tenant.encode("utf-8"),
+            _as_hash32(checkpoint_hash),
+        ]
+    )
+
+
+def witness_anchor_signing_preimage(
+    tenant: str,
+    tree_size: int,
+    checkpoint_hash: bytes | str,
+) -> bytes:
+    return hash_length_delimited(
+        [
+            b"acta:witness_sig:v1",
+            tenant.encode("utf-8"),
+            struct.pack("<q", int(tree_size)),
+            _as_hash32(checkpoint_hash),
         ]
     )
 
@@ -568,6 +838,88 @@ def verify_override_signature(
     sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
     digest = override_signing_preimage(tenant, evidence_seq_num, attestation_hash)
     return verify_ed25519_strict(pk_raw, digest, sig_raw)
+
+
+def verify_checkpoint_signature(
+    pubkey: bytes | str,
+    tenant: str,
+    checkpoint_hash: bytes | str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = bytes.fromhex(pubkey) if isinstance(pubkey, str) else bytes(pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    digest = checkpoint_signing_preimage(tenant, checkpoint_hash)
+    return verify_ed25519_strict(pk_raw, digest, sig_raw)
+
+
+def verify_witness_anchor_signature(
+    witness_pubkey: bytes | str,
+    tenant: str,
+    tree_size: int,
+    checkpoint_hash: bytes | str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = bytes.fromhex(witness_pubkey) if isinstance(witness_pubkey, str) else bytes(witness_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    digest = witness_anchor_signing_preimage(tenant, tree_size, checkpoint_hash)
+    return verify_ed25519_strict(pk_raw, digest, sig_raw)
+
+
+def verify_signed_tree_head(
+    sth: Mapping[str, Any],
+    expected_tenant: str,
+    expected_pubkey: bytes | str,
+) -> int:
+    """Verifies a `SignedTreeHead` checkpoint and all attached external witness cosignatures."""
+    if str(sth["tenant_id"]) != expected_tenant:
+        raise ValueError(
+            f"checkpoint tenant_id '{sth['tenant_id']}' != expected '{expected_tenant}'"
+        )
+    tree_size = int(sth["tree_size"])
+    if tree_size < 1:
+        raise ValueError(f"invalid checkpoint tree_size={tree_size}")
+
+    recomputed_cp = compute_checkpoint_hash(
+        str(sth["tenant_id"]),
+        tree_size,
+        sth["head_event_hash"],
+        sth["merkle_root"],
+        sth["issued_at"],
+    )
+    stored_cp_hex = str(sth["checkpoint_hash"]).lower()
+    if recomputed_cp.hex() != stored_cp_hex:
+        raise ValueError(
+            f"tampered SignedTreeHead: recomputed checkpoint_hash {recomputed_cp.hex()} != stored {stored_cp_hex}"
+        )
+    if not verify_checkpoint_signature(
+        expected_pubkey,
+        str(sth["tenant_id"]),
+        recomputed_cp,
+        sth["host_signature"],
+    ):
+        raise ValueError("Ed25519 host_signature verification failed on SignedTreeHead")
+
+    anchors = sth.get("witness_anchors") or []
+    for anchor in anchors:
+        if (
+            str(anchor["tenant_id"]) != str(sth["tenant_id"])
+            or int(anchor["tree_size"]) != tree_size
+            or str(anchor["checkpoint_hash"]).lower() != stored_cp_hex
+        ):
+            raise ValueError(
+                f"witness_anchor[id={anchor.get('id')}] metadata mismatch against SignedTreeHead"
+            )
+        if not verify_witness_anchor_signature(
+            anchor["witness_public_key"],
+            str(anchor["tenant_id"]),
+            tree_size,
+            recomputed_cp,
+            anchor["witness_signature"],
+        ):
+            raise ValueError(
+                f"Ed25519 witness_signature verification failed on witness_anchor[id={anchor.get('id')}, witness={anchor.get('witness_id')}]"
+            )
+    return len(anchors)
 
 
 def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str) -> None:
@@ -660,6 +1012,39 @@ def sign_override_attestation(
     return sk.sign(digest)
 
 
+def sign_checkpoint_head(
+    private_key_seed: bytes | str,
+    tenant: str,
+    checkpoint_hash: bytes | str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(private_key_seed)
+        if isinstance(private_key_seed, str)
+        else bytes(private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    digest = checkpoint_signing_preimage(tenant, checkpoint_hash)
+    return sk.sign(digest)
+
+
+def sign_witness_anchor(
+    witness_private_key_seed: bytes | str,
+    tenant: str,
+    tree_size: int,
+    checkpoint_hash: bytes | str,
+) -> tuple[str, str]:
+    """Signs `(tenant, tree_size, checkpoint_hash)` (`b"acta:witness_sig:v1"`) and returns `(sig_hex, pubkey_hex)`."""
+    seed = (
+        bytes.fromhex(witness_private_key_seed)
+        if isinstance(witness_private_key_seed, str)
+        else bytes(witness_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    pk_hex = _ed25519_pubkey_raw(sk.public_key()).hex()
+    digest = witness_anchor_signing_preimage(tenant, tree_size, checkpoint_hash)
+    return sk.sign(digest).hex(), pk_hex
+
+
 def sign_client_content_hash(private_key_seed: bytes | str, content_hash: bytes | str) -> tuple[str, str]:
     seed = (
         bytes.fromhex(private_key_seed)
@@ -696,6 +1081,40 @@ class VerificationSummary:
     verified_refusals: int = 0
     non_default_thresholds: bool = False
     resolver_manifest: Mapping[str, Any] | None = None
+    verification_mode: str = "full_chain"
+    merkle_tree_size: int | None = None
+    merkle_root_hex: str | None = None
+    verified_witness_anchors: int = 0
+
+
+def _verify_entry_inclusion(
+    proof: Mapping[str, Any],
+    sth: Mapping[str, Any],
+    expected_pk: bytes,
+) -> None:
+    entry = proof["entry"]
+    if str(entry["tenant_id"]) != str(sth["tenant_id"]):
+        raise ValueError(
+            f"evidence entry seq_num={entry['seq_num']} tenant_id '{entry['tenant_id']}' != checkpoint tenant_id '{sth['tenant_id']}'"
+        )
+    verify_evidence_entry(entry, expected_pk)
+    seq_num = int(entry["seq_num"])
+    tree_size = int(sth["tree_size"])
+    if not verify_merkle_inclusion_proof(
+        seq_num,
+        entry["event_hash"],
+        tree_size,
+        proof.get("audit_path", []),
+        sth["merkle_root"],
+    ):
+        raise ValueError(
+            f"Merkle inclusion proof failed for seq_num={seq_num} against tree_size={tree_size} merkle_root={sth['merkle_root']}"
+        )
+    if (
+        seq_num == tree_size
+        and str(entry["event_hash"]).lower() != str(sth["head_event_hash"]).lower()
+    ):
+        raise ValueError(f"head entry event_hash mismatch at tree_size={tree_size}")
 
 
 def verify_export_archive(
@@ -799,7 +1218,16 @@ def verify_export_archive(
         if csig is not None and cpk is not None:
             csig_raw = bytes.fromhex(csig) if isinstance(csig, str) else bytes(csig)
             cpk_raw = _as_hash32(cpk)
-            if not verify_ed25519_strict(cpk_raw, recomputed_att, csig_raw):
+            intent_hash = compute_override_client_intent_hash(
+                str(att["tenant_id"]),
+                str(att["scope"]),
+                str(att["winning_claim_id"]),
+                str(att["adjudicator_id"]),
+                str(att["justification"]),
+            )
+            ok_intent = verify_ed25519_strict(cpk_raw, intent_hash, csig_raw)
+            ok_full = verify_ed25519_strict(cpk_raw, recomputed_att, csig_raw)
+            if not ok_intent and not ok_full:
                 raise ValueError(
                     f"client Ed25519 signature verification failed on override_attestation[id={aid}]"
                 )
@@ -887,6 +1315,26 @@ def verify_export_archive(
                 raise ValueError(
                     f"tampered dispute_record candidate claim[id={cid}]: content_hash != verified claim"
                 )
+        lapsed = disp.get("lapsed_override")
+        if lapsed is not None:
+            aid = str(uuid.UUID(str(lapsed["attestation_id"]))).lower()
+            verified_att = overrides_by_id.get(aid)
+            if verified_att is None:
+                raise ValueError(
+                    f"dispute_record.lapsed_override references missing override_attestation[id={aid}]"
+                )
+            if (
+                str(verified_att["attestation_hash"]).lower()
+                != str(lapsed["attestation_hash"]).lower()
+                or str(uuid.UUID(str(verified_att["winning_claim_id"]))).lower()
+                != str(uuid.UUID(str(lapsed["prior_winning_claim_id"]))).lower()
+                or str(verified_att["adjudicator_id"]) != str(lapsed["adjudicator_id"])
+                or str(verified_att["justification"]) != str(lapsed["justification"])
+                or int(verified_att["evidence_seq_num"]) != int(lapsed["evidence_seq_num"])
+            ):
+                raise ValueError(
+                    f"tampered lapsed_override reference on dispute_record[id={aid}]"
+                )
 
     recomputed_bundle_hash, _ = compute_bundle_hash(bundle)
     archive_bundle_hex = str(archive["bundle_hash"]).lower()
@@ -895,12 +1343,14 @@ def verify_export_archive(
             f"tampered ContextBundle: recomputed bundle_hash {recomputed_bundle_hash.hex()} != archive bundle_hash {archive_bundle_hex}"
         )
 
-    evidence_chain = archive.get("evidence_chain", [])
-    if not evidence_chain:
-        raise ValueError("evidence_chain cannot be empty")
+    evidence_chain = archive.get("evidence_chain") or []
+    merkle_proof = archive.get("merkle_proof")
+    if not evidence_chain and merkle_proof is None:
+        raise ValueError("ExportArchive must contain either evidence_chain or merkle_proof")
 
     found_matching_bundle_entry = False
     verified_refusals = 0
+    verified_evidence_entries = 0
     evidence_by_seq: dict[int, Mapping[str, Any]] = {}
     zero_hex = "00" * 32
 
@@ -935,6 +1385,7 @@ def verify_export_archive(
             verified_refusals += 1
 
         verify_evidence_entry(entry, expected_pk)
+        verified_evidence_entries += 1
 
         eb_hash = entry.get("bundle_hash")
         if eb_hash is not None and str(eb_hash).lower() == recomputed_bundle_hash.hex():
@@ -947,12 +1398,65 @@ def verify_export_archive(
 
         evidence_by_seq[seq_num] = entry
 
+    merkle_tree_size: int | None = None
+    merkle_root_hex: str | None = None
+    verified_witness_anchors = 0
+
+    if merkle_proof is not None:
+        sth = merkle_proof["checkpoint"]
+        verified_witness_anchors = verify_signed_tree_head(
+            sth, str(bundle["tenant_id"]), expected_pk
+        )
+        b_proof = merkle_proof["bundle_entry_proof"]
+        _verify_entry_inclusion(b_proof, sth, expected_pk)
+        b_entry = b_proof["entry"]
+        if (
+            b_entry.get("bundle_hash") is None
+            or str(b_entry["bundle_hash"]).lower() != recomputed_bundle_hash.hex()
+            or b_entry.get("state_commitment") is None
+            or str(b_entry["state_commitment"]).lower() != str(bundle["state_commitment"]).lower()
+        ):
+            raise ValueError(
+                "merkle_proof.bundle_entry_proof does not bind archive bundle_hash and state_commitment"
+            )
+        found_matching_bundle_entry = True
+        b_seq = int(b_entry["seq_num"])
+        if not evidence_chain:
+            verified_evidence_entries += 1
+        evidence_by_seq[b_seq] = b_entry
+
+        for ovr_proof in merkle_proof.get("override_entry_proofs", []):
+            _verify_entry_inclusion(ovr_proof, sth, expected_pk)
+            o_entry = ovr_proof["entry"]
+            o_seq = int(o_entry["seq_num"])
+            if not evidence_chain and o_seq != b_seq:
+                verified_evidence_entries += 1
+            evidence_by_seq[o_seq] = o_entry
+
+        if (
+            evidence_chain
+            and int(evidence_chain[0]["seq_num"]) == 1
+            and len(evidence_chain) == int(sth["tree_size"])
+        ):
+            leaves = [
+                merkle_leaf_hash(int(e["seq_num"]), e["event_hash"])
+                for e in evidence_chain
+            ]
+            chain_root = compute_merkle_root_from_leaves(leaves).hex()
+            if chain_root != str(sth["merkle_root"]).lower():
+                raise ValueError(
+                    f"merkle_proof.checkpoint.merkle_root {sth['merkle_root']} != root {chain_root} computed from evidence_chain"
+                )
+
+        merkle_tree_size = int(sth["tree_size"])
+        merkle_root_hex = str(sth["merkle_root"]).lower()
+
     for aid, att in overrides_by_id.items():
         seq_ref = int(att["evidence_seq_num"])
         ev = evidence_by_seq.get(seq_ref)
         if ev is None:
             raise ValueError(
-                f"override_attestation[id={aid}] references missing evidence_chain seq_num={seq_ref}"
+                f"override_attestation[id={aid}] references missing verified evidence seq_num={seq_ref}"
             )
         ev_sc = ev.get("state_commitment")
         if ev_sc is None or str(ev_sc).lower() != str(att["attestation_hash"]).lower():
@@ -965,6 +1469,13 @@ def verify_export_archive(
             f"no verified evidence_history entry binds bundle_hash {recomputed_bundle_hash.hex()}"
         )
 
+    if evidence_chain and merkle_proof is not None:
+        v_mode = "full_chain_and_merkle"
+    elif evidence_chain:
+        v_mode = "full_chain"
+    else:
+        v_mode = "merkle_inclusion"
+
     non_default = bool(rm["non_default_thresholds"]) if rm is not None else False
 
     return VerificationSummary(
@@ -973,18 +1484,142 @@ def verify_export_archive(
         state_commitment_hex=str(bundle["state_commitment"]).lower(),
         verified_objects=len(objects_by_id),
         verified_claims=len(claims_by_id),
-        verified_evidence_entries=len(evidence_chain),
+        verified_evidence_entries=verified_evidence_entries,
         verified_overrides=len(overrides_by_id),
         verified_refusals=verified_refusals,
         non_default_thresholds=non_default,
         resolver_manifest=dict(rm) if isinstance(rm, Mapping) else None,
+        verification_mode=v_mode,
+        merkle_tree_size=merkle_tree_size,
+        merkle_root_hex=merkle_root_hex,
+        verified_witness_anchors=verified_witness_anchors,
     )
 
 
+def dump_archive_preimages(archive: Mapping[str, Any]) -> dict[str, Any]:
+    """Dumps explicit domain-separated cryptographic preimages inside `archive` (`--dump-preimages` parity)."""
+    bundle_jcs = to_canonical_bytes(archive["bundle"])
+    overrides_dump = []
+    for att in archive.get("override_attestations", []):
+        host_sig_digest = override_signing_preimage(
+            str(att["tenant_id"]),
+            int(att["evidence_seq_num"]),
+            att["attestation_hash"],
+        )
+        client_intent = compute_override_client_intent_hash(
+            str(att["tenant_id"]),
+            str(att["scope"]),
+            str(att["winning_claim_id"]),
+            str(att["adjudicator_id"]),
+            str(att["justification"]),
+        )
+        overrides_dump.append(
+            {
+                "id": str(uuid.UUID(str(att["id"]))).lower(),
+                "evidence_seq_num": int(att["evidence_seq_num"]),
+                "attestation_hash": str(att["attestation_hash"]).lower(),
+                "host_sig_preimage_domain": "acta:override_sig:v1",
+                "host_sig_digest_hex": host_sig_digest.hex(),
+                "client_sig_domain": "acta:override_client_sig:v1",
+                "client_sig_digest_hex": client_intent.hex(),
+            }
+        )
+
+    entries_src: list[Mapping[str, Any]] = []
+    if archive.get("evidence_chain"):
+        entries_src = list(archive["evidence_chain"])
+    elif archive.get("merkle_proof") is not None:
+        mp = archive["merkle_proof"]
+        entries_src = [mp["bundle_entry_proof"]["entry"]] + [
+            op["entry"] for op in mp.get("override_entry_proofs", [])
+        ]
+
+    evidence_dump = []
+    for entry in entries_src:
+        ev_domain = (
+            "acta:evidence_event:v1"
+            if entry.get("refusal_metadata") is None and entry.get("override_summary") is None
+            else "acta:evidence_event:v2"
+        )
+        sig_digest = evidence_signing_preimage(
+            str(entry["tenant_id"]),
+            int(entry["seq_num"]),
+            entry["prev_hash"],
+            entry["event_hash"],
+        )
+        refusal_jcs = (
+            to_canonical_json(_normalize_refusal_metadata(entry["refusal_metadata"]))
+            if entry.get("refusal_metadata") is not None
+            else None
+        )
+        evidence_dump.append(
+            {
+                "seq_num": int(entry["seq_num"]),
+                "event_domain": ev_domain,
+                "event_hash": str(entry["event_hash"]).lower(),
+                "merkle_leaf_hash": merkle_leaf_hash(
+                    int(entry["seq_num"]), entry["event_hash"]
+                ).hex(),
+                "host_sig_preimage_domain": "acta:evidence_sig:v1",
+                "host_sig_digest_hex": sig_digest.hex(),
+                "refusal_metadata_canonical_jcs": refusal_jcs,
+            }
+        )
+
+    mp_opt = archive.get("merkle_proof")
+    cp_dump = None
+    if mp_opt is not None:
+        sth = mp_opt["checkpoint"]
+        cp_sig_digest = checkpoint_signing_preimage(
+            str(sth["tenant_id"]), sth["checkpoint_hash"]
+        )
+        cp_dump = {
+            "tree_size": int(sth["tree_size"]),
+            "merkle_root": str(sth["merkle_root"]).lower(),
+            "checkpoint_hash": str(sth["checkpoint_hash"]).lower(),
+            "host_sig_preimage_domain": "acta:checkpoint_sig:v1",
+            "host_sig_digest_hex": cp_sig_digest.hex(),
+            "bundle_audit_path_len": len(mp_opt["bundle_entry_proof"].get("audit_path", [])),
+        }
+
+    return {
+        "bundle_domain": "acta:bundle:v1",
+        "bundle_canonical_jcs_len": len(bundle_jcs),
+        "bundle_hash": str(archive["bundle_hash"]).lower(),
+        "checkpoint": cp_dump,
+        "override_attestations": overrides_dump,
+        "evidence_entries": evidence_dump,
+    }
+
+
 # ==============================================================================
-# Acta v1.1 Stateless Keyed-BLAKE3 Tenant-Bound API Keys (`acta_tk_v1`)
+# Acta v1.1 / v1.6 Stateless Keyed-BLAKE3 Tenant & OAuth Principal Tokens
 # ==============================================================================
 TENANT_TOKEN_PREFIX = "acta_tk_v1:"
+
+
+def normalize_github_slug(raw: str) -> str:
+    trimmed = raw.strip().lstrip("@").lower()
+    out: list[str] = []
+    prev_dash = False
+    for ch in trimmed:
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in ("_", "."):
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    clean = "".join(out).strip("-")
+    if not clean or len(clean) > 100:
+        raise ValueError("GitHub organization/user slug must be 1..=100 valid characters")
+    return clean
+
+
+def _validate_token_segment(label: str, val: str) -> None:
+    if not val or len(val.encode("utf-8")) > 128:
+        raise ValueError(f"{label} must be 1..=128 bytes")
+    if any(ch.isspace() or ord(ch) < 32 or ch == ":" for ch in val):
+        raise ValueError(f"{label} cannot contain whitespace, control characters, or ':'")
 
 
 def derive_tenant_mac_key(master_api_key: str) -> bytes:
@@ -993,15 +1628,12 @@ def derive_tenant_mac_key(master_api_key: str) -> bytes:
     )
 
 
-def _tenant_token_preimage_parts(tenant_id: str) -> list[bytes]:
-    domain = b"acta:tenant_token:v1"
-    t_bytes = tenant_id.encode("utf-8")
-    return [
-        struct.pack("<Q", len(domain)),
-        domain,
-        struct.pack("<Q", len(t_bytes)),
-        t_bytes,
-    ]
+def _length_delimited_preimage_parts(parts: Sequence[bytes]) -> list[bytes]:
+    out: list[bytes] = []
+    for p in parts:
+        out.append(struct.pack("<Q", len(p)))
+        out.append(p)
+    return out
 
 
 def mint_tenant_api_key(master_api_key: str, tenant_id: str) -> str:
@@ -1010,38 +1642,104 @@ def mint_tenant_api_key(master_api_key: str, tenant_id: str) -> str:
     if not master_clean:
         raise ValueError("master_api_key must be non-empty")
     tenant_clean = tenant_id.strip()
-    if not tenant_clean or len(tenant_clean.encode("utf-8")) > 128:
-        raise ValueError("tenant_id must be 1..=128 bytes")
-    if any(ch.isspace() or ord(ch) < 32 or ch == ":" for ch in tenant_clean):
-        raise ValueError("tenant_id cannot contain whitespace, control characters, or ':'")
+    _validate_token_segment("tenant_id", tenant_clean)
 
     key_32 = derive_tenant_mac_key(master_clean)
-    mac = blake3_keyed_hash(key_32, _tenant_token_preimage_parts(tenant_clean))
+    mac = blake3_keyed_hash(
+        key_32,
+        _length_delimited_preimage_parts(
+            [b"acta:tenant_token:v1", tenant_clean.encode("utf-8")]
+        ),
+    )
     return f"{TENANT_TOKEN_PREFIX}{tenant_clean}:{mac.hex()}"
 
 
-def extract_token_tenant(token: str) -> str | None:
-    """Extracts `<tenant_id>` from an `acta_tk_v1:<tenant_id>:<mac>` token string (unverified)."""
+def mint_user_tenant_api_key(
+    master_api_key: str,
+    tenant_id: str,
+    github_login: str,
+) -> str:
+    """Mints a 3-segment principal-bound OAuth key `acta_tk_v1:<tenant_id>:<github_login>:<64_hex_mac>`."""
+    master_clean = master_api_key.strip()
+    if not master_clean:
+        raise ValueError("master_api_key must be non-empty")
+    tenant_clean = tenant_id.strip()
+    user_clean = normalize_github_slug(github_login)
+    _validate_token_segment("tenant_id", tenant_clean)
+    _validate_token_segment("github_login", user_clean)
+
+    key_32 = derive_tenant_mac_key(master_clean)
+    mac = blake3_keyed_hash(
+        key_32,
+        _length_delimited_preimage_parts(
+            [
+                b"acta:tenant_user_token:v2",
+                tenant_clean.encode("utf-8"),
+                user_clean.encode("utf-8"),
+            ]
+        ),
+    )
+    return f"{TENANT_TOKEN_PREFIX}{tenant_clean}:{user_clean}:{mac.hex()}"
+
+
+def _parse_acta_tk_segments(token: str) -> tuple[str, str | None, str] | None:
     clean = token.strip()
     if not clean.startswith(TENANT_TOKEN_PREFIX):
         return None
     rest = clean[len(TENANT_TOKEN_PREFIX) :]
-    sep = rest.rfind(":")
-    if sep <= 0:
+    parts = rest.split(":")
+    if len(parts) == 2:
+        tenant_part, mac_hex = parts
+        _validate_token_segment("tenant_id", tenant_part)
+        user_part: str | None = None
+    elif len(parts) == 3:
+        tenant_part, user_part, mac_hex = parts
+        _validate_token_segment("tenant_id", tenant_part)
+        _validate_token_segment("github_login", user_part)
+    else:
         raise ValueError("malformed acta_tk_v1 token")
-    tenant_part, mac_hex = rest[:sep], rest[sep + 1 :]
     if len(mac_hex) != 64:
         raise ValueError("malformed acta_tk_v1 token MAC length")
     bytes.fromhex(mac_hex)
-    return tenant_part
+    return tenant_part, user_part, mac_hex
+
+
+def extract_token_tenant(token: str) -> str | None:
+    """Extracts `<tenant_id>` from 2-segment or 3-segment `acta_tk_v1` tokens (unverified)."""
+    parsed = _parse_acta_tk_segments(token)
+    return parsed[0] if parsed is not None else None
+
+
+def extract_token_principal(token: str) -> str | None:
+    """Extracts `<github_login>` from 3-segment `acta_tk_v1:<tenant>:<login>:<mac>` tokens (unverified)."""
+    parsed = _parse_acta_tk_segments(token)
+    return parsed[1] if parsed is not None else None
+
+
+def verify_tenant_api_key_with_principal(
+    master_api_key: str,
+    token: str,
+) -> tuple[str, str | None]:
+    """Verifies a 2-segment or 3-segment `acta_tk_v1` token in constant time -> `(tenant_id, principal)`."""
+    parsed = _parse_acta_tk_segments(token)
+    if parsed is None:
+        raise ValueError("token does not start with acta_tk_v1:")
+    tenant_part, user_part, _ = parsed
+    expected_token = (
+        mint_tenant_api_key(master_api_key, tenant_part)
+        if user_part is None
+        else mint_user_tenant_api_key(master_api_key, tenant_part, user_part)
+    )
+    if not _hmac.compare_digest(
+        expected_token.encode("ascii"), token.strip().lower().encode("ascii")
+    ) and not _hmac.compare_digest(
+        expected_token.encode("ascii"), token.strip().encode("ascii")
+    ):
+        raise ValueError("invalid or forged tenant-bound API key MAC")
+    return tenant_part, user_part
 
 
 def verify_tenant_api_key(master_api_key: str, token: str) -> str:
     """Verifies an `acta_tk_v1` token in constant time and returns its bound `tenant_id`."""
-    tenant_part = extract_token_tenant(token)
-    if tenant_part is None:
-        raise ValueError("token does not start with acta_tk_v1:")
-    expected_token = mint_tenant_api_key(master_api_key, tenant_part)
-    if not _hmac.compare_digest(expected_token.encode("ascii"), token.strip().encode("ascii")):
-        raise ValueError("invalid or forged tenant-bound API key MAC")
+    tenant_part, _ = verify_tenant_api_key_with_principal(master_api_key, token)
     return tenant_part

@@ -1,10 +1,12 @@
-"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.5.
+"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.6.0.
 
 Features:
-- Stateless Keyed-BLAKE3 Tenant-Bound API Keys (`acta_tk_v1:<tenant_id>:<mac>`) + `X-Acta-Tenant` locking
+- Stateless Keyed-BLAKE3 Tenant & OAuth Principal Tokens (`acta_tk_v1:<tenant>[:<login>]:<mac>`) + `X-Acta-Tenant` locking
 - Automatic default `tenant_id` inference from `acta_tk_v1` keys so callers never mix up clients
 - Local BLAKE3 `event_hash` (`v1`/`v2`) + strict Ed25519 `host_signature` verification on every `compile()`
-- Signed Dispute-Override Attestations (`attest_override` / `list_overrides`) with local Ed25519 verification
+- Signed Dispute-Override Attestations (`attest_override` / `list_overrides`) with Principal-Bound OAuth or offline Ed25519 signatures
+- RFC 6962 Merkle `SignedTreeHead` checkpoints (`get_checkpoint`), `O(log N)` compact bundle verification (`mode="merkle"`),
+  and external witness cosignature anchoring (`anchor_checkpoint`)
 """
 
 from __future__ import annotations
@@ -19,10 +21,14 @@ from typing import Any, Mapping, Sequence
 
 from .crypto import (
     VerificationSummary,
+    extract_token_principal,
     extract_token_tenant,
     verify_evidence_entry,
     verify_export_archive,
+    verify_merkle_consistency_proof,
     verify_override_signature,
+    verify_signed_tree_head,
+    verify_witness_anchor_signature,
 )
 from .errors import (
     ActaAuthError,
@@ -111,7 +117,7 @@ def _enforce_guarded_compile(
 
 
 class ActaClient:
-    """Synchronous Zero-Trust client for Acta Compiler v1.5."""
+    """Synchronous Zero-Trust client for Acta Compiler v1.6.0."""
 
     def __init__(
         self,
@@ -127,6 +133,7 @@ class ActaClient:
         self.base_url = resolved_url.rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("ACTA_API_KEY")
         self.locked_tenant = _resolve_client_tenant_lock(self.api_key, default_tenant_id)
+        self.verified_principal = extract_token_principal(self.api_key) if self.api_key else None
         self._pinned_pubkey = (
             pinned_host_public_key or os.environ.get("ACTA_HOST_PUBLIC_KEY") or None
         )
@@ -216,12 +223,15 @@ class ActaClient:
             )
         return data
 
-    def mint_tenant_key(self, tenant_id: str) -> dict[str, Any]:
-        """Mints a stateless `acta_tk_v1:<tenant_id>:<mac>` key via `POST /v1/auth/mint-tenant-key` (requires master key)."""
+    def mint_tenant_key(self, tenant_id: str, *, principal: str | None = None) -> dict[str, Any]:
+        """Mints a stateless `acta_tk_v1` key via `POST /v1/auth/mint-tenant-key` (requires master key)."""
+        req: dict[str, Any] = {"tenant_id": tenant_id}
+        if principal is not None:
+            req["principal"] = principal
         _, data = self._request_json(
             "POST",
             "/v1/auth/mint-tenant-key",
-            {"tenant_id": tenant_id},
+            req,
             allowed_statuses=(200,),
             include_tenant_lock=False,
         )
@@ -320,8 +330,8 @@ class ActaClient:
         *,
         scope: str,
         winning_claim_id: str,
-        adjudicator_id: str,
         justification: str,
+        adjudicator_id: str | None = None,
         tenant_id: str | None = None,
         source_bundle_hash_hex: str | None = None,
         override_id: str | None = None,
@@ -335,9 +345,10 @@ class ActaClient:
             "tenant_id": eff_tenant,
             "scope": scope,
             "winning_claim_id": str(winning_claim_id),
-            "adjudicator_id": adjudicator_id,
             "justification": justification,
         }
+        if adjudicator_id is not None:
+            req["adjudicator_id"] = adjudicator_id
         if source_bundle_hash_hex is not None:
             req["source_bundle_hash_hex"] = source_bundle_hash_hex
         if override_id is not None:
@@ -371,6 +382,107 @@ class ActaClient:
         _, data = self._request_json(
             "GET",
             f"/v1/tenants/{urllib.parse.quote(eff_tenant)}/overrides{qs}",
+            allowed_statuses=(200,),
+        )
+        return data
+
+    def get_checkpoint(
+        self,
+        *,
+        tenant_id: str | None = None,
+        tree_size: int | None = None,
+        since_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetches and locally verifies a RFC 6962 `SignedTreeHead` checkpoint (`GET /v1/tenants/:id/checkpoint`)."""
+        eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
+        host_pk = self.ensure_host_public_key()
+        qparts: list[str] = []
+        if tree_size is not None:
+            qparts.append(f"tree_size={int(tree_size)}")
+        if since_size is not None:
+            qparts.append(f"since_size={int(since_size)}")
+        qs = f"?{'&'.join(qparts)}" if qparts else ""
+
+        _, data = self._request_json(
+            "GET",
+            f"/v1/tenants/{urllib.parse.quote(eff_tenant)}/checkpoint{qs}",
+            allowed_statuses=(200,),
+        )
+        sth = data.get("checkpoint")
+        if sth is not None:
+            try:
+                verify_signed_tree_head(sth, eff_tenant, host_pk)
+            except ValueError as exc:
+                raise ActaSignatureVerificationError(str(exc)) from exc
+            cproof = data.get("consistency_proof")
+            prior_sth = data.get("prior_checkpoint")
+            if cproof is not None and prior_sth is not None:
+                try:
+                    verify_signed_tree_head(prior_sth, eff_tenant, host_pk)
+                except ValueError as exc:
+                    raise ActaSignatureVerificationError(str(exc)) from exc
+                if not verify_merkle_consistency_proof(
+                    int(prior_sth["tree_size"]),
+                    str(prior_sth["merkle_root"]),
+                    int(sth["tree_size"]),
+                    str(sth["merkle_root"]),
+                    cproof,
+                ):
+                    raise ActaVerificationError(
+                        f"RFC 6962 consistency proof failed from first_size={prior_sth['tree_size']} to second_size={sth['tree_size']}"
+                    )
+        return data
+
+    def anchor_checkpoint(
+        self,
+        *,
+        tree_size: int,
+        checkpoint_hash_hex: str,
+        witness_id: str,
+        witness_public_key_hex: str,
+        witness_signature_hex: str,
+        external_uri: str | None = None,
+        anchor_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Appends an external witness Ed25519 cosignature to a `SignedTreeHead` (`POST /v1/anchors`)."""
+        eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
+        req: dict[str, Any] = {
+            "tenant_id": eff_tenant,
+            "tree_size": int(tree_size),
+            "checkpoint_hash_hex": checkpoint_hash_hex,
+            "witness_id": witness_id,
+            "witness_public_key_hex": witness_public_key_hex,
+            "witness_signature_hex": witness_signature_hex,
+        }
+        if anchor_id is not None:
+            req["id"] = anchor_id
+        if external_uri is not None:
+            req["external_uri"] = external_uri
+
+        _, data = self._request_json("POST", "/v1/anchors", req, allowed_statuses=(200, 201))
+        anchor = data.get("anchor", data)
+        if not verify_witness_anchor_signature(
+            anchor["witness_public_key"],
+            eff_tenant,
+            int(anchor["tree_size"]),
+            anchor["checkpoint_hash"],
+            anchor["witness_signature"],
+        ):
+            raise ActaSignatureVerificationError(
+                "Ed25519 witness_signature verification failed on anchor_checkpoint response"
+            )
+        return anchor
+
+    def list_anchors(
+        self,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
+        _, data = self._request_json(
+            "GET",
+            f"/v1/tenants/{urllib.parse.quote(eff_tenant)}/anchors",
             allowed_statuses=(200,),
         )
         return data
@@ -500,10 +612,13 @@ class ActaClient:
         _, data = self._request_json("POST", "/v1/replay", body, allowed_statuses=(200,))
         return data
 
-    def export_bundle(self, bundle_hash: str) -> dict[str, Any]:
+    def export_bundle(self, bundle_hash: str, *, mode: str = "full") -> dict[str, Any]:
         clean = bundle_hash.strip().lower()
+        qs = "?mode=merkle" if mode == "merkle" else ""
         _, data = self._request_json(
-            "GET", f"/v1/bundles/{urllib.parse.quote(clean)}/export", allowed_statuses=(200,)
+            "GET",
+            f"/v1/bundles/{urllib.parse.quote(clean)}/export{qs}",
+            allowed_statuses=(200,),
         )
         return data
 
@@ -512,9 +627,10 @@ class ActaClient:
         bundle_hash: str,
         *,
         expected_pubkey_hex: str | None = None,
+        mode: str = "full",
     ) -> VerificationSummary:
         pubkey = (expected_pubkey_hex or self.ensure_host_public_key()).strip().lower()
-        archive = self.export_bundle(bundle_hash)
+        archive = self.export_bundle(bundle_hash, mode=mode)
         try:
             return verify_export_archive(archive, pubkey)
         except ValueError as exc:
@@ -564,7 +680,7 @@ class ActaClient:
 
 
 class AsyncActaClient:
-    """Asynchronous Zero-Trust client for Acta Compiler v1.5 (requires `httpx`)."""
+    """Asynchronous Zero-Trust client for Acta Compiler v1.6.0 (requires `httpx`)."""
 
     def __init__(
         self,
@@ -582,6 +698,7 @@ class AsyncActaClient:
         self.base_url = resolved_url.rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("ACTA_API_KEY")
         self.locked_tenant = _resolve_client_tenant_lock(self.api_key, default_tenant_id)
+        self.verified_principal = extract_token_principal(self.api_key) if self.api_key else None
         self._pinned_pubkey = (
             pinned_host_public_key or os.environ.get("ACTA_HOST_PUBLIC_KEY") or None
         )
@@ -651,10 +768,12 @@ class AsyncActaClient:
         *,
         scope: str,
         winning_claim_id: str,
-        adjudicator_id: str,
         justification: str,
+        adjudicator_id: str | None = None,
         tenant_id: str | None = None,
         source_bundle_hash_hex: str | None = None,
+        client_signature_hex: str | None = None,
+        client_public_key_hex: str | None = None,
     ) -> dict[str, Any]:
         eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
         host_pk = await self.ensure_host_public_key()
@@ -662,11 +781,16 @@ class AsyncActaClient:
             "tenant_id": eff_tenant,
             "scope": scope,
             "winning_claim_id": str(winning_claim_id),
-            "adjudicator_id": adjudicator_id,
             "justification": justification,
         }
+        if adjudicator_id is not None:
+            req["adjudicator_id"] = adjudicator_id
         if source_bundle_hash_hex is not None:
             req["source_bundle_hash_hex"] = source_bundle_hash_hex
+        if client_signature_hex is not None:
+            req["client_signature_hex"] = client_signature_hex
+        if client_public_key_hex is not None:
+            req["client_public_key_hex"] = client_public_key_hex
         _, data = await self._request_json("POST", "/v1/overrides", req, allowed_statuses=(200, 201))
         if not verify_override_signature(
             host_pk,

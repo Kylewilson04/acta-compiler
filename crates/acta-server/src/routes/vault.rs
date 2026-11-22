@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use acta_store::{evidence_repo, overrides_repo};
-use acta_types::{ContextBundle, EvidenceEntry, ResolverManifest};
+use acta_types::{
+    ContextBundle, EvidenceEntry, ExternalWitnessAnchor, ResolverManifest, SignedTreeHead,
+};
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -147,6 +149,7 @@ pub struct VaultOverrideItem {
     pub version: i32,
     pub attestation_hash: String,
     pub evidence_seq_num: i64,
+    pub has_client_signature: bool,
     pub is_superseded: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -157,6 +160,10 @@ pub struct TenantVaultResponse {
     pub active_scope_filter: Option<String>,
     pub host_public_key: String,
     pub permission_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint: Option<SignedTreeHead>,
+    #[serde(default)]
+    pub witness_anchors: Vec<ExternalWitnessAnchor>,
     pub scopes: Vec<VaultScopeSummary>,
     pub claims: Vec<VaultClaimItem>,
     pub objects: Vec<VaultObjectItem>,
@@ -313,14 +320,32 @@ pub async fn handle_tenant_vault(
         scope_filter.as_deref(),
     );
     let evidence_fut = evidence_repo::fetch_tenant_evidence_chain(&state.pool, clean_tenant, None);
+    let cp_fut = evidence_repo::build_signed_tree_head(
+        &state.pool,
+        &state.host_signing_key,
+        clean_tenant,
+        None,
+    );
+    let anchors_fut = evidence_repo::fetch_recent_witness_anchors(&state.pool, clean_tenant);
 
-    let (scopes_res, claims_res, objects_res, overrides_res, bundles_res, evidence_res) = tokio::join!(
+    let (
+        scopes_res,
+        claims_res,
+        objects_res,
+        overrides_res,
+        bundles_res,
+        evidence_res,
+        cp_res,
+        anchors_res,
+    ) = tokio::join!(
         scopes_fut,
         claims_fut,
         objects_fut,
         overrides_fut,
         bundles_fut,
-        evidence_fut
+        evidence_fut,
+        cp_fut,
+        anchors_fut,
     );
 
     let scopes = scopes_res
@@ -333,6 +358,8 @@ pub async fn handle_tenant_vault(
     let bundle_rows = bundles_res
         .map_err(|e| ApiError::bad_request(format!("vault bundles query failed: {e}")))?;
     let evidence = evidence_res?;
+    let latest_checkpoint = cp_res?.map(|(sth, _)| sth);
+    let witness_anchors = anchors_res?;
 
     let mut distinct_vals_by_slot: HashMap<(String, String, String), Vec<String>> = HashMap::new();
     let mut seen_source_head: HashMap<(String, String, String, String), ()> = HashMap::new();
@@ -420,6 +447,7 @@ pub async fn handle_tenant_vault(
             version: a.version,
             attestation_hash: hex::encode(a.attestation_hash),
             evidence_seq_num: a.evidence_seq_num,
+            has_client_signature: a.client_signature.is_some(),
             is_superseded: is_sup,
             created_at: a.created_at,
         })
@@ -460,6 +488,8 @@ pub async fn handle_tenant_vault(
         active_scope_filter: scope_filter,
         host_public_key: hex::encode(state.host_public_key),
         permission_root: hex::encode(state.policy_gate.permission_root()),
+        latest_checkpoint,
+        witness_anchors,
         scopes,
         claims,
         objects,

@@ -1,11 +1,12 @@
 use std::process::ExitCode;
 
-pub use acta_crypto::{verify_export_archive, VerificationSummary};
+pub use acta_crypto::{dump_archive_preimages, verify_export_archive, VerificationSummary};
 use acta_types::ExportArchive;
 
-fn parse_cli_args(args: &[String]) -> Result<(String, [u8; 32]), String> {
+fn parse_cli_args(args: &[String]) -> Result<(String, [u8; 32], bool), String> {
     let mut archive_path: Option<String> = None;
     let mut pubkey_hex: Option<String> = None;
+    let mut dump_preimages = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -18,8 +19,12 @@ fn parse_cli_args(args: &[String]) -> Result<(String, [u8; 32]), String> {
             pubkey_hex = Some(args[i].clone());
         } else if let Some(val) = arg.strip_prefix("--pubkey=") {
             pubkey_hex = Some(val.to_string());
+        } else if arg == "--dump-preimages" {
+            dump_preimages = true;
         } else if arg == "--help" || arg == "-h" {
-            return Err("Usage: acta-verify <export.json> --pubkey <hex>".to_string());
+            return Err(
+                "Usage: acta-verify <export.json> --pubkey <hex> [--dump-preimages]".to_string(),
+            );
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag: {arg}"));
         } else if archive_path.is_none() {
@@ -30,8 +35,9 @@ fn parse_cli_args(args: &[String]) -> Result<(String, [u8; 32]), String> {
         i += 1;
     }
 
-    let path = archive_path
-        .ok_or_else(|| "Usage: acta-verify <export.json> --pubkey <hex>".to_string())?;
+    let path = archive_path.ok_or_else(|| {
+        "Usage: acta-verify <export.json> --pubkey <hex> [--dump-preimages]".to_string()
+    })?;
     let pk_str = pubkey_hex.ok_or_else(|| "missing required --pubkey <hex> flag".to_string())?;
     let pk_raw =
         hex::decode(pk_str.trim()).map_err(|e| format!("invalid --pubkey hex encoding: {e}"))?;
@@ -39,12 +45,12 @@ fn parse_cli_args(args: &[String]) -> Result<(String, [u8; 32]), String> {
         .try_into()
         .map_err(|_| "--pubkey must decode to exactly 32 bytes (64 hex chars)".to_string())?;
 
-    Ok((path, pk_arr))
+    Ok((path, pk_arr, dump_preimages))
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let (archive_path, expected_pubkey) = match parse_cli_args(&args) {
+    let (archive_path, expected_pubkey, dump_preimages) = match parse_cli_args(&args) {
         Ok(parsed) => parsed,
         Err(msg) => {
             eprintln!("VERIFICATION FAILED: {msg}");
@@ -71,8 +77,9 @@ fn main() -> ExitCode {
     match verify_export_archive(&archive, &expected_pubkey) {
         Ok(summary) => {
             println!(
-                "VERIFIED tenant={} bundle_hash={} state_commitment={} objects={} claims={} overrides={} refusals={} evidence_entries={} non_default_thresholds={}",
+                "VERIFIED tenant={} mode={} bundle_hash={} state_commitment={} objects={} claims={} overrides={} refusals={} evidence_entries={} merkle_tree_size={} witness_anchors={} non_default_thresholds={}",
                 summary.tenant_id,
+                summary.verification_mode,
                 summary.bundle_hash_hex,
                 summary.state_commitment_hex,
                 summary.verified_objects,
@@ -80,8 +87,24 @@ fn main() -> ExitCode {
                 summary.verified_overrides,
                 summary.verified_refusals,
                 summary.verified_evidence_entries,
+                summary.merkle_tree_size.unwrap_or(0),
+                summary.verified_witness_anchors,
                 summary.non_default_thresholds
             );
+            if dump_preimages {
+                match dump_archive_preimages(&archive) {
+                    Ok(preimages) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&preimages).unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("VERIFICATION FAILED: preimage dump error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(reason) => {
@@ -95,15 +118,19 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use acta_crypto::{
-        compute_bundle_hash, compute_claim_content_hash, compute_claim_group_key,
-        compute_evidence_event_hash_with_meta, compute_object_content_hash,
-        compute_omission_list_hash, compute_refusal_metadata_commitment, sign_evidence_entry,
+        compute_bundle_hash, compute_checkpoint_hash, compute_claim_content_hash,
+        compute_claim_group_key, compute_evidence_event_hash_with_meta,
+        compute_merkle_inclusion_proof, compute_merkle_root_from_leaves,
+        compute_object_content_hash, compute_omission_list_hash,
+        compute_refusal_metadata_commitment, merkle_leaf_hash, sign_checkpoint_head,
+        sign_evidence_entry, sign_witness_anchor,
     };
     use acta_types::{
         ClaimCandidate, ClaimStatus, ContextBudget, ContextBundle, DisputeReasonCode,
-        DisputeRecord, EvidenceEntry, KnowledgeClaim, LifecycleStatus, ObjectType, OmissionReason,
-        OmissionRecord, OmittedItem, PolicyResultTag, RefusalMetadata, ResolverManifest,
-        SelectedObjectRef, StoredObject, SCHEMA_VERSION,
+        DisputeRecord, EntryInclusionProof, EvidenceEntry, ExternalWitnessAnchor, KnowledgeClaim,
+        LifecycleStatus, MerkleBundleProof, ObjectType, OmissionReason, OmissionRecord,
+        OmittedItem, PolicyResultTag, RefusalMetadata, ResolverManifest, SelectedObjectRef,
+        SignedTreeHead, StoredObject, SCHEMA_VERSION,
     };
     use chrono::{SubsecRound, Utc};
     use ed25519_dalek::SigningKey;
@@ -113,6 +140,7 @@ mod tests {
     fn build_signed_fixture() -> (ExportArchive, [u8; 32]) {
         let host_key = SigningKey::from_bytes(&[0x33u8; 32]);
         let host_pubkey = host_key.verifying_key().to_bytes();
+        let witness_key = SigningKey::from_bytes(&[0x77u8; 32]);
         let now = Utc::now().trunc_subsecs(6);
 
         let mut intent = StoredObject {
@@ -199,6 +227,7 @@ mod tests {
                 ],
                 reason_code: DisputeReasonCode::InsufficientMargin,
                 escalation_required: true,
+                lapsed_override: None,
             }],
             omission_record: OmissionRecord {
                 inline_items: omitted_items,
@@ -276,6 +305,52 @@ mod tests {
             created_at: now,
         };
 
+        let leaves = vec![merkle_leaf_hash(1, &event_1), merkle_leaf_hash(2, &event_2)];
+        let merkle_root = compute_merkle_root_from_leaves(&leaves);
+        let cp_hash = compute_checkpoint_hash(
+            "tenant-verify",
+            2,
+            &event_2,
+            &merkle_root,
+            now.timestamp_micros(),
+        );
+        let cp_sig = sign_checkpoint_head(&host_key, "tenant-verify", &cp_hash);
+        let w_sig = sign_witness_anchor(&witness_key, "tenant-verify", 2, &cp_hash);
+        let anchor = ExternalWitnessAnchor {
+            id: Uuid::new_v4(),
+            tenant_id: "tenant-verify".to_string(),
+            tree_size: 2,
+            checkpoint_hash: cp_hash,
+            witness_id: "rekor-mirror-1".to_string(),
+            witness_public_key: witness_key.verifying_key().to_bytes(),
+            witness_signature: w_sig,
+            external_uri: Some("https://witness.ardyn.example/entry/2".to_string()),
+            anchored_at: now,
+        };
+        let path_2: Vec<String> = compute_merkle_inclusion_proof(&leaves, 1)
+            .unwrap()
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+
+        let merkle_proof = MerkleBundleProof {
+            checkpoint: SignedTreeHead {
+                tenant_id: "tenant-verify".to_string(),
+                tree_size: 2,
+                head_event_hash: event_2,
+                merkle_root,
+                issued_at: now,
+                checkpoint_hash: cp_hash,
+                host_signature: cp_sig,
+                witness_anchors: vec![anchor],
+            },
+            bundle_entry_proof: EntryInclusionProof {
+                entry: entry_2.clone(),
+                audit_path: path_2,
+            },
+            override_entry_proofs: vec![],
+        };
+
         let archive = ExportArchive {
             bundle_hash,
             bundle,
@@ -283,6 +358,7 @@ mod tests {
             claims: vec![claim_a, claim_b],
             override_attestations: vec![],
             evidence_chain: vec![entry_1, entry_2],
+            merkle_proof: Some(merkle_proof),
             host_public_key: host_pubkey,
         };
 
@@ -290,14 +366,40 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_export_verifies_cleanly() {
+    fn test_valid_export_verifies_full_and_merkle_only_cleanly() {
         let (archive, pubkey) = build_signed_fixture();
         let summary = verify_export_archive(&archive, &pubkey).expect("valid archive must pass");
         assert_eq!(summary.verified_objects, 1);
         assert_eq!(summary.verified_claims, 2);
         assert_eq!(summary.verified_refusals, 1);
         assert_eq!(summary.verified_evidence_entries, 2);
+        assert_eq!(summary.verification_mode, "full_chain_and_merkle");
+        assert_eq!(summary.merkle_tree_size, Some(2));
+        assert_eq!(summary.verified_witness_anchors, 1);
         assert!(!summary.non_default_thresholds);
+
+        // Verify compact `merkle_proof`-only ExportArchive (`evidence_chain = []`)!
+        let mut compact = archive.clone();
+        compact.evidence_chain.clear();
+        let c_sum = verify_export_archive(&compact, &pubkey).expect("merkle-only archive must pass");
+        assert_eq!(c_sum.verification_mode, "merkle_inclusion");
+        assert_eq!(c_sum.verified_evidence_entries, 1);
+        assert_eq!(c_sum.verified_witness_anchors, 1);
+
+        let dumped = dump_archive_preimages(&compact).unwrap();
+        assert_eq!(dumped["checkpoint"]["tree_size"], json!(2));
+
+        // Tampered witness signature must fail!
+        let mut bad_witness = compact;
+        bad_witness
+            .merkle_proof
+            .as_mut()
+            .unwrap()
+            .checkpoint
+            .witness_anchors[0]
+            .witness_signature[0] ^= 0xFF;
+        let w_err = verify_export_archive(&bad_witness, &pubkey).unwrap_err();
+        assert!(w_err.contains("witness_signature"));
     }
 
     #[test]

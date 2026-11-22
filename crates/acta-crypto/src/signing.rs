@@ -2,7 +2,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::hash::hash_length_delimited;
 
-fn evidence_signing_preimage(
+pub fn evidence_signing_preimage(
     tenant: &str,
     seq_num: i64,
     prev_hash: &[u8; 32],
@@ -18,7 +18,7 @@ fn evidence_signing_preimage(
     ])
 }
 
-fn override_signing_preimage(
+pub fn override_signing_preimage(
     tenant: &str,
     evidence_seq_num: i64,
     attestation_hash: &[u8; 32],
@@ -29,6 +29,28 @@ fn override_signing_preimage(
         tenant.as_bytes(),
         &seq_le,
         attestation_hash.as_slice(),
+    ])
+}
+
+pub fn checkpoint_signing_preimage(tenant: &str, checkpoint_hash: &[u8; 32]) -> [u8; 32] {
+    hash_length_delimited(&[
+        b"acta:checkpoint_sig:v1",
+        tenant.as_bytes(),
+        checkpoint_hash.as_slice(),
+    ])
+}
+
+pub fn witness_anchor_signing_preimage(
+    tenant: &str,
+    tree_size: i64,
+    checkpoint_hash: &[u8; 32],
+) -> [u8; 32] {
+    let size_le = tree_size.to_le_bytes();
+    hash_length_delimited(&[
+        b"acta:witness_sig:v1",
+        tenant.as_bytes(),
+        &size_le,
+        checkpoint_hash.as_slice(),
     ])
 }
 
@@ -88,7 +110,62 @@ pub fn verify_override_signature(
     verifying_key.verify_strict(&digest, &sig).is_ok()
 }
 
-/// Verifies an optional client Ed25519 signature over an ingested object/claim/override `content_hash`.
+/// Signs a `SignedTreeHead` checkpoint (`b"acta:checkpoint_sig:v1"`).
+pub fn sign_checkpoint_head(
+    host_key: &SigningKey,
+    tenant: &str,
+    checkpoint_hash: &[u8; 32],
+) -> [u8; 64] {
+    let digest = checkpoint_signing_preimage(tenant, checkpoint_hash);
+    host_key.sign(&digest).to_bytes()
+}
+
+/// Strictly verifies a host Ed25519 signature over `(tenant, checkpoint_hash)`.
+pub fn verify_checkpoint_signature(
+    verifying_key: &VerifyingKey,
+    tenant: &str,
+    checkpoint_hash: &[u8; 32],
+    signature_bytes: &[u8; 64],
+) -> bool {
+    if verifying_key.is_weak() {
+        return false;
+    }
+    let digest = checkpoint_signing_preimage(tenant, checkpoint_hash);
+    let sig = Signature::from_bytes(signature_bytes);
+    verifying_key.verify_strict(&digest, &sig).is_ok()
+}
+
+/// Signs `(tenant, tree_size, checkpoint_hash)` with an external witness Ed25519 key (`b"acta:witness_sig:v1"`).
+pub fn sign_witness_anchor(
+    witness_key: &SigningKey,
+    tenant: &str,
+    tree_size: i64,
+    checkpoint_hash: &[u8; 32],
+) -> [u8; 64] {
+    let digest = witness_anchor_signing_preimage(tenant, tree_size, checkpoint_hash);
+    witness_key.sign(&digest).to_bytes()
+}
+
+/// Strictly verifies an external witness Ed25519 cosignature over `(tenant, tree_size, checkpoint_hash)`.
+pub fn verify_witness_anchor_signature(
+    witness_public_key_bytes: &[u8; 32],
+    tenant: &str,
+    tree_size: i64,
+    checkpoint_hash: &[u8; 32],
+    signature_bytes: &[u8; 64],
+) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(witness_public_key_bytes) else {
+        return false;
+    };
+    if vk.is_weak() {
+        return false;
+    }
+    let digest = witness_anchor_signing_preimage(tenant, tree_size, checkpoint_hash);
+    let sig = Signature::from_bytes(signature_bytes);
+    vk.verify_strict(&digest, &sig).is_ok()
+}
+
+/// Verifies an optional client Ed25519 signature over a 32-byte digest (`content_hash` or intent hash).
 pub fn verify_client_content_signature(
     public_key_bytes: &[u8; 32],
     content_hash: &[u8; 32],

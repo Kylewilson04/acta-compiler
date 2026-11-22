@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use acta_crypto::{compute_logical_claim_group_key, to_canonical_bytes};
+use acta_crypto::{
+    compute_logical_claim_group_key, compute_override_client_intent_hash, to_canonical_bytes,
+    verify_client_content_signature,
+};
 use acta_policy::PolicyAction;
 use acta_store::{
     claims_repo, evidence_repo,
@@ -22,7 +25,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::routes::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, VerifiedKeyInfo};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OverridesQueryParams {
@@ -57,9 +60,21 @@ fn same_typed_value(a: &KnowledgeClaim, b: &KnowledgeClaim) -> bool {
     ja == jb
 }
 
-/// `POST /v1/overrides` -> Enforces Policy-Before-Attest (`Action::"attest"`), verifies that an
-/// active dispute actually exists for `winning_claim_id` in `(tenant_id, scope)` (and optionally
-/// in `source_bundle_hash`), and atomically notarizes the signed `OverrideAttestation` + `EvidenceEntry`.
+fn is_signature_mandatory_scope(scope: &str) -> bool {
+    let lower = scope.trim().to_ascii_lowercase();
+    lower == "regulated"
+        || lower.starts_with("regulated/")
+        || lower == "compliance"
+        || lower.starts_with("compliance/")
+        || lower == "governance"
+        || lower.starts_with("governance/")
+}
+
+/// `POST /v1/overrides` -> Enforces Policy-Before-Attest (`Action::"attest"`), binds `adjudicator_id`
+/// to the authenticated GitHub OAuth 2.1 principal (`<tenant>::oauth:<github_login>`) or verifies
+/// a mandatory 64-byte Ed25519 `client_signature_hex` (`acta:override_client_sig:v1`) whenever a
+/// custom/committee adjudicator or `regulated/*` / `compliance/*` / `governance/*` scope is targeted,
+/// and atomically notarizes the `OverrideAttestation` + `EvidenceEntry`.
 pub async fn handle_attest_override(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -74,38 +89,92 @@ pub async fn handle_attest_override(
         .await
         .map_err(ApiError::unauthorized)?;
 
+    let caller_auth = state
+        .inspect_caller_auth(&headers)
+        .map_err(ApiError::unauthorized)?;
+
     validate_identifier("tenant_id", &req.tenant_id)?;
     validate_scope(&req.scope)?;
-    validate_identifier("adjudicator_id", &req.adjudicator_id)?;
     validate_justification(&req.justification)?;
 
-    let effective_actor = if req.adjudicator_id.contains("::") {
-        let (adj_tenant, _) = req.adjudicator_id.split_once("::").unwrap();
-        if adj_tenant != req.tenant_id {
-            let msg = format!(
-                "adjudicator_id '{}' belongs to tenant '{}', cannot attest in tenant '{}'",
-                req.adjudicator_id, adj_tenant, req.tenant_id
-            );
-            let suffix = state
-                .append_refusal_audit_with_scope(
-                    &headers,
-                    Some(&req.tenant_id),
-                    PolicyResultTag::Block,
-                    "attest_override",
-                    "adjudicator_tenant_mismatch",
-                    Some(&req.scope),
-                    &msg,
-                )
-                .await
-                .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                .unwrap_or_default();
-            return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+    let raw_adjudicator = req
+        .adjudicator_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (effective_actor, matches_caller_principal) = match raw_adjudicator {
+        None => {
+            let actor = match &caller_auth {
+                VerifiedKeyInfo::TenantBound {
+                    verified_principal: Some(gh),
+                    ..
+                } => format!("{}::oauth:{gh}", req.tenant_id),
+                VerifiedKeyInfo::Master { .. } => format!("{}::master-admin", req.tenant_id),
+                _ => format!("{}::session", req.tenant_id),
+            };
+            (actor, true)
         }
-        req.adjudicator_id.clone()
-    } else {
-        format!("{}::{}", req.tenant_id, req.adjudicator_id)
+        Some(raw) => {
+            validate_identifier("adjudicator_id", raw)?;
+            let local_part = if let Some((adj_tenant, local)) = raw.split_once("::") {
+                if adj_tenant != req.tenant_id {
+                    let msg = format!(
+                        "adjudicator_id '{raw}' belongs to tenant '{adj_tenant}', cannot attest in tenant '{}'",
+                        req.tenant_id
+                    );
+                    let suffix = state
+                        .append_refusal_audit_with_scope(
+                            &headers,
+                            Some(&req.tenant_id),
+                            PolicyResultTag::Block,
+                            "attest_override",
+                            "adjudicator_tenant_mismatch",
+                            Some(&req.scope),
+                            &msg,
+                        )
+                        .await
+                        .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
+                        .unwrap_or_default();
+                    return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+                }
+                local
+            } else {
+                raw
+            };
+
+            match &caller_auth {
+                VerifiedKeyInfo::TenantBound {
+                    verified_principal: Some(gh),
+                    ..
+                } => {
+                    let local_lc = local_part.to_ascii_lowercase();
+                    let oauth_tag = format!("oauth:{gh}");
+                    if local_lc == *gh || local_lc == oauth_tag {
+                        (format!("{}::oauth:{gh}", req.tenant_id), true)
+                    } else {
+                        (format!("{}::{local_part}", req.tenant_id), false)
+                    }
+                }
+                VerifiedKeyInfo::Master { .. } => {
+                    if local_part == "master-admin" {
+                        (format!("{}::master-admin", req.tenant_id), true)
+                    } else {
+                        (format!("{}::{local_part}", req.tenant_id), false)
+                    }
+                }
+                _ => {
+                    if local_part == "session" {
+                        (format!("{}::session", req.tenant_id), true)
+                    } else {
+                        (format!("{}::{local_part}", req.tenant_id), false)
+                    }
+                }
+            }
+        }
     };
 
+    // 1. Cedar Policy-Before-Attest (`Action::"attest"`) runs BEFORE touching SQL!
     let (policy_decision, _perm_root) = state.policy_gate.evaluate_action(
         &req.tenant_id,
         &effective_actor,
@@ -156,45 +225,8 @@ pub async fn handle_attest_override(
         }
     }
 
-    let now = Utc::now().trunc_subsecs(6);
-
-    let source_bundle_hash: Option<[u8; 32]> = match req
-        .source_bundle_hash_hex
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw_hex) => {
-            let decoded = hex::decode(raw_hex)
-                .map_err(|e| ApiError::bad_request(format!("invalid source_bundle_hash_hex: {e}")))?;
-            let arr: [u8; 32] = decoded.try_into().map_err(|_| {
-                ApiError::bad_request("source_bundle_hash_hex must be 32 bytes (64 hex chars)")
-            })?;
-            let (orig_bundle, _) =
-                evidence_repo::fetch_bundle_with_evidence_slice(&state.pool, &arr).await?;
-            if orig_bundle.tenant_id != req.tenant_id || orig_bundle.scope != req.scope {
-                return Err(ApiError::bad_request(format!(
-                    "source_bundle_hash belongs to ({}, {}), not ({}, {})",
-                    orig_bundle.tenant_id, orig_bundle.scope, req.tenant_id, req.scope
-                )));
-            }
-            let in_dispute = orig_bundle.dispute_records.iter().any(|d| {
-                d.competing_claims
-                    .iter()
-                    .any(|c| c.id == req.winning_claim_id)
-            });
-            if !in_dispute {
-                return Err(ApiError::bad_request(format!(
-                    "winning_claim_id {} did not appear as a disputed candidate in source_bundle_hash {raw_hex}",
-                    req.winning_claim_id
-                )));
-            }
-            Some(arr)
-        }
-        None => None,
-    };
-
-    let client_signature = match req
+    // 2. Parse & enforce Ed25519 client signature (`acta:override_client_sig:v1`) / OAuth principal binding!
+    let client_signature: Option<Vec<u8>> = match req
         .client_signature_hex
         .as_deref()
         .map(str::trim)
@@ -220,11 +252,141 @@ pub async fn handle_attest_override(
         .filter(|s| !s.is_empty())
     {
         Some(s) => {
-            let bytes = hex::decode(s)
-                .map_err(|e| ApiError::bad_request(format!("invalid client_public_key_hex: {e}")))?;
+            let bytes = hex::decode(s).map_err(|e| {
+                ApiError::bad_request(format!("invalid client_public_key_hex: {e}"))
+            })?;
             let arr: [u8; 32] = bytes.try_into().map_err(|_| {
                 ApiError::bad_request("client_public_key_hex must be 32 bytes (64 hex chars)")
             })?;
+            Some(arr)
+        }
+        None => None,
+    };
+
+    if client_signature.is_some() != client_public_key.is_some() {
+        return Err(ApiError::bad_request(
+            "client_signature_hex and client_public_key_hex must both be provided together",
+        ));
+    }
+
+    let adjudicator_auth_kind = match (&client_signature, &client_public_key) {
+        (Some(sig_vec), Some(pk_arr)) => {
+            let sig_arr: [u8; 64] = sig_vec.as_slice().try_into().unwrap();
+            let intent_digest = compute_override_client_intent_hash(
+                &req.tenant_id,
+                &req.scope,
+                req.winning_claim_id,
+                &effective_actor,
+                &req.justification,
+            );
+            if !verify_client_content_signature(pk_arr, &intent_digest, &sig_arr) {
+                let msg = format!(
+                    "invalid Ed25519 client_signature_hex for adjudicator_id '{effective_actor}' over acta:override_client_sig:v1"
+                );
+                let suffix = state
+                    .append_refusal_audit_with_scope(
+                        &headers,
+                        Some(&req.tenant_id),
+                        PolicyResultTag::Block,
+                        "attest_override",
+                        "invalid_adjudicator_client_signature",
+                        Some(&req.scope),
+                        &msg,
+                    )
+                    .await
+                    .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
+                    .unwrap_or_default();
+                return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+            }
+            "ed25519_client_sig".to_string()
+        }
+        _ => {
+            if is_signature_mandatory_scope(&req.scope) {
+                let msg = format!(
+                    "high-assurance scope '{}' requires an Ed25519 client_signature_hex + client_public_key_hex on override attestations",
+                    req.scope
+                );
+                let suffix = state
+                    .append_refusal_audit_with_scope(
+                        &headers,
+                        Some(&req.tenant_id),
+                        PolicyResultTag::Block,
+                        "attest_override",
+                        "adjudicator_signature_required",
+                        Some(&req.scope),
+                        &msg,
+                    )
+                    .await
+                    .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
+                    .unwrap_or_default();
+                return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+            }
+
+            if !matches_caller_principal {
+                let msg = format!(
+                    "custom adjudicator_id '{effective_actor}' requires a valid 64-byte Ed25519 client_signature_hex + client_public_key_hex over acta:override_client_sig:v1 (omit adjudicator_id to attest as your verified session identity)"
+                );
+                let suffix = state
+                    .append_refusal_audit_with_scope(
+                        &headers,
+                        Some(&req.tenant_id),
+                        PolicyResultTag::Block,
+                        "attest_override",
+                        "adjudicator_signature_required",
+                        Some(&req.scope),
+                        &msg,
+                    )
+                    .await
+                    .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
+                    .unwrap_or_default();
+                return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+            }
+
+            match caller_auth {
+                VerifiedKeyInfo::TenantBound {
+                    verified_principal: Some(_),
+                    ..
+                } => "oauth_github_principal".to_string(),
+                VerifiedKeyInfo::Master { .. } => "master_admin".to_string(),
+                _ => "tenant_session".to_string(),
+            }
+        }
+    };
+
+    let now = Utc::now().trunc_subsecs(6);
+
+    let source_bundle_hash: Option<[u8; 32]> = match req
+        .source_bundle_hash_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw_hex) => {
+            let decoded = hex::decode(raw_hex).map_err(|e| {
+                ApiError::bad_request(format!("invalid source_bundle_hash_hex: {e}"))
+            })?;
+            let arr: [u8; 32] = decoded.try_into().map_err(|_| {
+                ApiError::bad_request("source_bundle_hash_hex must be 32 bytes (64 hex chars)")
+            })?;
+            let (orig_bundle, _) =
+                evidence_repo::fetch_bundle_with_evidence_slice(&state.pool, &arr).await?;
+            if orig_bundle.tenant_id != req.tenant_id || orig_bundle.scope != req.scope {
+                return Err(ApiError::bad_request(format!(
+                    "source_bundle_hash belongs to ({}, {}), not ({}, {})",
+                    orig_bundle.tenant_id, orig_bundle.scope, req.tenant_id, req.scope
+                )));
+            }
+            let in_dispute = orig_bundle.dispute_records.iter().any(|d| {
+                d.competing_claims
+                    .iter()
+                    .any(|c| c.id == req.winning_claim_id)
+            });
+            if !in_dispute {
+                return Err(ApiError::bad_request(format!(
+                    "winning_claim_id {} did not appear as a disputed candidate in source_bundle_hash {raw_hex}",
+                    req.winning_claim_id
+                )));
+            }
             Some(arr)
         }
         None => None,
@@ -277,7 +439,6 @@ pub async fn handle_attest_override(
         &winner.scope,
     );
 
-    // Deduplicate same-source heads inside this logical group (keeping `winner` if present).
     let mut by_source: BTreeMap<String, Vec<KnowledgeClaim>> = BTreeMap::new();
     for c in active_claims {
         let lkey = compute_logical_claim_group_key(&c.tenant_id, &c.subject, &c.predicate, &c.scope);
@@ -390,10 +551,12 @@ pub async fn handle_attest_override(
             winning_claim_content_hash: hex::encode(att.winning_claim_content_hash),
             overridden_claim_ids: att.overridden_claims.iter().map(|c| c.id).collect(),
             adjudicator_id: att.adjudicator_id,
+            adjudicator_auth_kind,
             justification: att.justification,
             attestation_hash: hex::encode(att.attestation_hash),
             evidence_seq_num: att.evidence_seq_num,
             host_signature: hex::encode(att.host_signature),
+            client_public_key_hex: att.client_public_key.map(hex::encode),
             was_idempotent_noop: was_noop,
             created_at: att.created_at,
         }),

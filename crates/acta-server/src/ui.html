@@ -290,7 +290,7 @@
 <header>
   <div class="brand">
     <h1>ACTA COMPILER</h1>
-    <span class="badge">v1.5 CONTROL PLANE</span>
+    <span class="badge">v1.6 CONTROL PLANE</span>
     <span id="health-badge" class="badge">CHECKING /v1/health...</span>
     <span id="oauth-badge" class="badge">OAUTH 2.1 READY</span>
   </div>
@@ -316,7 +316,7 @@
     <div>
       <div style="font-weight:700;font-size:15px;">Browse Your Private GitHub Vaults Without API Keys</div>
       <div style="color:var(--muted);font-size:13px;margin-top:2px;">
-        Sign in with GitHub (OAuth 2.1 + PKCE S256) to inspect all scopes, structured claims, intents, memories, compiled bundles, and Ed25519 evidence chains created from Claude or Cursor.
+        Sign in with GitHub (OAuth 2.1 + PKCE S256) to inspect scopes, claims, principal-bound dispute overrides, RFC 6962 Merkle checkpoints, and Ed25519 evidence chains.
       </div>
     </div>
     <button class="btn-gh-header" onclick="startGitHubSignIn()">
@@ -333,6 +333,10 @@
     <div class="card">
       <div class="label">Active Cedar Permission Root (BLAKE3)</div>
       <div class="mono" id="perm-root">loading...</div>
+    </div>
+    <div class="card" style="cursor:pointer;" onclick="inspectLatestCheckpoint()">
+      <div class="label">RFC 6962 SignedTreeHead Checkpoint</div>
+      <div class="mono" id="merkle-head-summary">tree_size=0 (click to verify)</div>
     </div>
     <div class="card">
       <div class="label">Zero-Key MCP URL (Claude / Cursor)</div>
@@ -462,7 +466,7 @@
   <div class="workspace-grid">
     <div class="card">
       <div class="label" id="left-pane-title">Record / Compiled Context Inspector</div>
-      <pre id="context-output">Click any Claim, Intent, Memory, or Compiled Bundle row above to inspect its canonical record and verify its signature.</pre>
+      <pre id="context-output">Click any Claim, Intent, Memory, Override, Merkle Checkpoint, or Compiled Bundle row above to inspect its canonical record and verify its signature.</pre>
     </div>
     <div class="card">
       <div class="label" id="right-pane-title">Cryptographic Receipt &amp; Verification Verdict</div>
@@ -505,12 +509,12 @@
         <span class="sub">Diffs margin 0.15 ([DISPUTE]) vs 0.05 (resolved winner) via /v1/replay</span>
       </button>
       <button class="lab-btn" onclick="runTamperAudit()">
-        4. Verify &amp; 1-Bit Tamper Audit
-        <span class="sub">Verifies ExportArchive then mutates 1 claim value to test detection</span>
+        4. O(log N) Merkle &amp; 1-Bit Tamper Audit
+        <span class="sub">Verifies compact ?mode=merkle ExportArchive then mutates 1 claim</span>
       </button>
       <button class="lab-btn" onclick="runMcpCheck()">
         5. Test MCP Agent Gateway (/mcp)
-        <span class="sub">Executes JSON-RPC 2.0 tools/list + acta_verify_bundle over HTTP</span>
+        <span class="sub">Executes JSON-RPC 2.0 tools/list (10 tools) + acta_verify_bundle</span>
       </button>
       <button class="lab-btn" onclick="runTenantLockAudit()">
         6. Tenant Lock Audit
@@ -519,6 +523,10 @@
       <button class="lab-btn" onclick="runOAuthDiscoveryCheck()">
         7. OAuth 2.1 Discovery Check
         <span class="sub">Verifies RFC 9728/8414 metadata, DCR &amp; 401 WWW-Authenticate</span>
+      </button>
+      <button class="lab-btn" onclick="inspectLatestCheckpoint()">
+        8. RFC 6962 Merkle Consistency Proof
+        <span class="sub">Fetches SignedTreeHead + consistency_proof from seq 1 to head</span>
       </button>
     </div>
   </details>
@@ -739,7 +747,7 @@ async function refreshHealth() {
     const badge = document.getElementById('health-badge');
     const oauthBadge = document.getElementById('oauth-badge');
     if (d.status === 'ok') {
-      badge.textContent = 'ONLINE · v' + (d.version || '1.4.1') + ' · PG17 + CEDAR';
+      badge.textContent = 'ONLINE · v' + (d.version || '1.6.0') + ' · PG17 + CEDAR';
       badge.className = 'badge ok';
       document.getElementById('host-pubkey').textContent = d.host_public_key;
       document.getElementById('perm-root').textContent = d.permission_root;
@@ -781,9 +789,18 @@ async function loadVaultExplorer() {
     latestBundleHash = data.bundles[0].bundle_hash;
   }
 
+  if (data.latest_checkpoint) {
+    const cp = data.latest_checkpoint;
+    const anchCnt = (data.witness_anchors || []).length;
+    document.getElementById('merkle-head-summary').textContent =
+      'size=' + cp.tree_size + ' · root=' + cp.merkle_root.slice(0, 14) + '... · anchors=' + anchCnt;
+  } else {
+    document.getElementById('merkle-head-summary').textContent = 'tree_size=0 (empty ledger)';
+  }
+
   document.getElementById('vault-status-note').textContent =
     (selectedScopeFilter ? ('Filtered by scope "' + selectedScopeFilter + '" · ') : 'Showing all scopes · ') +
-    'Ed25519 verified ledger';
+    'Ed25519 + RFC 6962 Merkle verified';
 
   // Render Scope Pills
   const pillsBar = document.getElementById('scope-pills-bar');
@@ -814,11 +831,12 @@ async function loadVaultExplorer() {
   } else {
     ovrTbody.innerHTML = overridesList.map((ov, idx) => {
       const shortJust = ov.justification.length > 64 ? (ov.justification.slice(0, 64) + '...') : ov.justification;
+      const sigTag = ov.has_client_signature ? ' <span class="pill-ok">ED25519 CLIENT SIG</span>' : '';
       return '<tr class="clickable-row" onclick="inspectOverride(' + idx + ')">' +
         '<td>' + escHtml(ov.scope) + '</td>' +
         '<td><strong>' + escHtml(ov.subject) + '</strong> · ' + escHtml(ov.predicate) + '</td>' +
         '<td style="color:var(--cyan);">' + escHtml(ov.winning_claim_id.slice(0, 8)) + '... (v' + ov.version + ')</td>' +
-        '<td>' + escHtml(ov.adjudicator_id) + '</td>' +
+        '<td>' + escHtml(ov.adjudicator_id) + sigTag + '</td>' +
         '<td>' + escHtml(shortJust) + '</td>' +
         '<td>#' + ov.evidence_seq_num + '</td>' +
         '<td>' + escHtml(ov.attestation_hash.slice(0, 14)) + '...</td>' +
@@ -888,7 +906,7 @@ async function loadVaultExplorer() {
         '<td>' + b.resolution_count + '</td>' +
         '<td>' + b.omitted_count + '</td>' +
         '<td>' + escHtml(new Date(b.issued_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
-        '<td><button class="btn-sm" style="padding:3px 8px;font-size:11px;">Verify Ed25519</button></td>' +
+        '<td><button class="btn-sm" style="padding:3px 8px;font-size:11px;">Verify Merkle</button></td>' +
       '</tr>';
     }).join('');
   }
@@ -912,12 +930,30 @@ async function loadVaultExplorer() {
               ? '<span class="pill-conflict">' + escHtml(e.refusal_metadata.reason_code) + (e.refusal_metadata.target_scope ? ' (' + escHtml(e.refusal_metadata.target_scope) + ')' : '') + '</span>'
               : (e.override_summary
                   ? '<span class="pill-intent">OVERRIDE ' + escHtml(e.override_summary.subject) + '·' + escHtml(e.override_summary.predicate) + '</span>'
-                  : '<span style="color:var(--muted);">legacy refusal (v1.5)</span>'))) + '</td>' +
+                  : '<span style="color:var(--muted);">legacy refusal (v1)</span>'))) + '</td>' +
         '<td>' + escHtml(e.host_signature.slice(0, 18)) + '...</td>' +
         '<td>' + escHtml(new Date(e.created_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
       '</tr>';
     }).join('');
   }
+}
+
+async function inspectLatestCheckpoint() {
+  const tenant = activeTenantId();
+  const hasHistory = cachedVaultData && cachedVaultData.evidence && cachedVaultData.evidence.length > 0;
+  const q = hasHistory ? '?since_size=1' : '';
+  const res = await fetch('/v1/tenants/' + encodeURIComponent(tenant) + '/checkpoint' + q, { headers: authHeaders() });
+  const cpJson = await res.json();
+  document.getElementById('left-pane-title').textContent = 'RFC 6962 SignedTreeHead (' + tenant + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(cpJson.checkpoint || cpJson, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Merkle Consistency & External Witness Anchors';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    tree_size: cpJson.tree_size,
+    since_size: cpJson.since_size,
+    consistency_verified: cpJson.consistency_verified,
+    consistency_proof_nodes: cpJson.consistency_proof ? cpJson.consistency_proof.length : 0,
+    witness_anchors: cachedVaultData ? cachedVaultData.witness_anchors : []
+  }, null, 2);
 }
 
 function inspectClaim(idx) {
@@ -958,6 +994,7 @@ function inspectOverride(idx) {
     evidence_seq_num: ov.evidence_seq_num,
     winning_claim_id: ov.winning_claim_id,
     adjudicator_id: ov.adjudicator_id,
+    has_client_signature: ov.has_client_signature,
     version: ov.version
   }, null, 2);
 }
@@ -972,18 +1009,18 @@ function inspectEvidence(idx) {
   document.getElementById('left-pane-title').textContent = 'Signed Evidence Entry #' + e.seq_num + ' (' + e.policy_result.toUpperCase() + ')';
   if (e.refusal_metadata) {
     document.getElementById('context-output').textContent =
-      'Auditable Refusal Record (v1.5 acta:evidence_event:v2)\n' +
+      'Auditable Refusal Record (acta:evidence_event:v2)\n' +
       'Operation:    ' + e.refusal_metadata.operation + '\n' +
       'Reason Code:  ' + e.refusal_metadata.reason_code + '\n' +
       'Target Scope: ' + (e.refusal_metadata.target_scope || '—') + '\n' +
       'Summary:      ' + e.refusal_metadata.summary;
   } else if (e.override_summary) {
     document.getElementById('context-output').textContent =
-      'Notarized Dispute-Override Entry (v1.5 acta:evidence_event:v2)\n' +
+      'Notarized Dispute-Override Entry (acta:evidence_event:v2)\n' +
       JSON.stringify(e.override_summary, null, 2);
   } else {
     document.getElementById('context-output').textContent =
-      'Verdict: ' + e.policy_result.toUpperCase() + ' (v1.5 refusal commitment: ' + (e.state_commitment || 'none') + ')';
+      'Verdict: ' + e.policy_result.toUpperCase() + ' (legacy v1 commitment: ' + (e.state_commitment || 'none') + ')';
   }
   document.getElementById('right-pane-title').textContent = 'Ed25519 Host Signature Record';
   document.getElementById('receipt-output').textContent = JSON.stringify(e, null, 2);
@@ -991,8 +1028,8 @@ function inspectEvidence(idx) {
 
 async function inspectAndVerifyBundle(bundleHash) {
   latestBundleHash = bundleHash;
-  document.getElementById('left-pane-title').textContent = 'Exporting Bundle ' + bundleHash.slice(0, 16) + '...';
-  const expRes = await fetch('/v1/bundles/' + encodeURIComponent(bundleHash) + '/export', { headers: authHeaders() });
+  document.getElementById('left-pane-title').textContent = 'Exporting O(log N) Merkle Archive ' + bundleHash.slice(0, 16) + '...';
+  const expRes = await fetch('/v1/bundles/' + encodeURIComponent(bundleHash) + '/export?mode=merkle', { headers: authHeaders() });
   if (!expRes.ok) {
     document.getElementById('context-output').textContent = 'Export failed: HTTP ' + expRes.status;
     return;
@@ -1007,7 +1044,7 @@ async function inspectAndVerifyBundle(bundleHash) {
 
   document.getElementById('left-pane-title').textContent = 'Canonical ContextBundle (' + bundleHash.slice(0, 16) + '...)';
   document.getElementById('context-output').textContent = JSON.stringify(archive.bundle, null, 2);
-  document.getElementById('right-pane-title').textContent = 'Ed25519 + RFC 8785 JCS + BLAKE3 Verification';
+  document.getElementById('right-pane-title').textContent = 'Ed25519 + RFC 6962 Merkle Inclusion Verification';
   document.getElementById('receipt-output').textContent = JSON.stringify(verJson, null, 2);
 }
 
@@ -1130,7 +1167,7 @@ async function runTamperAudit() {
   if (!latestBundleHash) {
     await runSeedAndCompile();
   }
-  const expRes = await fetch('/v1/bundles/' + latestBundleHash + '/export', { headers: authHeaders() });
+  const expRes = await fetch('/v1/bundles/' + latestBundleHash + '/export?mode=merkle', { headers: authHeaders() });
   const archive = await expRes.json();
 
   const validRes = await fetch('/v1/verify', {
@@ -1149,15 +1186,16 @@ async function runTamperAudit() {
   });
   const tamperJson = await tamperRes.json();
 
-  document.getElementById('left-pane-title').textContent = 'Authentic vs 1-Field Mutated Archive Verification';
+  document.getElementById('left-pane-title').textContent = 'O(log N) Merkle Archive vs 1-Field Mutated Verification';
   document.getElementById('context-output').textContent =
-    '1) AUTHENTIC EXPORT ARCHIVE (/v1/verify -> HTTP ' + validRes.status + '):\n' +
+    '1) COMPACT MERKLE EXPORT ARCHIVE (?mode=merkle -> HTTP ' + validRes.status + '):\n' +
     JSON.stringify(validJson, null, 2) +
     '\n\n2) MUTATED CLAIM ARCHIVE (object_val forged to 999999 -> HTTP ' + tamperRes.status + '):\n' +
     JSON.stringify(tamperJson, null, 2);
   document.getElementById('right-pane-title').textContent = 'Cryptographic Tamper Verdict';
   document.getElementById('receipt-output').textContent = JSON.stringify({
     authentic_verified: validJson.verified,
+    verification_mode: validJson.summary ? validJson.summary.verification_mode : null,
     forged_verified: tamperJson.verified,
     forged_rejection_reason: tamperJson.error
   }, null, 2);
@@ -1180,14 +1218,14 @@ async function runMcpCheck() {
     method: 'POST', headers: mcpHeaders,
     body: JSON.stringify({
       jsonrpc: '2.0', id: 2, method: 'tools/call',
-      params: { name: 'acta_verify_bundle', arguments: { bundle_hash: latestBundleHash } }
+      params: { name: 'acta_verify_bundle', arguments: { bundle_hash: latestBundleHash, proof_mode: 'merkle', dump_preimages: true } }
     })
   });
   const callJson = await callRes.json();
 
-  document.getElementById('left-pane-title').textContent = 'MCP JSON-RPC 2.0 tools/list Discovery';
+  document.getElementById('left-pane-title').textContent = 'MCP JSON-RPC 2.0 tools/list Discovery (10 Tools)';
   document.getElementById('context-output').textContent = JSON.stringify(listJson, null, 2);
-  document.getElementById('right-pane-title').textContent = 'MCP tools/call (acta_verify_bundle)';
+  document.getElementById('right-pane-title').textContent = 'MCP tools/call (acta_verify_bundle proof_mode=merkle)';
   document.getElementById('receipt-output').textContent = JSON.stringify(callJson, null, 2);
 }
 

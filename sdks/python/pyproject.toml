@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "acta-sdk"
-version = "1.5.0"
-description = "Official Python SDK, Git-Aware Global MCP Bridge (acta-mcp), Offline Epistemic Notary Verifier, and Gemini Guard for Acta Compiler v1.5"
+version = "1.6.0"
+description = "Official Python SDK, Git-Aware Global MCP Bridge (acta-mcp), RFC 6962 Merkle Verifier, Epistemic Notary, and Gemini Guard for Acta Compiler v1.6.0"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr = %cfg.bind_addr,
         host_public_key = %pubkey_hex,
         github_oauth_enabled = github_oauth_enabled,
-        "acta-server v1.5.0 Epistemic Notary control plane & MCP OAuth 2.1 gateway listening"
+        "acta-server v1.6.0 Epistemic Notary & RFC 6962 Merkle Checkpoint gateway listening"
     );
 
     axum::serve(listener, app)

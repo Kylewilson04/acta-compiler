@@ -179,6 +179,46 @@ pub fn compute_claim_content_hash(claim: &KnowledgeClaim) -> ActaResult<[u8; 32]
     ]))
 }
 
+/// Deterministic clock-free client signing digest (`b"acta:override_client_sig:v1"`) so external
+/// human/committee Ed25519 keys can sign an override adjudication offline without knowing the
+/// server's generated UUID or microsecond timestamp.
+pub fn compute_override_client_intent_hash(
+    tenant_id: &str,
+    scope: &str,
+    winning_claim_id: Uuid,
+    adjudicator_id: &str,
+    justification: &str,
+) -> [u8; 32] {
+    hash_length_delimited(&[
+        b"acta:override_client_sig:v1",
+        tenant_id.as_bytes(),
+        scope.as_bytes(),
+        winning_claim_id.as_bytes(),
+        adjudicator_id.as_bytes(),
+        justification.as_bytes(),
+    ])
+}
+
+/// Computes the deterministic 32-byte `checkpoint_hash` for a `SignedTreeHead` (`v1.6+`).
+pub fn compute_checkpoint_hash(
+    tenant_id: &str,
+    tree_size: i64,
+    head_event_hash: &[u8; 32],
+    merkle_root: &[u8; 32],
+    issued_at_micros: i64,
+) -> [u8; 32] {
+    let size_le = tree_size.to_le_bytes();
+    let micros_le = issued_at_micros.to_le_bytes();
+    hash_length_delimited(&[
+        b"acta:checkpoint:v1",
+        tenant_id.as_bytes(),
+        &size_le,
+        head_event_hash,
+        merkle_root,
+        &micros_le,
+    ])
+}
+
 /// Input parameters hashed into `OverrideAttestation.attestation_hash` (`b"acta:override:v1"`).
 pub struct OverrideHashInput<'a> {
     pub id: Uuid,
@@ -290,9 +330,8 @@ pub fn compute_evidence_event_hash(
 
 /// Computes the deterministic `event_hash` for an `evidence_history` entry:
 /// - Uses `b"acta:evidence_event:v1"` whenever `refusal_metadata.is_none() && override_summary.is_none()`
-///   (100% backward-compatible with all `Allow` compile entries and all v1.0–v1.4 historical rows).
 /// - Uses `b"acta:evidence_event:v2"` binding canonical `refusal_metadata` and `override_summary`
-///   whenever either metadata struct is present, preventing any tampering OR stripping of audit metadata.
+///   whenever either metadata struct is present.
 pub fn compute_evidence_event_hash_with_meta(
     tenant_id: &str,
     seq_num: i64,

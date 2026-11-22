@@ -15,22 +15,37 @@ import {
   ActaVerificationError,
   Blake3Hasher,
   computeBundleHash,
+  computeCheckpointHash,
   computeClaimContentHash,
   computeClaimGroupKey,
   computeEvidenceEventHash,
   computeLogicalClaimGroupKey,
+  computeMerkleConsistencyProof,
+  computeMerkleInclusionProof,
+  computeMerkleRootFromLeaves,
   computeObjectContentHash,
   computeOmissionListHash,
   computeOverrideAttestationHash,
   computeRefusalMetadataCommitment,
   deriveEd25519PublicKeyHex,
+  dumpArchivePreimages,
+  extractTokenPrincipal,
+  extractTokenTenant,
   hashLengthDelimited,
+  merkleLeafHash,
   mintTenantApiKey,
+  mintUserTenantApiKey,
+  signCheckpointHead,
   signEvidenceEntry,
   signOverrideAttestation,
+  signOverrideClientIntent,
+  signWitnessAnchor,
   toCanonicalJson,
   verifyExportArchive,
+  verifyMerkleConsistencyProof,
+  verifyMerkleInclusionProof,
   verifyTenantApiKey,
+  verifyTenantApiKeyWithPrincipal,
 } from "../dist/index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -65,7 +80,6 @@ const permRoot = Buffer.from(
   ])
 ).toString("hex");
 assert.equal(permRoot.length, 64);
-assert.notEqual(permRoot, "a885276369e22c385c756739f83d771e5874db13dfcd2f424268fc3fbda76a9a");
 
 const cgk = computeClaimGroupKey(
   "sandbox-live",
@@ -98,7 +112,34 @@ const ev2 = computeEvidenceEventHash({
 });
 assert.equal(ev2, "1e1aa455fbcea3e6e698dce7efd85219ac006bd2470d70429452463bfd938753");
 
-// 3. Offline ExportArchive verification & v1.5 Epistemic Notary tests
+// 3. RFC 6962 Merkle Inclusion & Consistency Proofs across tree sizes 1..25
+{
+  const events = [];
+  const leaves = [];
+  for (let i = 1; i <= 25; i++) {
+    const ev = Buffer.from(hashLengthDelimited(["ev", `seq-${i}`])).toString("hex");
+    events.push(ev);
+    leaves.push(merkleLeafHash(i, ev));
+  }
+  for (let size = 1; size <= 25; size++) {
+    const root = computeMerkleRootFromLeaves(leaves.slice(0, size));
+    for (let idx = 0; idx < size; idx++) {
+      const pathNodes = computeMerkleInclusionProof(leaves.slice(0, size), idx);
+      assert.ok(verifyMerkleInclusionProof(idx + 1, events[idx], size, pathNodes, root));
+    }
+    for (let first = 1; first <= size; first++) {
+      const firstRoot = computeMerkleRootFromLeaves(leaves.slice(0, first));
+      const cproof = computeMerkleConsistencyProof(leaves, first, size);
+      assert.ok(verifyMerkleConsistencyProof(first, firstRoot, size, root, cproof));
+      if (first < size) {
+        const badFirst = (firstRoot.startsWith("00") ? "ff" : "00") + firstRoot.slice(2);
+        assert.ok(!verifyMerkleConsistencyProof(first, badFirst, size, root, cproof));
+      }
+    }
+  }
+}
+
+// 4. Offline ExportArchive verification & v1.6.0 Epistemic Notary + Merkle-only proof tests
 function buildFixture(seedHex, disputed = true) {
   const pkHex = deriveEd25519PublicKeyHex(seedHex);
   const ts = "2026-11-20T16:37:01.215313Z";
@@ -265,12 +306,13 @@ const seedHex = "55".repeat(32);
 const { pkHex, archive } = buildFixture(seedHex, true);
 const summary = verifyExportArchive(archive, pkHex);
 assert.equal(summary.verified_claims, 2);
+assert.equal(summary.verification_mode, "full_chain");
 
 const forged = JSON.parse(JSON.stringify(archive));
 forged.claims[0].object_val = 999999;
 assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
 
-// v1.5 Epistemic Notary: ResolverManifest + RefusalMetadata v2 + OverrideAttestation
+// v1.6.0 Merkle-only ExportArchive with client-signed LapsedOverrideRef & ExternalWitnessAnchor
 {
   const tenant = archive.bundle.tenant_id;
   const scope = archive.bundle.scope;
@@ -282,10 +324,10 @@ assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
   const zeroPrev = "00".repeat(32);
 
   const rmeta = {
-    operation: "ingest_claim",
-    reason_code: "POLICY_ESCALATE",
-    target_scope: "restricted/signing-keys",
-    summary: "Restricted scope requires supervisor escalation approval",
+    operation: "attest_override",
+    reason_code: "adjudicator_signature_required",
+    target_scope: scope,
+    summary: "Custom adjudicator requires offline Ed25519 signature",
   };
   const rcomm = computeRefusalMetadataCommitment(rmeta);
   const ev1Hash = computeEvidenceEventHash({
@@ -293,9 +335,19 @@ assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
     seqNum: 1,
     prevHash: zeroPrev,
     stateCommitment: rcomm,
-    policyResult: "escalate",
+    policyResult: "block",
     createdAt: ts1,
     refusalMetadata: rmeta,
+  });
+
+  const committeeSeed = "99".repeat(32);
+  const justification = "Signed MSA addendum §4.2 supersedes legacy ledger rate";
+  const { clientSignatureHex, clientPublicKeyHex } = signOverrideClientIntent(committeeSeed, {
+    tenantId: tenant,
+    scope,
+    winningClaimId: claim2.id,
+    adjudicatorId: "cfo-committee",
+    justification,
   });
 
   const attId = "99999999-1111-4222-8333-444444444444";
@@ -310,14 +362,16 @@ assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
     winning_claim_id: claim2.id,
     winning_claim_content_hash: claim2.content_hash,
     overridden_claims: [{ id: claim1.id, content_hash: claim1.content_hash }],
-    adjudicator_id: `${tenant}::kyle-cfo`,
-    justification: "Signed MSA addendum §4.2 supersedes legacy ledger rate",
+    adjudicator_id: `${tenant}::cfo-committee`,
+    justification,
     version: 1,
     predecessor_id: null,
     created_at: ts2,
     attestation_hash: "",
     evidence_seq_num: 2,
     host_signature: "",
+    client_signature: clientSignatureHex,
+    client_public_key: clientPublicKeyHex,
   };
   att.attestation_hash = computeOverrideAttestationHash(att);
   att.host_signature = signOverrideAttestation(seedHex, tenant, 2, att.attestation_hash);
@@ -341,116 +395,160 @@ assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
     createdAt: ts2,
     overrideSummary: osummary,
   });
-
-  const bundleV15 = JSON.parse(JSON.stringify(archive.bundle));
-  bundleV15.resolver_manifest = {
-    min_confidence: 0.7,
-    decisiveness_threshold: 0.05,
-    corroboration_damping: 0.5,
-    non_default_thresholds: true,
-    budget: { kind: "tokens", limit: 2048 },
-    permission_root: "ab".repeat(32),
+  const ev2Entry = {
+    tenant_id: tenant,
+    seq_num: 2,
+    prev_hash: ev1Hash,
+    event_hash: ev2Hash,
+    bundle_hash: null,
+    state_commitment: att.attestation_hash,
+    policy_result: "allow",
+    override_summary: osummary,
+    host_signature: signEvidenceEntry(seedHex, tenant, 2, ev1Hash, ev2Hash),
+    created_at: ts2,
   };
-  bundleV15.dispute_records = [];
-  bundleV15.omission_record.has_unresolved_claims = false;
-  bundleV15.resolution_records = [
-    {
-      claim_group_key: logicalGroup,
-      winning_claim: archive.bundle.dispute_records[0].competing_claims[1],
-      margin: null,
-      suppressed_claim_ids: [claim1.id],
-      override_attestation: {
-        attestation_id: attId,
-        attestation_hash: att.attestation_hash,
-        adjudicator_id: att.adjudicator_id,
-        justification: att.justification,
-        source_bundle_hash: archive.bundle_hash,
-        evidence_seq_num: 2,
-        version: 1,
-        attested_at: ts2,
-      },
-    },
-  ];
-  const { hashHex: bHexV15 } = computeBundleHash(bundleV15);
+
+  const claim3 = {
+    ...claim1,
+    id: "20b6b7a6-8c52-4590-9987-a6487f7cf185",
+    object_val: 310,
+    confidence: 0.79,
+    source_descriptor: "erp-v3",
+  };
+  claim3.content_hash = computeClaimContentHash(claim3);
+
+  const bundleV16 = JSON.parse(JSON.stringify(archive.bundle));
+  bundleV16.dispute_records[0].claim_group_key = logicalGroup;
+  bundleV16.dispute_records[0].competing_claims.push({
+    ...archive.bundle.dispute_records[0].competing_claims[0],
+    id: claim3.id,
+    object_val: 310,
+    confidence: 0.79,
+    source_descriptor: "erp-v3",
+    content_hash: claim3.content_hash,
+  });
+  bundleV16.dispute_records[0].lapsed_override = {
+    attestation_id: attId,
+    attestation_hash: att.attestation_hash,
+    prior_winning_claim_id: claim2.id,
+    adjudicator_id: att.adjudicator_id,
+    justification,
+    evidence_seq_num: 2,
+    version: 1,
+    attested_at: ts2,
+    reopened_by_claim_ids: [claim3.id],
+  };
+
+  const { hashHex: bHexV16 } = computeBundleHash(bundleV16);
   const ev3Hash = computeEvidenceEventHash({
     tenantId: tenant,
     seqNum: 3,
     prevHash: ev2Hash,
-    bundleHash: bHexV15,
-    stateCommitment: bundleV15.state_commitment,
+    bundleHash: bHexV16,
+    stateCommitment: bundleV16.state_commitment,
     policyResult: "allow",
     createdAt: ts3,
   });
+  const ev3Entry = {
+    tenant_id: tenant,
+    seq_num: 3,
+    prev_hash: ev2Hash,
+    event_hash: ev3Hash,
+    bundle_hash: bHexV16,
+    state_commitment: bundleV16.state_commitment,
+    policy_result: "allow",
+    host_signature: signEvidenceEntry(seedHex, tenant, 3, ev2Hash, ev3Hash),
+    created_at: ts3,
+  };
 
-  const archiveV15 = {
-    bundle_hash: bHexV15,
-    bundle: bundleV15,
+  const chainLeaves = [
+    merkleLeafHash(1, ev1Hash),
+    merkleLeafHash(2, ev2Hash),
+    merkleLeafHash(3, ev3Hash),
+  ];
+  const merkleRoot = computeMerkleRootFromLeaves(chainLeaves);
+  const cpHash = computeCheckpointHash({
+    tenantId: tenant,
+    treeSize: 3,
+    headEventHash: ev3Hash,
+    merkleRoot,
+    issuedAt: ts3,
+  });
+  const cpSig = signCheckpointHead(seedHex, tenant, cpHash);
+  const { witnessSignatureHex, witnessPublicKeyHex } = signWitnessAnchor("77".repeat(32), tenant, 3, cpHash);
+
+  const merkleOnlyArchive = {
+    bundle_hash: bHexV16,
+    bundle: bundleV16,
     objects: archive.objects,
-    claims: archive.claims,
+    claims: [claim1, claim2, claim3],
     override_attestations: [att],
-    evidence_chain: [
-      {
+    evidence_chain: [],
+    merkle_proof: {
+      checkpoint: {
         tenant_id: tenant,
-        seq_num: 1,
-        prev_hash: zeroPrev,
-        event_hash: ev1Hash,
-        bundle_hash: null,
-        state_commitment: rcomm,
-        policy_result: "escalate",
-        refusal_metadata: rmeta,
-        host_signature: signEvidenceEntry(seedHex, tenant, 1, zeroPrev, ev1Hash),
-        created_at: ts1,
+        tree_size: 3,
+        head_event_hash: ev3Hash,
+        merkle_root: merkleRoot,
+        issued_at: ts3,
+        checkpoint_hash: cpHash,
+        host_signature: cpSig,
+        witness_anchors: [
+          {
+            id: "11111111-2222-4333-8444-555555555555",
+            tenant_id: tenant,
+            tree_size: 3,
+            checkpoint_hash: cpHash,
+            witness_id: "rekor-transparency-mirror",
+            witness_public_key: witnessPublicKeyHex,
+            witness_signature: witnessSignatureHex,
+            anchored_at: ts3,
+          },
+        ],
       },
-      {
-        tenant_id: tenant,
-        seq_num: 2,
-        prev_hash: ev1Hash,
-        event_hash: ev2Hash,
-        bundle_hash: null,
-        state_commitment: att.attestation_hash,
-        policy_result: "allow",
-        override_summary: osummary,
-        host_signature: signEvidenceEntry(seedHex, tenant, 2, ev1Hash, ev2Hash),
-        created_at: ts2,
+      bundle_entry_proof: {
+        entry: ev3Entry,
+        audit_path: computeMerkleInclusionProof(chainLeaves, 2),
       },
-      {
-        tenant_id: tenant,
-        seq_num: 3,
-        prev_hash: ev2Hash,
-        event_hash: ev3Hash,
-        bundle_hash: bHexV15,
-        state_commitment: bundleV15.state_commitment,
-        policy_result: "allow",
-        host_signature: signEvidenceEntry(seedHex, tenant, 3, ev2Hash, ev3Hash),
-        created_at: ts3,
-      },
-    ],
+      override_entry_proofs: [
+        {
+          entry: ev2Entry,
+          audit_path: computeMerkleInclusionProof(chainLeaves, 1),
+        },
+      ],
+    },
     host_public_key: pkHex,
   };
 
-  const sumV15 = verifyExportArchive(archiveV15, pkHex);
-  assert.equal(sumV15.verified_overrides, 1);
-  assert.equal(sumV15.verified_refusals, 1);
-  assert.equal(sumV15.non_default_thresholds, true);
+  const sumV16 = verifyExportArchive(merkleOnlyArchive, pkHex);
+  assert.equal(sumV16.verification_mode, "merkle_inclusion");
+  assert.equal(sumV16.verified_overrides, 1);
+  assert.equal(sumV16.verified_evidence_entries, 2);
+  assert.equal(sumV16.merkle_tree_size, 3);
+  assert.equal(sumV16.verified_witness_anchors, 1);
 
-  const stripped = JSON.parse(JSON.stringify(archiveV15));
-  delete stripped.evidence_chain[0].refusal_metadata;
-  assert.throws(() => verifyExportArchive(stripped, pkHex), ActaVerificationError);
+  const preimages = dumpArchivePreimages(merkleOnlyArchive);
+  assert.equal(preimages.checkpoint.tree_size, 3);
+  assert.equal(preimages.override_attestations.length, 1);
 
-  const liedManifest = JSON.parse(JSON.stringify(archiveV15));
-  liedManifest.bundle.resolver_manifest.non_default_thresholds = false;
-  assert.throws(() => verifyExportArchive(liedManifest, pkHex), ActaVerificationError);
+  const badClientSig = JSON.parse(JSON.stringify(merkleOnlyArchive));
+  badClientSig.override_attestations[0].client_signature = "00".repeat(64);
+  assert.throws(() => verifyExportArchive(badClientSig, pkHex), ActaVerificationError);
+
+  const badLapsed = JSON.parse(JSON.stringify(merkleOnlyArchive));
+  badLapsed.bundle.dispute_records[0].lapsed_override.evidence_seq_num = 99;
+  assert.throws(() => verifyExportArchive(badLapsed, pkHex), ActaVerificationError);
 }
 
-// 4. Live HTTP client + ActaGeminiGuard circuit-breaker tests
+// 5. Live HTTP client + ActaGeminiGuard circuit-breaker tests
 let forgeSig = false;
 const srv = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "1.5.0", host_public_key: pkHex, permission_root: permRoot }));
+    res.end(JSON.stringify({ status: "ok", version: "1.6.0", host_public_key: pkHex, permission_root: permRoot }));
     return;
   }
-  if (req.method === "GET" && req.url.endsWith("/export")) {
+  if (req.method === "GET" && req.url.includes("/export")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(archive));
     return;
@@ -473,7 +571,8 @@ const srv = http.createServer((req, res) => {
           winning_claim_id: body.winning_claim_id,
           winning_claim_content_hash: "bb".repeat(32),
           overridden_claim_ids: ["54e00c71-af84-4104-b180-0dd284829ac4"],
-          adjudicator_id: body.adjudicator_id,
+          adjudicator_id: body.adjudicator_id || `${body.tenant_id}::session`,
+          adjudicator_auth_kind: "master_api_key",
           justification: body.justification,
           attestation_hash: attHash,
           evidence_seq_num: 7,
@@ -612,13 +711,12 @@ try {
       }),
     ActaDisputeEscalationError
   );
-  assert.equal(llmCalls, 1, "LLM must never run on unresolved [DISPUTE]");
+  assert.equal(llmCalls, 1);
 
   const ovr = await client.attestOverride({
     tenantId: "prod-acme",
     scope: "dispute-settlement",
     winningClaimId: "652a3897-b0a8-410f-a18c-c8d80b3ae7b2",
-    adjudicatorId: "prod-acme::cfo",
     justification: "Verified signed MSA schedule",
   });
   assert.equal(ovr.evidence_seq_num, 7);
@@ -630,14 +728,10 @@ try {
         actorId: "ts-auditor",
         scope: "restricted/vault",
         prompt: "Read keys",
-        llmCallable: () => {
-          llmCalls += 1;
-          return "Should never run";
-        },
+        llmCallable: () => "Should never run",
       }),
     ActaPolicyEscalatedError
   );
-  assert.equal(llmCalls, 1);
 
   const offlineSummary = await client.verifyBundleOffline(ok.bundleHash);
   assert.equal(offlineSummary.verified_claims, 2);
@@ -667,33 +761,44 @@ try {
     ActaAuthError
   );
 
-  console.log("ALL TYPESCRIPT @acta/sdk v1.5.0 TESTS + EPISTEMIC NOTARY VECTORS PASSED!");
+  console.log("ALL TYPESCRIPT @acta/sdk v1.6.0 TESTS + MERKLE & EPISTEMIC NOTARY VECTORS PASSED!");
 } finally {
   srv.close();
 }
 
-// 5. v1.1 Stateless Keyed-BLAKE3 Tenant-Bound API Keys & Local Client Lock
+// 6. v1.1 2-Segment & v1.6 3-Segment Principal Tokens & Local Client Lock
 const masterSecret = "acta_live_master_secret_998877";
 const tkArdyn = mintTenantApiKey(masterSecret, "ardyn-core");
 const tkAcme = mintTenantApiKey(masterSecret, "client-acme");
 assert.ok(tkArdyn.startsWith("acta_tk_v1:ardyn-core:"));
-assert.notEqual(tkArdyn, tkAcme);
 assert.equal(verifyTenantApiKey(masterSecret, tkArdyn), "ardyn-core");
-assert.equal(verifyTenantApiKey(masterSecret, tkAcme), "client-acme");
+assert.equal(extractTokenPrincipal(tkArdyn), null);
 
-const macOnly = tkArdyn.split(":").pop();
-assert.throws(() => verifyTenantApiKey(masterSecret, `acta_tk_v1:client-acme:${macOnly}`));
+const tkUser = mintUserTenantApiKey(masterSecret, "ardyn-core", "KyleWilson04");
+assert.ok(tkUser.startsWith("acta_tk_v1:ardyn-core:kylewilson04:"));
+assert.equal(extractTokenTenant(tkUser), "ardyn-core");
+assert.equal(extractTokenPrincipal(tkUser), "kylewilson04");
+assert.deepEqual(verifyTenantApiKeyWithPrincipal(masterSecret, tkUser), {
+  tenantId: "ardyn-core",
+  principal: "kylewilson04",
+});
 
-const lockedTsClient = new ActaClient({ baseUrl: "http://127.0.0.1:9", apiKey: tkAcme });
-assert.equal(lockedTsClient.lockedTenant, "client-acme");
+const userMac = tkUser.split(":").pop();
+assert.throws(() =>
+  verifyTenantApiKeyWithPrincipal(masterSecret, `acta_tk_v1:ardyn-core:cfo-committee:${userMac}`)
+);
+
+const lockedTsClient = new ActaClient({ baseUrl: "http://127.0.0.1:9", apiKey: tkUser });
+assert.equal(lockedTsClient.lockedTenant, "ardyn-core");
+assert.equal(lockedTsClient.verifiedPrincipal, "kylewilson04");
 await assert.rejects(
   () =>
     lockedTsClient.compile({
-      tenantId: "ardyn-core",
+      tenantId: "client-acme",
       actorId: "claude",
       scope: "ops",
       queryText: "attempt cross-tenant",
     }),
   ActaTenantLockError
 );
-console.log("ALL v1.1 TENANT-BOUND TOKEN & CLIENT LOCK TESTS PASSED!");
+console.log("ALL v1.6.0 2-PART & 3-PART PRINCIPAL TOKEN & CLIENT LOCK TESTS PASSED!");

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use acta_crypto::{
-    mint_signed_envelope, mint_tenant_api_key, normalize_github_slug, verify_pkce_s256,
-    verify_signed_envelope, verify_tenant_api_key, TENANT_TOKEN_PREFIX,
+    mint_signed_envelope, mint_tenant_api_key, mint_user_tenant_api_key, normalize_github_slug,
+    verify_pkce_s256, verify_signed_envelope, verify_tenant_api_key_with_principal,
+    TENANT_TOKEN_PREFIX,
 };
 use axum::{
     body::Bytes,
@@ -312,7 +313,6 @@ fn redirect_uri_matches_registered(registered: &str, requested: &str) -> bool {
     if registered == requested {
         return true;
     }
-    // RFC 8252 §7.3: native loopback clients may bind an ephemeral port at authorize time.
     if let (Some((reg_host, reg_path)), Some((req_host, req_path))) = (
         is_loopback_http_uri(registered),
         is_loopback_http_uri(requested),
@@ -351,7 +351,6 @@ fn validate_client_and_redirect(
         return Ok(reg.client_name);
     }
 
-    // CIMD (`client_id` is an `https://` metadata URL)
     if let Some(cid_host) = extract_https_host(cid) {
         if is_loopback_http_uri(ruri).is_some() || is_ide_custom_scheme_uri(ruri) {
             return Ok(cid_host.to_string());
@@ -372,7 +371,6 @@ fn validate_client_and_redirect(
         ));
     }
 
-    // Public unregistered native MCP clients (Cursor, Claude Desktop/Code, Gemini CLI, MCP Inspector)
     if is_loopback_http_uri(ruri).is_some()
         || is_ide_custom_scheme_uri(ruri)
         || matches!(
@@ -400,7 +398,6 @@ fn build_client_callback_url(redirect_uri: &str, code: &str, state: Option<&str>
 }
 
 /// `GET /.well-known/oauth-protected-resource` & `GET /.well-known/oauth-protected-resource/mcp`
-/// Implements RFC 9728 OAuth 2.0 Protected Resource Metadata for MCP discovery.
 pub async fn handle_protected_resource_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -418,7 +415,6 @@ pub async fn handle_protected_resource_metadata(
 }
 
 /// `GET /.well-known/oauth-authorization-server` & `GET /.well-known/openid-configuration`
-/// Implements RFC 8414 Authorization Server Metadata advertising OAuth 2.1 + PKCE S256 + DCR + CIMD.
 pub async fn handle_authorization_server_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -527,7 +523,6 @@ pub async fn handle_authorize(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    // Direct redirect when user clicks the "Sign in with GitHub" button on the consent screen
     if let Some(otx_tok) = params.get("otx") {
         let select_org = params
             .get("select_org")
@@ -911,8 +906,6 @@ pub async fn handle_github_callback(
     let org_count = options.iter().filter(|o| o.kind == "github_org").count();
     let is_ui_session = otx.scope.split_whitespace().any(|s| s == "acta:ui");
 
-    // Control Plane UI sign-in (`scope=acta:ui`) routes straight back to `/` in 1 click
-    // carrying all GitHub-verified vaults so the header Vault Switcher can toggle seamlessly.
     if is_ui_session || (!otx.select_org && state.oauth.auto_select_single_org && org_count <= 1) {
         let chosen = if org_count >= 1 {
             options
@@ -936,7 +929,6 @@ pub async fn handle_github_callback(
         );
     }
 
-    // Multiple GitHub organizations (e.g. consultant across multiple client orgs) -> 1-click picker!
     let picker = OrgPickerEnvelope {
         otx: otx.clone(),
         github_login: gh_user.login.clone(),
@@ -1054,9 +1046,9 @@ pub async fn handle_key_login(State(state): State<AppState>, body: Bytes) -> Res
         );
     }
 
-    let resolved_tenant = if raw_key.starts_with(TENANT_TOKEN_PREFIX) {
-        match verify_tenant_api_key(state.effective_token_secret(), raw_key) {
-            Ok(locked) => {
+    let (resolved_tenant, resolved_principal) = if raw_key.starts_with(TENANT_TOKEN_PREFIX) {
+        match verify_tenant_api_key_with_principal(state.effective_token_secret(), raw_key) {
+            Ok((locked, principal)) => {
                 if !requested_tenant.is_empty() && requested_tenant != locked {
                     return render_oauth_error_html(
                         StatusCode::FORBIDDEN,
@@ -1066,7 +1058,7 @@ pub async fn handle_key_login(State(state): State<AppState>, body: Bytes) -> Res
                         ),
                     );
                 }
-                locked
+                (locked, principal)
             }
             Err(e) => {
                 return render_oauth_error_html(StatusCode::UNAUTHORIZED, "Invalid Key", &e);
@@ -1081,7 +1073,7 @@ pub async fn handle_key_login(State(state): State<AppState>, body: Bytes) -> Res
             return render_oauth_error_html(StatusCode::UNAUTHORIZED, "Invalid Master Key", &e);
         }
         match normalize_github_slug(requested_tenant) {
-            Ok(slug) => slug,
+            Ok(slug) => (slug, None),
             Err(_) => {
                 return render_oauth_error_html(
                     StatusCode::BAD_REQUEST,
@@ -1092,7 +1084,7 @@ pub async fn handle_key_login(State(state): State<AppState>, body: Bytes) -> Res
         }
     };
 
-    issue_auth_code_redirect(&state, &otx, &resolved_tenant, None, Vec::new())
+    issue_auth_code_redirect(&state, &otx, &resolved_tenant, resolved_principal, Vec::new())
 }
 
 fn issue_auth_code_redirect(
@@ -1149,7 +1141,7 @@ fn extract_basic_client_id(headers: &HeaderMap) -> Option<String> {
 }
 
 /// `POST /oauth/token` -> OAuth 2.1 Token Endpoint (`authorization_code` + PKCE `S256` & `refresh_token`).
-/// Mints a stateless Keyed-BLAKE3 `acta_tk_v1:<github_org_slug>:<mac>` Bearer token!
+/// Mints a principal-bound `acta_tk_v1:<github_org_slug>:<github_login>:<mac>` Bearer token (`v1.6+`)!
 pub async fn handle_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1340,7 +1332,16 @@ fn issue_oauth_token_response(
     available_vaults: Vec<CandidateOrgOption>,
 ) -> Response {
     let secret = state.effective_token_secret();
-    let Ok(access_token) = mint_tenant_api_key(secret, tenant_id) else {
+    let gh_clean = github_login
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let tok_res = match gh_clean {
+        Some(gh) => mint_user_tenant_api_key(secret, tenant_id, gh),
+        None => mint_tenant_api_key(secret, tenant_id),
+    };
+    let Ok(access_token) = tok_res else {
         return oauth_json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -1358,7 +1359,10 @@ fn issue_oauth_token_response(
         available_vaults
             .iter()
             .filter_map(|opt| {
-                let tok = mint_tenant_api_key(secret, &opt.slug).ok()?;
+                let tok = match gh_clean {
+                    Some(gh) => mint_user_tenant_api_key(secret, &opt.slug, gh).ok()?,
+                    None => mint_tenant_api_key(secret, &opt.slug).ok()?,
+                };
                 Some(json!({
                     "tenant_id": opt.slug,
                     "label": opt.label,
@@ -1477,9 +1481,9 @@ fn render_authorize_signin_html(
 </head>
 <body>
   <div class="card">
-    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256</span>
+    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256 · v1.6.0</span>
     <h1>Connect {client_esc}</h1>
-    <p class="sub">Sign in with GitHub to automatically bind <strong>{client_esc}</strong> to your GitHub Organization's cryptographic context vault.</p>
+    <p class="sub">Sign in with GitHub to cryptographically bind <strong>{client_esc}</strong> to your GitHub Organization vault and OAuth principal.</p>
     {github_section}
     <details {details_open}>
       <summary>Or authorize with an Acta Key (acta_tk_v1 / Master Key)</summary>

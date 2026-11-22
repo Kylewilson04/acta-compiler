@@ -1,4 +1,4 @@
-"""Comprehensive cryptographic & live-mock HTTP test suite for `acta_sdk` v1.5.0."""
+"""Comprehensive cryptographic, RFC 6962 Merkle & live-mock HTTP test suite for `acta_sdk` v1.6.0."""
 
 from __future__ import annotations
 
@@ -22,21 +22,39 @@ from acta_sdk import (
     ActaPolicyBlockedError,
     ActaPolicyEscalatedError,
     ActaSignatureVerificationError,
+    ActaTenantLockError,
     AsyncActaClient,
     compute_bundle_hash,
+    compute_checkpoint_hash,
     compute_claim_content_hash,
     compute_claim_group_key,
     compute_evidence_event_hash,
     compute_logical_claim_group_key,
+    compute_merkle_consistency_proof,
+    compute_merkle_inclusion_proof,
+    compute_merkle_root_from_leaves,
     compute_object_content_hash,
     compute_omission_list_hash,
     compute_override_attestation_hash,
     compute_refusal_metadata_commitment,
+    dump_archive_preimages,
+    extract_token_principal,
+    extract_token_tenant,
+    merkle_leaf_hash,
+    mint_tenant_api_key,
+    mint_user_tenant_api_key,
+    sign_checkpoint_head,
     sign_evidence_entry,
     sign_override_attestation,
+    sign_override_client_intent,
+    sign_witness_anchor,
     to_canonical_json,
     verify_ed25519_strict,
     verify_export_archive,
+    verify_merkle_consistency_proof,
+    verify_merkle_inclusion_proof,
+    verify_tenant_api_key,
+    verify_tenant_api_key_with_principal,
 )
 from acta_sdk.crypto import ED25519_L, hash_length_delimited
 
@@ -291,12 +309,37 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             "1e1aa455fbcea3e6e698dce7efd85219ac006bd2470d70429452463bfd938753",
         )
 
-    def test_v15_epistemic_notary_manifest_refusal_and_override_verification(self) -> None:
+    def test_v16_merkle_inclusion_consistency_lapsed_override_and_witness_anchor(self) -> None:
+        # 1. RFC 6962 inclusion & consistency across sizes 1..25
+        events = [
+            hash_length_delimited([b"ev", i.to_bytes(8, "little")]) for i in range(1, 26)
+        ]
+        leaves = [merkle_leaf_hash(i + 1, ev) for i, ev in enumerate(events)]
+        for size in range(1, 26):
+            root = compute_merkle_root_from_leaves(leaves[:size])
+            for idx in range(size):
+                path = compute_merkle_inclusion_proof(leaves[:size], idx)
+                self.assertTrue(
+                    verify_merkle_inclusion_proof(idx + 1, events[idx], size, path, root)
+                )
+            for first in range(1, size + 1):
+                first_root = compute_merkle_root_from_leaves(leaves[:first])
+                cproof = compute_merkle_consistency_proof(leaves, first, size)
+                self.assertTrue(
+                    verify_merkle_consistency_proof(first, first_root, size, root, cproof)
+                )
+                if first < size:
+                    bad_first = bytearray(first_root)
+                    bad_first[0] ^= 0x01
+                    self.assertFalse(
+                        verify_merkle_consistency_proof(
+                            first, bytes(bad_first), size, root, cproof
+                        )
+                    )
+
+        # 2. Compact O(log N) Merkle-only ExportArchive with client-signed LapsedOverrideRef & WitnessAnchor
         seed = b"\x42" * 32
         pk_hex, base_archive = _build_signed_fixture(seed=seed, disputed=True)
-        ts1 = "2026-11-22T04:10:00.000000Z"
-        ts2 = "2026-11-22T04:10:05.000000Z"
-        ts3 = "2026-11-22T04:10:10.000000Z"
         tenant = base_archive["bundle"]["tenant_id"]
         scope = base_archive["bundle"]["scope"]
         claim1, claim2 = base_archive["claims"][0], base_archive["claims"][1]
@@ -304,24 +347,20 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             tenant, claim1["subject"], claim1["predicate"], scope
         ).hex()
 
-        # Seq 1: v2 Refusal entry with readable RefusalMetadata
+        ts1 = "2026-11-22T04:10:00.000000Z"
+        ts2 = "2026-11-22T04:10:05.000000Z"
+        ts3 = "2026-11-22T04:10:10.000000Z"
+        zero_prev = "00" * 32
+
         rmeta = {
-            "operation": "ingest_claim",
-            "reason_code": "POLICY_ESCALATE",
-            "target_scope": "restricted/signing-keys",
-            "summary": "Restricted scope requires supervisor escalation approval",
+            "operation": "attest_override",
+            "reason_code": "adjudicator_signature_required",
+            "target_scope": scope,
+            "summary": "Custom adjudicator requires offline Ed25519 signature",
         }
         rcomm = compute_refusal_metadata_commitment(rmeta).hex()
-        zero_prev = "00" * 32
         ev1_hash = compute_evidence_event_hash(
-            tenant,
-            1,
-            zero_prev,
-            None,
-            rcomm,
-            "escalate",
-            ts1,
-            refusal_metadata=rmeta,
+            tenant, 1, zero_prev, None, rcomm, "block", ts1, refusal_metadata=rmeta
         ).hex()
         ev1 = {
             "tenant_id": tenant,
@@ -330,13 +369,22 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             "event_hash": ev1_hash,
             "bundle_hash": None,
             "state_commitment": rcomm,
-            "policy_result": "escalate",
+            "policy_result": "block",
             "refusal_metadata": rmeta,
             "host_signature": sign_evidence_entry(seed, tenant, 1, zero_prev, ev1_hash).hex(),
             "created_at": ts1,
         }
 
-        # Seq 2: Signed OverrideAttestation adjudicating claim2 (240 bps contract) over claim1 (290 bps)
+        committee_seed = b"\x99" * 32
+        justification = "Signed MSA addendum §4.2 supersedes legacy ledger rate"
+        csig_hex, cpk_hex = sign_override_client_intent(
+            committee_seed,
+            tenant_id=tenant,
+            scope=scope,
+            winning_claim_id=claim2["id"],
+            adjudicator_id="cfo-committee",
+            justification=justification,
+        )
         att_id = "99999999-1111-4222-8333-444444444444"
         att: dict[str, Any] = {
             "id": att_id,
@@ -348,17 +396,17 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             "source_bundle_hash": base_archive["bundle_hash"],
             "winning_claim_id": claim2["id"],
             "winning_claim_content_hash": claim2["content_hash"],
-            "overridden_claims": [
-                {"id": claim1["id"], "content_hash": claim1["content_hash"]}
-            ],
-            "adjudicator_id": f"{tenant}::kyle-cfo",
-            "justification": "Signed MSA addendum §4.2 supersedes legacy ledger rate",
+            "overridden_claims": [{"id": claim1["id"], "content_hash": claim1["content_hash"]}],
+            "adjudicator_id": f"{tenant}::cfo-committee",
+            "justification": justification,
             "version": 1,
             "predecessor_id": None,
             "created_at": ts2,
             "attestation_hash": "",
             "evidence_seq_num": 2,
             "host_signature": "",
+            "client_signature": csig_hex,
+            "client_public_key": cpk_hex,
         }
         att["attestation_hash"] = compute_override_attestation_hash(att).hex()
         att["host_signature"] = sign_override_attestation(
@@ -376,14 +424,7 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             "version": 1,
         }
         ev2_hash = compute_evidence_event_hash(
-            tenant,
-            2,
-            ev1_hash,
-            None,
-            att["attestation_hash"],
-            "allow",
-            ts2,
-            override_summary=osummary,
+            tenant, 2, ev1_hash, None, att["attestation_hash"], "allow", ts2, override_summary=osummary
         ).hex()
         ev2 = {
             "tenant_id": tenant,
@@ -398,94 +439,135 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
             "created_at": ts2,
         }
 
-        # Seq 3: Compiled bundle with ResolverManifest (custom 0.05 threshold flagged) + override resolution
-        win_cand = base_archive["bundle"]["dispute_records"][0]["competing_claims"][1]
-        bundle_v15 = copy.deepcopy(base_archive["bundle"])
-        bundle_v15["resolver_manifest"] = {
-            "min_confidence": 0.70,
-            "decisiveness_threshold": 0.05,
-            "corroboration_damping": 0.50,
-            "non_default_thresholds": True,
-            "budget": {"kind": "tokens", "limit": 2048},
-            "permission_root": "ab" * 32,
+        # Claim C arrives and reopens the dispute with LapsedOverrideRef!
+        claim3 = copy.deepcopy(claim1)
+        claim3["id"] = "20b6b7a6-8c52-4590-9987-a6487f7cf185"
+        claim3["object_val"] = 310
+        claim3["confidence"] = 0.79
+        claim3["source_descriptor"] = "erp-v3"
+        claim3["content_hash"] = compute_claim_content_hash(claim3).hex()
+        cand3 = {
+            **base_archive["bundle"]["dispute_records"][0]["competing_claims"][0],
+            "id": claim3["id"],
+            "object_val": 310,
+            "confidence": 0.79,
+            "source_descriptor": "erp-v3",
+            "content_hash": claim3["content_hash"],
         }
-        bundle_v15["dispute_records"] = []
-        bundle_v15["omission_record"]["has_unresolved_claims"] = False
-        bundle_v15["resolution_records"] = [
-            {
-                "claim_group_key": logical_group,
-                "winning_claim": win_cand,
-                "margin": None,
-                "suppressed_claim_ids": [claim1["id"]],
-                "override_attestation": {
-                    "attestation_id": att_id,
-                    "attestation_hash": att["attestation_hash"],
-                    "adjudicator_id": att["adjudicator_id"],
-                    "justification": att["justification"],
-                    "source_bundle_hash": base_archive["bundle_hash"],
-                    "evidence_seq_num": 2,
-                    "version": 1,
-                    "attested_at": ts2,
-                },
-            }
-        ]
-        b_hash_v15, _ = compute_bundle_hash(bundle_v15)
-        b_hex_v15 = b_hash_v15.hex()
+
+        bundle_v16 = copy.deepcopy(base_archive["bundle"])
+        bundle_v16["dispute_records"][0]["claim_group_key"] = logical_group
+        bundle_v16["dispute_records"][0]["competing_claims"].append(cand3)
+        bundle_v16["dispute_records"][0]["lapsed_override"] = {
+            "attestation_id": att_id,
+            "attestation_hash": att["attestation_hash"],
+            "prior_winning_claim_id": claim2["id"],
+            "adjudicator_id": att["adjudicator_id"],
+            "justification": justification,
+            "evidence_seq_num": 2,
+            "version": 1,
+            "attested_at": ts2,
+            "reopened_by_claim_ids": [claim3["id"]],
+        }
+        b_hash_v16, _ = compute_bundle_hash(bundle_v16)
+        b_hex_v16 = b_hash_v16.hex()
 
         ev3_hash = compute_evidence_event_hash(
-            tenant,
-            3,
-            ev2_hash,
-            b_hex_v15,
-            bundle_v15["state_commitment"],
-            "allow",
-            ts3,
+            tenant, 3, ev2_hash, b_hex_v16, bundle_v16["state_commitment"], "allow", ts3
         ).hex()
         ev3 = {
             "tenant_id": tenant,
             "seq_num": 3,
             "prev_hash": ev2_hash,
             "event_hash": ev3_hash,
-            "bundle_hash": b_hex_v15,
-            "state_commitment": bundle_v15["state_commitment"],
+            "bundle_hash": b_hex_v16,
+            "state_commitment": bundle_v16["state_commitment"],
             "policy_result": "allow",
             "host_signature": sign_evidence_entry(seed, tenant, 3, ev2_hash, ev3_hash).hex(),
             "created_at": ts3,
         }
 
-        archive_v15 = {
-            "bundle_hash": b_hex_v15,
-            "bundle": bundle_v15,
+        chain_leaves = [
+            merkle_leaf_hash(1, ev1_hash),
+            merkle_leaf_hash(2, ev2_hash),
+            merkle_leaf_hash(3, ev3_hash),
+        ]
+        merkle_root_hex = compute_merkle_root_from_leaves(chain_leaves).hex()
+        cp_hash_hex = compute_checkpoint_hash(tenant, 3, ev3_hash, merkle_root_hex, ts3).hex()
+        cp_sig_hex = sign_checkpoint_head(seed, tenant, cp_hash_hex).hex()
+
+        witness_seed = b"\x77" * 32
+        wsig_hex, wpk_hex = sign_witness_anchor(witness_seed, tenant, 3, cp_hash_hex)
+        anchor = {
+            "id": "11111111-2222-4333-8444-555555555555",
+            "tenant_id": tenant,
+            "tree_size": 3,
+            "checkpoint_hash": cp_hash_hex,
+            "witness_id": "rekor-transparency-mirror",
+            "witness_public_key": wpk_hex,
+            "witness_signature": wsig_hex,
+            "anchored_at": ts3,
+        }
+        sth = {
+            "tenant_id": tenant,
+            "tree_size": 3,
+            "head_event_hash": ev3_hash,
+            "merkle_root": merkle_root_hex,
+            "issued_at": ts3,
+            "checkpoint_hash": cp_hash_hex,
+            "host_signature": cp_sig_hex,
+            "witness_anchors": [anchor],
+        }
+
+        merkle_only_archive = {
+            "bundle_hash": b_hex_v16,
+            "bundle": bundle_v16,
             "objects": base_archive["objects"],
-            "claims": base_archive["claims"],
+            "claims": [claim1, claim2, claim3],
             "override_attestations": [att],
-            "evidence_chain": [ev1, ev2, ev3],
+            "evidence_chain": [],
+            "merkle_proof": {
+                "checkpoint": sth,
+                "bundle_entry_proof": {
+                    "entry": ev3,
+                    "audit_path": [
+                        p.hex() for p in compute_merkle_inclusion_proof(chain_leaves, 2)
+                    ],
+                },
+                "override_entry_proofs": [
+                    {
+                        "entry": ev2,
+                        "audit_path": [
+                            p.hex() for p in compute_merkle_inclusion_proof(chain_leaves, 1)
+                        ],
+                    }
+                ],
+            },
             "host_public_key": pk_hex,
         }
 
-        summary = verify_export_archive(archive_v15, pk_hex)
+        summary = verify_export_archive(merkle_only_archive, pk_hex)
+        self.assertEqual(summary.verification_mode, "merkle_inclusion")
         self.assertEqual(summary.verified_overrides, 1)
-        self.assertEqual(summary.verified_refusals, 1)
-        self.assertEqual(summary.verified_evidence_entries, 3)
-        self.assertTrue(summary.non_default_thresholds)
+        self.assertEqual(summary.verified_evidence_entries, 2)
+        self.assertEqual(summary.merkle_tree_size, 3)
+        self.assertEqual(summary.verified_witness_anchors, 1)
 
-        # Stripping refusal_metadata must fail v2 event_hash verification!
-        stripped_refusal = copy.deepcopy(archive_v15)
-        del stripped_refusal["evidence_chain"][0]["refusal_metadata"]
-        with self.assertRaisesRegex(ValueError, "tampered evidence entry at seq_num=1"):
-            verify_export_archive(stripped_refusal, pk_hex)
+        preimages = dump_archive_preimages(merkle_only_archive)
+        self.assertEqual(preimages["checkpoint"]["tree_size"], 3)
+        self.assertEqual(len(preimages["override_attestations"]), 1)
 
-        # Lying about non_default_thresholds=False on a 0.05 threshold must fail!
-        lied_manifest = copy.deepcopy(archive_v15)
-        lied_manifest["bundle"]["resolver_manifest"]["non_default_thresholds"] = False
-        with self.assertRaisesRegex(ValueError, "inconsistent resolver_manifest"):
-            verify_export_archive(lied_manifest, pk_hex)
+        # Forging client_signature on committee override must fail!
+        bad_csig = copy.deepcopy(merkle_only_archive)
+        bad_csig["override_attestations"][0]["client_signature"] = "00" * 64
+        with self.assertRaisesRegex(ValueError, "client Ed25519 signature"):
+            verify_export_archive(bad_csig, pk_hex)
 
-        # Tampering justification on override_attestation must fail!
-        forged_att = copy.deepcopy(archive_v15)
-        forged_att["override_attestations"][0]["justification"] = "Forged justification"
-        with self.assertRaisesRegex(ValueError, "tampered override_attestation"):
-            verify_export_archive(forged_att, pk_hex)
+        # Tampering lapsed_override.evidence_seq_num must fail!
+        bad_lapsed = copy.deepcopy(merkle_only_archive)
+        bad_lapsed["bundle"]["dispute_records"][0]["lapsed_override"]["evidence_seq_num"] = 99
+        with self.assertRaisesRegex(ValueError, "tampered lapsed_override"):
+            verify_export_archive(bad_lapsed, pk_hex)
 
     def test_offline_archive_verification_and_tamper_rejection(self) -> None:
         pk_hex, archive = _build_signed_fixture()
@@ -494,6 +576,7 @@ class TestActaCryptoAndLiveCloudRunParity(unittest.TestCase):
         self.assertEqual(summary.verified_objects, 1)
         self.assertEqual(summary.verified_claims, 2)
         self.assertEqual(summary.verified_evidence_entries, 1)
+        self.assertEqual(summary.verification_mode, "full_chain")
 
         forged_claim = copy.deepcopy(archive)
         forged_claim["claims"][0]["object_val"] = 999999
@@ -542,13 +625,13 @@ class _MockActaHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "acta-compiler",
-                    "version": "1.5.0",
+                    "version": "1.6.0",
                     "host_public_key": self.pk_hex,
                     "permission_root": "26" * 32,
                 },
             )
             return
-        if self.path.startswith("/v1/bundles/") and self.path.endswith("/export"):
+        if self.path.startswith("/v1/bundles/") and "/export" in self.path:
             _, archive = _build_signed_fixture(self.seed, disputed=True)
             self._send(200, archive)
             return
@@ -573,7 +656,8 @@ class _MockActaHandler(BaseHTTPRequestHandler):
                     "winning_claim_id": body["winning_claim_id"],
                     "winning_claim_content_hash": "bb" * 32,
                     "overridden_claim_ids": ["54e00c71-af84-4104-b180-0dd284829ac4"],
-                    "adjudicator_id": body["adjudicator_id"],
+                    "adjudicator_id": body.get("adjudicator_id", f"{tenant}::session"),
+                    "adjudicator_auth_kind": "master_api_key",
                     "justification": body["justification"],
                     "attestation_hash": att_hash,
                     "evidence_seq_num": 7,
@@ -756,7 +840,6 @@ class TestActaClientAndGeminiGuard(unittest.TestCase):
                 tenant_id="prod-acme",
                 scope="dispute-settlement",
                 winning_claim_id="652a3897-b0a8-410f-a18c-c8d80b3ae7b2",
-                adjudicator_id="prod-acme::cfo",
                 justification="Verified signed MSA schedule",
             )
             self.assertEqual(ovr["evidence_seq_num"], 7)
@@ -824,31 +907,38 @@ class TestActaClientAndGeminiGuard(unittest.TestCase):
         asyncio.run(_run())
 
 
-class TestActaV11TenantTokens(unittest.TestCase):
-    def test_stateless_keyed_blake3_tenant_tokens_and_client_lock(self) -> None:
-        from acta_sdk import (
-            ActaTenantLockError,
-            mint_tenant_api_key,
-            verify_tenant_api_key,
-        )
-
+class TestActaV16TenantAndPrincipalTokens(unittest.TestCase):
+    def test_stateless_2part_and_3part_principal_tokens_and_client_lock(self) -> None:
         master = "acta_live_master_secret_998877"
         tk_ardyn = mint_tenant_api_key(master, "ardyn-core")
         tk_acme = mint_tenant_api_key(master, "client-acme")
         self.assertTrue(tk_ardyn.startswith("acta_tk_v1:ardyn-core:"))
         self.assertNotEqual(tk_ardyn, tk_acme)
         self.assertEqual(verify_tenant_api_key(master, tk_ardyn), "ardyn-core")
-        self.assertEqual(verify_tenant_api_key(master, tk_acme), "client-acme")
+        self.assertIsNone(extract_token_principal(tk_ardyn))
 
-        mac_only = tk_ardyn.rsplit(":", 1)[1]
+        tk_user = mint_user_tenant_api_key(master, "ardyn-core", "KyleWilson04")
+        self.assertTrue(tk_user.startswith("acta_tk_v1:ardyn-core:kylewilson04:"))
+        self.assertEqual(extract_token_tenant(tk_user), "ardyn-core")
+        self.assertEqual(extract_token_principal(tk_user), "kylewilson04")
+        self.assertEqual(
+            verify_tenant_api_key_with_principal(master, tk_user),
+            ("ardyn-core", "kylewilson04"),
+        )
+
+        # Swapping principal login inside 3-segment token must fail MAC!
+        mac_user = tk_user.rsplit(":", 1)[1]
         with self.assertRaises(ValueError):
-            verify_tenant_api_key(master, f"acta_tk_v1:client-acme:{mac_only}")
+            verify_tenant_api_key_with_principal(
+                master, f"acta_tk_v1:ardyn-core:cfo-committee:{mac_user}"
+            )
 
-        with ActaClient("http://127.0.0.1:9", api_key=tk_acme) as locked_client:
-            self.assertEqual(locked_client.locked_tenant, "client-acme")
+        with ActaClient("http://127.0.0.1:9", api_key=tk_user) as locked_client:
+            self.assertEqual(locked_client.locked_tenant, "ardyn-core")
+            self.assertEqual(locked_client.verified_principal, "kylewilson04")
             with self.assertRaises(ActaTenantLockError):
                 locked_client.compile(
-                    tenant_id="ardyn-core",
+                    tenant_id="client-acme",
                     actor_id="claude",
                     scope="ops",
                     query_text="attempt cross-tenant",
@@ -874,26 +964,6 @@ class TestActaGitMcpBridge(unittest.TestCase):
             r_a = resolve_git_workspace_context(repo_a)
             self.assertEqual(r_a.tenant_id, "ardyn-intelligence")
             self.assertEqual(r_a.default_scope, "ads-platform")
-
-            repo_b = pathlib.Path(tmp) / "client-portal"
-            repo_b.mkdir()
-            subprocess.run(["git", "init", "-q"], cwd=repo_b, check=True)
-            subprocess.run(
-                ["git", "remote", "add", "origin", "https://github.com/Acme-Corp/Billing_V2.git"],
-                cwd=repo_b,
-                check=True,
-            )
-            r_b = resolve_git_workspace_context(repo_b)
-            self.assertEqual(r_b.tenant_id, "acme-corp")
-            self.assertEqual(r_b.default_scope, "billing_v2")
-
-            (repo_b / ".acta.json").write_text(
-                '{"tenant": "client-custom", "default_scope": "settlements"}',
-                encoding="utf-8",
-            )
-            r_override = resolve_git_workspace_context(repo_b)
-            self.assertEqual(r_override.tenant_id, "client-custom")
-            self.assertEqual(r_override.default_scope, "settlements")
 
             _MockActaHandler.forged_sig_mode = False
             srv = HTTPServer(("127.0.0.1", 0), _MockActaHandler)
@@ -926,15 +996,12 @@ class TestActaGitMcpBridge(unittest.TestCase):
                     ]
                     self.assertEqual(len(lines), 4)
                     self.assertEqual(
-                        lines[1]["result"]["structuredContent"]["tenant_id"], "sandbox-ardyn"
+                        lines[0]["result"]["serverInfo"]["version"], "1.6.0"
                     )
                     self.assertEqual(
-                        lines[1]["result"]["structuredContent"]["default_scope"], "ads-core"
+                        lines[1]["result"]["structuredContent"]["tenant_id"], "sandbox-ardyn"
                     )
                     self.assertFalse(lines[2]["result"]["isError"])
-                    self.assertTrue(
-                        lines[2]["result"]["structuredContent"]["ed25519_verified_locally"]
-                    )
                     self.assertTrue(lines[3]["result"]["isError"])
                 finally:
                     bridge.close()

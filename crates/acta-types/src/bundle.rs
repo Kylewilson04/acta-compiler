@@ -188,6 +188,72 @@ pub struct EvidenceEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// External witness cosignature or transparency-log anchor over a `SignedTreeHead` (`v1.6+`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalWitnessAnchor {
+    pub id: Uuid,
+    pub tenant_id: String,
+    pub tree_size: i64,
+    #[serde(with = "hex_32")]
+    pub checkpoint_hash: [u8; 32],
+    pub witness_id: String,
+    #[serde(with = "hex_32")]
+    pub witness_public_key: [u8; 32],
+    #[serde(with = "hex_64")]
+    pub witness_signature: [u8; 64],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_uri: Option<String>,
+    pub anchored_at: DateTime<Utc>,
+}
+
+/// Deterministic RFC 6962–style Merkle checkpoint over `evidence_history[1..=tree_size]` (`v1.6+`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedTreeHead {
+    pub tenant_id: String,
+    pub tree_size: i64,
+    #[serde(with = "hex_32")]
+    pub head_event_hash: [u8; 32],
+    #[serde(with = "hex_32")]
+    pub merkle_root: [u8; 32],
+    pub issued_at: DateTime<Utc>,
+    #[serde(with = "hex_32")]
+    pub checkpoint_hash: [u8; 32],
+    #[serde(with = "hex_64")]
+    pub host_signature: [u8; 64],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness_anchors: Vec<ExternalWitnessAnchor>,
+}
+
+/// `O(log N)` RFC 6962 inclusion proof binding a single `EvidenceEntry` into a `SignedTreeHead`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInclusionProof {
+    pub entry: EvidenceEntry,
+    pub audit_path: Vec<String>,
+}
+
+/// Compact `O(log N)` Merkle proof replacing linear `evidence_chain` scans in `ExportArchive` (`v1.6+`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MerkleBundleProof {
+    pub checkpoint: SignedTreeHead,
+    pub bundle_entry_proof: EntryInclusionProof,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_entry_proofs: Vec<EntryInclusionProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorCheckpointRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub tenant_id: String,
+    pub tree_size: i64,
+    pub checkpoint_hash_hex: String,
+    pub witness_id: String,
+    pub witness_public_key_hex: String,
+    pub witness_signature_hex: String,
+    #[serde(default)]
+    pub external_uri: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportArchive {
     #[serde(with = "hex_32")]
@@ -197,7 +263,10 @@ pub struct ExportArchive {
     pub claims: Vec<KnowledgeClaim>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_attestations: Vec<OverrideAttestation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_chain: Vec<EvidenceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merkle_proof: Option<MerkleBundleProof>,
     #[serde(with = "hex_32")]
     pub host_public_key: [u8; 32],
 }

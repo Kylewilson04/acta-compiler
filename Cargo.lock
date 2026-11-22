@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acta-crypto"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-types",
  "base64 0.22.1",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "acta-engine"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-crypto",
  "acta-policy",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "acta-policy"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-crypto",
  "acta-types",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "acta-server"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-crypto",
  "acta-engine",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "acta-store"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-crypto",
  "acta-types",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "acta-types"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "hex",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "acta-verify"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "acta-crypto",
  "acta-types",

@@ -1,6 +1,7 @@
 pub mod canonical;
 pub mod commitment;
 pub mod hash;
+pub mod merkle;
 pub mod signing;
 pub mod token;
 pub mod verify;
@@ -10,22 +11,33 @@ pub use commitment::{
     compute_dependency_commitment, compute_state_commitment, compute_sub_commitment,
 };
 pub use hash::{
-    compute_bundle_hash, compute_claim_content_hash, compute_claim_group_key,
-    compute_evidence_event_hash, compute_evidence_event_hash_with_meta,
+    compute_bundle_hash, compute_checkpoint_hash, compute_claim_content_hash,
+    compute_claim_group_key, compute_evidence_event_hash, compute_evidence_event_hash_with_meta,
     compute_logical_claim_group_key, compute_object_content_hash, compute_omission_list_hash,
-    compute_override_attestation_hash, compute_refusal_commitment,
-    compute_refusal_metadata_commitment, hash_length_delimited, OverrideHashInput,
+    compute_override_attestation_hash, compute_override_client_intent_hash,
+    compute_refusal_commitment, compute_refusal_metadata_commitment, hash_length_delimited,
+    OverrideHashInput,
+};
+pub use merkle::{
+    compute_merkle_consistency_proof, compute_merkle_inclusion_proof,
+    compute_merkle_root_from_leaves, merkle_empty_root, merkle_leaf_hash, merkle_node_hash,
+    verify_merkle_consistency_proof, verify_merkle_inclusion_proof,
 };
 pub use signing::{
-    sign_evidence_entry, sign_override_attestation, verify_client_content_signature,
-    verify_evidence_signature, verify_override_signature,
+    checkpoint_signing_preimage, evidence_signing_preimage, override_signing_preimage,
+    sign_checkpoint_head, sign_evidence_entry, sign_override_attestation, sign_witness_anchor,
+    verify_checkpoint_signature, verify_client_content_signature, verify_evidence_signature,
+    verify_override_signature, verify_witness_anchor_signature, witness_anchor_signing_preimage,
 };
 pub use token::{
     compute_pkce_s256, derive_oauth_envelope_key, derive_tenant_mac_key, mint_signed_envelope,
-    mint_tenant_api_key, normalize_github_slug, verify_pkce_s256, verify_signed_envelope,
-    verify_tenant_api_key, TENANT_TOKEN_PREFIX,
+    mint_tenant_api_key, mint_user_tenant_api_key, normalize_github_slug, verify_pkce_s256,
+    verify_signed_envelope, verify_tenant_api_key, verify_tenant_api_key_with_principal,
+    TENANT_TOKEN_PREFIX,
 };
-pub use verify::{verify_export_archive, VerificationSummary};
+pub use verify::{
+    dump_archive_preimages, verify_export_archive, verify_signed_tree_head, VerificationSummary,
+};
 
 #[cfg(test)]
 mod tests {

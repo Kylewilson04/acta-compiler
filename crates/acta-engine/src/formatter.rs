@@ -37,6 +37,16 @@ pub fn sanitize_header_atom(raw: &str) -> String {
     out
 }
 
+fn truncate_chars_with_ellipsis(raw: &str, max_chars: usize) -> String {
+    let total = raw.chars().count();
+    if total <= max_chars {
+        raw.to_string()
+    } else {
+        let head: String = raw.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", head.trim_end())
+    }
+}
+
 fn canonical_single_line_json(val: &serde_json::Value) -> String {
     let raw = to_canonical_bytes(val)
         .ok()
@@ -141,8 +151,26 @@ pub fn format_resolution_entry(res: &ResolutionRecord) -> String {
     }
 }
 
-/// Compact fallback for an override-adjudicated `ResolutionRecord` under tight token budgets
-/// (preserving `override_id` and `adjudicator` while omitting full `justification` prose).
+/// Compact override line preserving a bounded `why="..."` justification snippet under tight budgets
+/// (such as `token_budget: 80`!).
+pub fn format_resolution_compact_with_why(res: &ResolutionRecord, max_why_chars: usize) -> Option<String> {
+    let ovr = res.override_attestation.as_ref()?;
+    let c = &res.winning_claim;
+    let id_short = &c.id.simple().to_string()[..8];
+    let ovr_short = &ovr.attestation_id.simple().to_string()[..8];
+    let safe_subj = sanitize_header_atom(&c.subject);
+    let safe_pred = sanitize_header_atom(&c.predicate);
+    let safe_adj = sanitize_header_atom(&ovr.adjudicator_id);
+    let snippet = truncate_chars_with_ellipsis(&ovr.justification, max_why_chars);
+    let safe_why = sanitize_header_atom(&snippet);
+    let canonical_val = canonical_single_line_json(&c.object_val);
+    Some(format!(
+        "[FACT:{id_short} {safe_subj}:{safe_pred} override={ovr_short} seq={} by={safe_adj} why={safe_why}] {canonical_val}",
+        ovr.evidence_seq_num
+    ))
+}
+
+/// Ultra-compact survival fallback for an override-adjudicated `ResolutionRecord` near the ~30-token floor.
 pub fn format_resolution_compact(res: &ResolutionRecord) -> Option<String> {
     let ovr = res.override_attestation.as_ref()?;
     let c = &res.winning_claim;
@@ -158,9 +186,10 @@ pub fn format_resolution_compact(res: &ResolutionRecord) -> Option<String> {
     ))
 }
 
-/// Formats a full `DisputeRecord` wrapped in explicit `[DISPUTE: <reason_code>] ... [/DISPUTE]` markers.
+/// Formats a full `DisputeRecord` wrapped in explicit `[DISPUTE: <reason_code>] ... [/DISPUTE]` markers
+/// (including `lapsed_override` provenance whenever a prior adjudication was reopened by unseen evidence).
 pub fn format_dispute_entry(dispute: &DisputeRecord) -> String {
-    let mut lines = Vec::with_capacity(dispute.competing_claims.len() + 3);
+    let mut lines = Vec::with_capacity(dispute.competing_claims.len() + 4);
     lines.push(format!("[DISPUTE: {}]", dispute.reason_code.as_str()));
     lines.push(format!(
         "claim_group_key={} candidates={} escalation_required={}",
@@ -168,6 +197,25 @@ pub fn format_dispute_entry(dispute: &DisputeRecord) -> String {
         dispute.competing_claims.len(),
         dispute.escalation_required
     ));
+
+    if let Some(ref lapsed) = dispute.lapsed_override {
+        let ovr_short = &lapsed.attestation_id.simple().to_string()[..8];
+        let reopened_str = lapsed
+            .reopened_by_claim_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        lines.push(format!(
+            "lapsed_override: id={} seq={} prior_winner={} adjudicator={} reopened_by={} justification={}",
+            ovr_short,
+            lapsed.evidence_seq_num,
+            lapsed.prior_winning_claim_id,
+            sanitize_header_atom(&lapsed.adjudicator_id),
+            sanitize_header_atom(&reopened_str),
+            sanitize_header_atom(&lapsed.justification)
+        ));
+    }
 
     for (idx, candidate) in dispute.competing_claims.iter().enumerate() {
         let canonical_val = canonical_single_line_json(&candidate.object_val);
@@ -228,14 +276,27 @@ pub fn format_dispute_stub(dispute: &DisputeRecord) -> String {
         .first()
         .map(|c| (c.subject.as_str(), c.predicate.as_str()))
         .unwrap_or(("unknown", "unknown"));
-    format!(
-        "[DISPUTE: {} STUB {}:{} candidates={} escalate={}]",
-        dispute.reason_code.as_str(),
-        sanitize_header_atom(subj),
-        sanitize_header_atom(pred),
-        dispute.competing_claims.len(),
-        dispute.escalation_required
-    )
+    if let Some(ref lapsed) = dispute.lapsed_override {
+        let ovr_short = &lapsed.attestation_id.simple().to_string()[..8];
+        format!(
+            "[DISPUTE: {} STUB {}:{} candidates={} reopened_override={} escalate={}]",
+            dispute.reason_code.as_str(),
+            sanitize_header_atom(subj),
+            sanitize_header_atom(pred),
+            dispute.competing_claims.len(),
+            ovr_short,
+            dispute.escalation_required
+        )
+    } else {
+        format!(
+            "[DISPUTE: {} STUB {}:{} candidates={} escalate={}]",
+            dispute.reason_code.as_str(),
+            sanitize_header_atom(subj),
+            sanitize_header_atom(pred),
+            dispute.competing_claims.len(),
+            dispute.escalation_required
+        )
+    }
 }
 
 /// Formats a single Ranked Memory entry deterministically.
@@ -354,6 +415,7 @@ mod tests {
             competing_claims: vec![cand],
             reason_code: DisputeReasonCode::InsufficientMargin,
             escalation_required: true,
+            lapsed_override: None,
         });
         assert!(!disp_block.lines().any(|l| l.starts_with("[FACT")));
         assert_eq!(disp_block.lines().count(), 4);

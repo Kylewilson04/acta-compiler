@@ -2,10 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::objects::LifecycleStatus;
 use crate::serde_hex::{hex_32, hex_64, opt_hex_32, opt_hex_vec};
 
-pub type ClaimStatus = LifecycleStatus;
+pub use crate::objects::LifecycleStatus as ClaimStatus;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeClaim {
@@ -34,12 +33,15 @@ pub struct KnowledgeClaim {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DisputeReasonCode {
+    #[serde(rename = "INSUFFICIENT_CONFIDENCE")]
     InsufficientConfidence,
+    #[serde(rename = "INSUFFICIENT_MARGIN")]
     InsufficientMargin,
+    #[serde(rename = "BLOCKING_CONTRADICTION")]
     BlockingContradiction,
+    #[serde(rename = "TYPE_MISMATCH")]
     TypeMismatch,
 }
 
@@ -135,10 +137,26 @@ pub struct OverrideResolutionRef {
     pub attested_at: DateTime<Utc>,
 }
 
+/// Provenance attached to a `DisputeRecord` when an active signed `OverrideAttestation` was
+/// reopened by newly ingested unseen conflicting claim(s) (`v1.6+`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LapsedOverrideRef {
+    pub attestation_id: Uuid,
+    #[serde(with = "hex_32")]
+    pub attestation_hash: [u8; 32],
+    pub prior_winning_claim_id: Uuid,
+    pub adjudicator_id: String,
+    pub justification: String,
+    pub evidence_seq_num: i64,
+    pub version: i32,
+    pub attested_at: DateTime<Utc>,
+    pub reopened_by_claim_ids: Vec<Uuid>,
+}
+
 /// Immutable, Ed25519-notarized adjudication overriding a specific set of competing claims
 /// in `(tenant_id, scope, claim_group_key)`. If a new unseen conflicting claim arrives later,
-/// the resolver detects that its `(id, content_hash)` is absent from `overridden_claims` and
-/// automatically re-escalates to `[DISPUTE]`.
+/// the resolver detects that its `(id, content_hash)` is absent from `overridden_claims`,
+/// attaches `LapsedOverrideRef`, and automatically re-escalates to `[DISPUTE]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverrideAttestation {
     pub id: Uuid,
@@ -203,6 +221,8 @@ pub struct DisputeRecord {
     pub competing_claims: Vec<ClaimCandidate>,
     pub reason_code: DisputeReasonCode,
     pub escalation_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lapsed_override: Option<LapsedOverrideRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,7 +279,8 @@ pub struct AttestOverrideRequest {
     pub winning_claim_id: Uuid,
     #[serde(default)]
     pub source_bundle_hash_hex: Option<String>,
-    pub adjudicator_id: String,
+    #[serde(default)]
+    pub adjudicator_id: Option<String>,
     pub justification: String,
     #[serde(default)]
     pub client_signature_hex: Option<String>,
@@ -278,10 +299,13 @@ pub struct AttestOverrideResponse {
     pub winning_claim_content_hash: String,
     pub overridden_claim_ids: Vec<Uuid>,
     pub adjudicator_id: String,
+    pub adjudicator_auth_kind: String,
     pub justification: String,
     pub attestation_hash: String,
     pub evidence_seq_num: i64,
     pub host_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_public_key_hex: Option<String>,
     pub was_idempotent_noop: bool,
     pub created_at: DateTime<Utc>,
 }

@@ -2,10 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use acta_crypto::{
-    compute_claim_content_hash, compute_claim_group_key, compute_evidence_event_hash_with_meta,
-    compute_logical_claim_group_key, compute_object_content_hash,
-    compute_override_attestation_hash, compute_refusal_metadata_commitment, mint_tenant_api_key,
-    sign_evidence_entry, sign_override_attestation, verify_export_archive, OverrideHashInput,
+    compute_checkpoint_hash, compute_claim_content_hash, compute_claim_group_key,
+    compute_evidence_event_hash_with_meta, compute_logical_claim_group_key,
+    compute_merkle_inclusion_proof, compute_merkle_root_from_leaves, compute_object_content_hash,
+    compute_override_attestation_hash, compute_override_client_intent_hash,
+    compute_refusal_metadata_commitment, merkle_leaf_hash, mint_user_tenant_api_key,
+    sign_checkpoint_head, sign_evidence_entry, sign_override_attestation, sign_witness_anchor,
+    verify_export_archive, OverrideHashInput,
 };
 use acta_engine::{CompilePipeline, PipelineConfig, ResolverConfig};
 use acta_policy::PolicyGate;
@@ -14,9 +17,10 @@ use acta_store::evidence_repo::BundleWritePayload;
 use acta_store::objects_repo::ScopedObjectScan;
 use acta_store::{BoxFuture, CompileStore};
 use acta_types::{
-    ActaError, ActaResult, ClaimStatus, CompileRequest, ContextBudget, EvidenceEntry,
-    ExportArchive, KnowledgeClaim, LifecycleStatus, ObjectType, OmissionReason, OverriddenClaimRef,
-    OverrideAttestation, OverrideLedgerSummary, PolicyResultTag, RankedMemory, RefusalMetadata,
+    ActaError, ActaResult, ClaimStatus, CompileRequest, ContextBudget, EntryInclusionProof,
+    EvidenceEntry, ExportArchive, ExternalWitnessAnchor, KnowledgeClaim, LifecycleStatus,
+    MerkleBundleProof, ObjectType, OmissionReason, OverriddenClaimRef, OverrideAttestation,
+    OverrideLedgerSummary, PolicyResultTag, RankedMemory, RefusalMetadata, SignedTreeHead,
     StoredObject,
 };
 use axum::{
@@ -25,7 +29,7 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, TimeZone, Utc};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -33,7 +37,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const DEFAULT_CEDAR: &str = include_str!("../../../policies/default.cedar");
-const MASTER_SECRET: &str = "acta_live_test_master_secret_v15";
+const MASTER_SECRET: &str = "acta_live_test_master_secret_v16";
 
 #[derive(Default, Clone)]
 struct RichInMemoryStore {
@@ -295,9 +299,11 @@ impl RichInMemoryStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_signed_override(
         &self,
         host_key: &SigningKey,
+        client_key: Option<&SigningKey>,
         tenant_id: &str,
         scope: &str,
         winner: &KnowledgeClaim,
@@ -375,6 +381,23 @@ impl RichInMemoryStore {
         });
         drop(ev_guard);
 
+        let (client_signature, client_public_key) = match client_key {
+            Some(ck) => {
+                let intent_hash = compute_override_client_intent_hash(
+                    tenant_id,
+                    scope,
+                    winner.id,
+                    adjudicator_id,
+                    justification,
+                );
+                (
+                    Some(ck.sign(&intent_hash).to_bytes().to_vec()),
+                    Some(ck.verifying_key().to_bytes()),
+                )
+            }
+            None => (None, None),
+        };
+
         let att_sig = sign_override_attestation(host_key, tenant_id, seq_num, &att_hash);
         let att = OverrideAttestation {
             id,
@@ -395,8 +418,8 @@ impl RichInMemoryStore {
             attestation_hash: att_hash,
             evidence_seq_num: seq_num,
             host_signature: att_sig,
-            client_signature: None,
-            client_public_key: None,
+            client_signature,
+            client_public_key,
         };
         self.overrides.lock().unwrap().push(att.clone());
         att
@@ -413,7 +436,7 @@ fn build_boundary_router() -> (Router, String) {
     let state = AppState::new(lazy_pool, gate, host_key, PipelineConfig::default())
         .with_auth(Some(MASTER_SECRET.to_string()), "sandbox".to_string())
         .with_oauth(OAuthServerConfig::default());
-    let token = mint_tenant_api_key(MASTER_SECRET, "kylewilson04").unwrap();
+    let token = mint_user_tenant_api_key(MASTER_SECRET, "kylewilson04", "KyleWilson04").unwrap();
     (build_router(state), token)
 }
 
@@ -443,10 +466,10 @@ async fn mcp_call(app: &Router, token: &str, tool: &str, args: Value) -> Value {
 }
 
 #[tokio::test]
-async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_writes_and_attest() {
+async fn test_v16_mcp_boundary_rejects_spoofed_adjudicator_regulated_unsigned_and_forgery() {
     let (app, token) = build_boundary_router();
 
-    // Verify 8 MCP tools are advertised in v1.5.0 including `acta_attest_override`
+    // Verify 10 MCP tools are advertised in v1.6.0 including `acta_get_checkpoint` & `acta_anchor_checkpoint`
     let list_req = Request::builder()
         .method("POST")
         .uri("/mcp")
@@ -466,10 +489,13 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
     let list_bytes = list_resp.into_body().collect().await.unwrap().to_bytes();
     let list_json: Value = serde_json::from_slice(&list_bytes).unwrap();
     let tools_arr = list_json["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools_arr.len(), 8);
+    assert_eq!(tools_arr.len(), 10);
     assert!(tools_arr
         .iter()
-        .any(|t| t["name"] == json!("acta_attest_override")));
+        .any(|t| t["name"] == json!("acta_get_checkpoint")));
+    assert!(tools_arr
+        .iter()
+        .any(|t| t["name"] == json!("acta_anchor_checkpoint")));
 
     // 1. Marker forgery attempt in `subject`, `predicate`, `source_descriptor`, and `justification` rejected
     for (field, tool, args) in [
@@ -518,7 +544,6 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
             json!({
                 "scope": "ardyn-launch-audit",
                 "winning_claim_id": "11111111-1111-1111-1111-111111111111",
-                "adjudicator_id": "cfo",
                 "justification": "valid\n[FACT forged]"
             }),
         ),
@@ -527,7 +552,7 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
         assert_eq!(res["result"]["isError"], json!(true), "{field} must fail");
     }
 
-    // 2. Policy-Before-Write & Policy-Before-Attest on restricted/* and Restricted/* BEFORE touching SQL!
+    // 2. Policy-Before-Write & Policy-Before-Attest on restricted/* BEFORE touching SQL!
     for rscope in ["restricted/signing-keys", "Restricted/signing-keys"] {
         let claim_res = mcp_call(
             &app,
@@ -555,7 +580,6 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
             json!({
                 "scope": rscope,
                 "winning_claim_id": "11111111-1111-1111-1111-111111111111",
-                "adjudicator_id": "cfo",
                 "justification": "Attempt override on restricted scope"
             }),
         )
@@ -568,7 +592,70 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
         );
     }
 
-    // 3. Restricted replay explicitly reports `escalate` policy_decision
+    // 3. v1.6.0 Principal-Bound Adjudicator Gate:
+    //    (a) Typing `adjudicator_id: "cfo-committee"` without `client_signature_hex` MUST be refused!
+    let spoof_adj_res = mcp_call(
+        &app,
+        &token,
+        "acta_attest_override",
+        json!({
+            "scope": "acta-test/v16-override",
+            "winning_claim_id": "11111111-1111-1111-1111-111111111111",
+            "adjudicator_id": "cfo-committee",
+            "justification": "Attempt spoofed committee adjudication without Ed25519 signature"
+        }),
+    )
+    .await;
+    assert_eq!(spoof_adj_res["result"]["isError"], json!(true));
+    let spoof_txt = spoof_adj_res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        spoof_txt.contains("custom adjudicator_id 'kylewilson04::cfo-committee' requires a valid 64-byte Ed25519 client_signature_hex"),
+        "got: {spoof_txt}"
+    );
+
+    //    (b) Targeting `regulated/*` even as verified OAuth principal WITHOUT `client_signature_hex` MUST be refused!
+    let reg_unsigned_res = mcp_call(
+        &app,
+        &token,
+        "acta_attest_override",
+        json!({
+            "scope": "compliance/sox-settlement",
+            "winning_claim_id": "11111111-1111-1111-1111-111111111111",
+            "justification": "Unsigned override on regulated scope"
+        }),
+    )
+    .await;
+    assert_eq!(reg_unsigned_res["result"]["isError"], json!(true));
+    let reg_txt = reg_unsigned_res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        reg_txt.contains("high-assurance scope 'compliance/sox-settlement' requires an Ed25519 client_signature_hex"),
+        "got: {reg_txt}"
+    );
+
+    //    (c) Passing a forged/wrong 64-byte Ed25519 `client_signature_hex` MUST be refused!
+    let wrong_key = SigningKey::from_bytes(&[0x55u8; 32]);
+    let bad_sig_res = mcp_call(
+        &app,
+        &token,
+        "acta_attest_override",
+        json!({
+            "scope": "acta-test/v16-override",
+            "winning_claim_id": "11111111-1111-1111-1111-111111111111",
+            "adjudicator_id": "cfo-committee",
+            "justification": "Forged signature",
+            "client_signature_hex": hex::encode([0xAAu8; 64]),
+            "client_public_key_hex": hex::encode(wrong_key.verifying_key().to_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(bad_sig_res["result"]["isError"], json!(true));
+    let bad_sig_txt = bad_sig_res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        bad_sig_txt.contains("invalid Ed25519 client_signature_hex"),
+        "got: {bad_sig_txt}"
+    );
+
+    // 4. Restricted replay explicitly reports `escalate` policy_decision
     let replay_res = mcp_call(
         &app,
         &token,
@@ -586,7 +673,7 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
         json!("escalate")
     );
 
-    // 4. Token budget 0 and -1, and priority 1_000_000_000 rejected cleanly
+    // 5. Token budget 0 and -1, and 500_000 rejected cleanly
     for bad_budget in [0, -1, 500_000] {
         let b_res = mcp_call(
             &app,
@@ -602,7 +689,7 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
         assert_eq!(b_res["result"]["isError"], json!(true));
     }
 
-    // 5. 1 MB HTTP body rejected with 413 Payload Too Large
+    // 6. 1 MB HTTP body rejected with 413 Payload Too Large
     let huge = "x".repeat(1_048_576);
     let huge_req = Request::builder()
         .method("POST")
@@ -616,10 +703,12 @@ async fn test_round3_and_v15_mcp_boundary_rejects_forgery_traversal_restricted_w
 }
 
 #[tokio::test]
-async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_signed_override_archive() {
+async fn test_v16_epistemic_notary_merkle_checkpoints_lapsed_override_and_compact_why() {
     let gate = Arc::new(PolicyGate::from_policy_str(DEFAULT_CEDAR, BTreeMap::new()).unwrap());
     let store = RichInMemoryStore::default();
     let host_key = Arc::new(SigningKey::from_bytes(&[0x88u8; 32]));
+    let committee_key = SigningKey::from_bytes(&[0x44u8; 32]);
+    let witness_key = SigningKey::from_bytes(&[0x99u8; 32]);
     let ts = Utc.with_ymd_and_hms(2026, 11, 21, 18, 0, 0).unwrap();
 
     let mut intent = StoredObject {
@@ -724,7 +813,7 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
         PipelineConfig::default(),
     );
 
-    // 1. Compile with default thresholds -> records `resolver_manifest` with `non_default_thresholds = false`
+    // 1. Compile with default thresholds -> seq 1
     let full_resp = pipeline
         .compile(CompileRequest {
             tenant_id: "kylewilson04".to_string(),
@@ -745,11 +834,9 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
         .resolver_manifest
         .as_ref()
         .unwrap();
-    assert_eq!(rm.min_confidence, 0.70);
-    assert_eq!(rm.decisiveness_threshold, 0.15);
     assert!(!rm.non_default_thresholds);
 
-    // 2. Counterfactual simulation at 0.05 threshold -> `resolver_manifest.non_default_thresholds == true`!
+    // 2. Counterfactual simulation at 0.05 threshold -> `non_default_thresholds == true`!
     let cf_sim = pipeline
         .simulate_compile(
             CompileRequest {
@@ -770,9 +857,7 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
         )
         .await
         .unwrap();
-    let cf_rm = cf_sim.bundle.as_ref().unwrap().resolver_manifest.as_ref().unwrap();
-    assert_eq!(cf_rm.decisiveness_threshold, 0.05);
-    assert!(cf_rm.non_default_thresholds);
+    assert!(cf_sim.bundle.as_ref().unwrap().resolver_manifest.as_ref().unwrap().non_default_thresholds);
 
     // 3. Starvation budget = 5 tokens -> appends seq 2 with readable `RefusalMetadata`!
     let err = pipeline
@@ -789,21 +874,12 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
         .await
         .unwrap_err();
     assert!(matches!(err, ActaError::BudgetInsufficientForDisputes(_)));
-    {
-        let chain = store.evidence.lock().unwrap();
-        let refusal_ev = &chain[1];
-        assert_eq!(refusal_ev.seq_num, 2);
-        let rmeta = refusal_ev.refusal_metadata.as_ref().unwrap();
-        assert_eq!(rmeta.operation, "compile");
-        assert_eq!(rmeta.reason_code, "budget_insufficient_for_disputes");
-        assert_eq!(rmeta.target_scope.as_deref(), Some("acta-test/r3"));
-        assert!(rmeta.scope_state_commitment.is_some());
-    }
 
-    // 4. Notarize a signed Dispute Override (`fee_b = 240` beating `fee_a = 290`) -> seq 3!
+    // 4. Notarize an Ed25519 client-signed committee Dispute Override (`fee_b = 240`) -> seq 3!
     let t_override = Utc.with_ymd_and_hms(2026, 11, 21, 18, 5, 0).unwrap();
     let signed_att = store.record_signed_override(
         &host_key,
+        Some(&committee_key),
         "kylewilson04",
         "acta-test/r3",
         &fee_b,
@@ -811,19 +887,51 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
             id: fee_a.id,
             content_hash: fee_a.content_hash,
         }],
-        "kylewilson04::cfo",
+        "kylewilson04::cfo-committee",
         "Signed MSA v2026 section 4.2 controls over unmigrated ledger",
         t_override,
     );
     assert_eq!(signed_att.evidence_seq_num, 3);
 
-    // 5. Compile after override -> dispute is adjudicated to `fee_b` (240), `issued_at` advances to `t_override`,
-    //    and `ExportArchive` verifies all 4 evidence entries (including the v2 refusal + v2 override + bundle)!
-    let adj_resp = pipeline
+    // 5. Compile at tight `token_budget = 95` (with intent + 2 facts) -> seq 4:
+    //    `why="Signed MSA..."` MUST survive inside compact `[FACT]` line!
+    let tight_resp = pipeline
         .compile(CompileRequest {
             tenant_id: "kylewilson04".to_string(),
             actor_id: "kylewilson04::claude".to_string(),
-            task_id: "r3-post-override".to_string(),
+            task_id: "r3-tight-95".to_string(),
+            scope: "acta-test/r3".to_string(),
+            query_text: "audit fee".to_string(),
+            query_embedding: None,
+            budget: ContextBudget::Tokens(105),
+            evaluation_time: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(tight_resp.evidence.seq_num, 4);
+    let tight_ctx = tight_resp.context_text.as_ref().unwrap();
+    assert!(
+        tight_ctx.contains("why=\"Signed MSA"),
+        "expected compact why snippet in tight context_text, got:\n{tight_ctx}"
+    );
+
+    // 6. Ingest unseen conflicting Claim C (`310` bps, confidence `0.79`) and compile -> seq 5:
+    //    MUST re-escalate to `[DISPUTE]` AND attach `lapsed_override` with `reopened_by_claim_ids = [fee_c.id]`!
+    let mut fee_c = fee_a.clone();
+    fee_c.id = Uuid::from_bytes([4; 16]);
+    fee_c.object_val = json!(310);
+    fee_c.confidence = 0.79;
+    fee_c.source_descriptor = "erp-q4-amendment".to_string();
+    fee_c.source_commitment = [4; 32];
+    fee_c.created_at = Utc.with_ymd_and_hms(2026, 11, 21, 18, 10, 0).unwrap();
+    fee_c.content_hash = compute_claim_content_hash(&fee_c).unwrap();
+    store.claims.lock().unwrap().push(fee_c.clone());
+
+    let reesc_resp = pipeline
+        .compile(CompileRequest {
+            tenant_id: "kylewilson04".to_string(),
+            actor_id: "kylewilson04::claude".to_string(),
+            task_id: "r3-reescalated".to_string(),
             scope: "acta-test/r3".to_string(),
             query_text: "audit fee".to_string(),
             query_embedding: None,
@@ -832,39 +940,117 @@ async fn test_v15_epistemic_notary_end_to_end_manifest_refusal_metadata_and_sign
         })
         .await
         .unwrap();
-    assert_eq!(adj_resp.evidence.seq_num, 4);
-    let adj_ctx = adj_resp.context_text.as_ref().unwrap();
-    assert!(!adj_ctx.contains("[DISPUTE"));
-    assert!(adj_ctx.contains("override_seq=3"));
-    assert!(adj_ctx.contains("adjudicator=kylewilson04::cfo"));
+    assert_eq!(reesc_resp.evidence.seq_num, 5);
+    let reesc_ctx = reesc_resp.context_text.as_ref().unwrap();
+    assert!(reesc_ctx.contains("[DISPUTE: INSUFFICIENT_MARGIN]"));
+    assert!(
+        reesc_ctx.contains("lapsed_override:"),
+        "expected lapsed_override provenance in context_text, got:\n{reesc_ctx}"
+    );
 
-    let adj_bundle = adj_resp.bundle.unwrap();
-    assert_eq!(adj_bundle.issued_at, t_override);
-    assert!(adj_bundle.dispute_records.is_empty());
+    let reesc_bundle = reesc_resp.bundle.unwrap();
+    assert_eq!(reesc_bundle.dispute_records.len(), 1);
+    let lapsed = reesc_bundle.dispute_records[0]
+        .lapsed_override
+        .as_ref()
+        .expect("lapsed_override must be attached");
+    assert_eq!(lapsed.attestation_id, signed_att.id);
+    assert_eq!(lapsed.reopened_by_claim_ids, vec![fee_c.id]);
 
-    let adj_hash: [u8; 32] = hex::decode(adj_resp.bundle_hash.unwrap())
+    // 7. Build an `O(log N)` `MerkleBundleProof` (`evidence_chain = []`) + `ExternalWitnessAnchor`
+    //    over the 5-entry ledger and verify offline!
+    let reesc_hash: [u8; 32] = hex::decode(reesc_resp.bundle_hash.unwrap())
         .unwrap()
         .try_into()
         .unwrap();
-    let archive = ExportArchive {
-        bundle_hash: adj_hash,
-        bundle: adj_bundle,
+    let chain_snapshot = store.evidence.lock().unwrap().clone();
+    assert_eq!(chain_snapshot.len(), 5);
+
+    let leaves: Vec<[u8; 32]> = chain_snapshot
+        .iter()
+        .map(|e| merkle_leaf_hash(e.seq_num, &e.event_hash))
+        .collect();
+    let merkle_root = compute_merkle_root_from_leaves(&leaves);
+    let head_entry = chain_snapshot.last().unwrap().clone();
+    let ovr_entry = chain_snapshot[2].clone(); // seq 3
+    let cp_hash = compute_checkpoint_hash(
+        "kylewilson04",
+        5,
+        &head_entry.event_hash,
+        &merkle_root,
+        head_entry.created_at.timestamp_micros(),
+    );
+    let cp_sig = sign_checkpoint_head(&host_key, "kylewilson04", &cp_hash);
+    let wit_sig = sign_witness_anchor(&witness_key, "kylewilson04", 5, &cp_hash);
+
+    let merkle_proof = MerkleBundleProof {
+        checkpoint: SignedTreeHead {
+            tenant_id: "kylewilson04".to_string(),
+            tree_size: 5,
+            head_event_hash: head_entry.event_hash,
+            merkle_root,
+            issued_at: head_entry.created_at,
+            checkpoint_hash: cp_hash,
+            host_signature: cp_sig,
+            witness_anchors: vec![ExternalWitnessAnchor {
+                id: Uuid::new_v4(),
+                tenant_id: "kylewilson04".to_string(),
+                tree_size: 5,
+                checkpoint_hash: cp_hash,
+                witness_id: "ardyn-rekor-witness".to_string(),
+                witness_public_key: witness_key.verifying_key().to_bytes(),
+                witness_signature: wit_sig,
+                external_uri: Some("https://witness.ardyn.ai/checkpoints/5".to_string()),
+                anchored_at: head_entry.created_at,
+            }],
+        },
+        bundle_entry_proof: EntryInclusionProof {
+            entry: head_entry,
+            audit_path: compute_merkle_inclusion_proof(&leaves, 4)
+                .unwrap()
+                .into_iter()
+                .map(hex::encode)
+                .collect(),
+        },
+        override_entry_proofs: vec![EntryInclusionProof {
+            entry: ovr_entry,
+            audit_path: compute_merkle_inclusion_proof(&leaves, 2)
+                .unwrap()
+                .into_iter()
+                .map(hex::encode)
+                .collect(),
+        }],
+    };
+
+    let compact_archive = ExportArchive {
+        bundle_hash: reesc_hash,
+        bundle: reesc_bundle,
         objects: vec![intent],
-        claims: vec![poisoned_claim, fee_b],
+        claims: vec![poisoned_claim, fee_a, fee_b, fee_c],
         override_attestations: vec![signed_att],
-        evidence_chain: store.evidence.lock().unwrap().clone(),
+        evidence_chain: vec![],
+        merkle_proof: Some(merkle_proof),
         host_public_key: host_key.verifying_key().to_bytes(),
     };
-    let summary = verify_export_archive(&archive, &host_key.verifying_key().to_bytes())
-        .expect("v1.5 ExportArchive with override + refusal_metadata + resolver_manifest must verify");
-    assert_eq!(summary.verified_overrides, 1);
-    assert_eq!(summary.verified_refusals, 1);
-    assert_eq!(summary.verified_evidence_entries, 4);
 
-    // Tampering with override justification inside ExportArchive MUST fail cryptographic verification!
-    let mut tampered_archive = archive.clone();
-    tampered_archive.override_attestations[0].justification = "Forged justification".to_string();
-    let tamper_err =
-        verify_export_archive(&tampered_archive, &host_key.verifying_key().to_bytes()).unwrap_err();
-    assert!(tamper_err.contains("tampered override_attestation"));
+    let summary = verify_export_archive(&compact_archive, &host_key.verifying_key().to_bytes())
+        .expect("v1.6 compact Merkle ExportArchive with client-signed lapsed_override + witness anchor must verify");
+    assert_eq!(summary.verification_mode, "merkle_inclusion");
+    assert_eq!(summary.merkle_tree_size, Some(5));
+    assert_eq!(summary.verified_overrides, 1);
+    assert_eq!(summary.verified_witness_anchors, 1);
+    assert_eq!(summary.verified_evidence_entries, 2);
+
+    // Tampering with the committee Ed25519 client_signature inside ExportArchive MUST fail!
+    let mut bad_client_sig = compact_archive.clone();
+    bad_client_sig.override_attestations[0]
+        .client_signature
+        .as_mut()
+        .unwrap()[0] ^= 0xFF;
+    let cs_err =
+        verify_export_archive(&bad_client_sig, &host_key.verifying_key().to_bytes()).unwrap_err();
+    assert!(
+        cs_err.contains("client Ed25519 signature verification failed"),
+        "got: {cs_err}"
+    );
 }

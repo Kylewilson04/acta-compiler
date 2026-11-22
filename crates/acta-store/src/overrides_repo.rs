@@ -1,6 +1,7 @@
 use acta_crypto::{
-    compute_evidence_event_hash_with_meta, compute_override_attestation_hash, sign_evidence_entry,
-    sign_override_attestation, verify_client_content_signature, OverrideHashInput,
+    compute_evidence_event_hash_with_meta, compute_override_attestation_hash,
+    compute_override_client_intent_hash, sign_evidence_entry, sign_override_attestation,
+    verify_client_content_signature, OverrideHashInput,
 };
 use acta_types::{
     ActaError, ActaResult, EvidenceEntry, OverriddenClaimRef, OverrideAttestation,
@@ -129,11 +130,6 @@ impl OverrideRow {
     }
 }
 
-/// Atomically persists a signed `OverrideAttestation` AND its notarizing `EvidenceEntry` in a
-/// single advisory-locked PostgreSQL transaction:
-/// - Deduplicates identical repeat overrides on the same `(tenant, scope, claim_group_key)` head.
-/// - Auto-supersedes prior active overrides (`version = prev.version + 1`, `predecessor_id = Some(prev.id)`)
-///   when the winning claim, competing set, adjudicator, or justification changes.
 pub async fn attest_override_tx(
     pool: &PgPool,
     host_key: &SigningKey,
@@ -199,12 +195,12 @@ pub async fn attest_override_tx(
 
     let (version, predecessor_id) = if let Some(prev_row) = existing_head_row {
         let (prev_att, _) = prev_row.into_domain()?;
-        if input.client_signature.is_none()
-            && prev_att.winning_claim_id == input.winning_claim_id
+        if prev_att.winning_claim_id == input.winning_claim_id
             && prev_att.winning_claim_content_hash == input.winning_claim_content_hash
             && prev_att.overridden_claims == input.overridden_claims
             && prev_att.adjudicator_id == input.adjudicator_id
             && prev_att.justification == input.justification
+            && prev_att.client_public_key == input.client_public_key
         {
             tx.rollback().await.ok();
             let existing_ev =
@@ -263,9 +259,18 @@ pub async fn attest_override_tx(
                     .to_string(),
             ));
         };
-        if !verify_client_content_signature(cpk, &attestation_hash, &sig_arr) {
+        let intent_digest = compute_override_client_intent_hash(
+            &input.tenant_id,
+            &input.scope,
+            input.winning_claim_id,
+            &input.adjudicator_id,
+            &input.justification,
+        );
+        let ok_intent = verify_client_content_signature(cpk, &intent_digest, &sig_arr);
+        let ok_full = verify_client_content_signature(cpk, &attestation_hash, &sig_arr);
+        if !ok_intent && !ok_full {
             return Err(ActaError::Validation(
-                "client Ed25519 signature verification failed over override attestation_hash"
+                "client Ed25519 signature verification failed over override intent digest"
                     .to_string(),
             ));
         }
@@ -414,7 +419,6 @@ pub async fn attest_override_tx(
     Ok((att, ev, false))
 }
 
-/// Fetches all active (non-superseded) `OverrideAttestation` heads in `(tenant_id, scope)`.
 pub async fn fetch_active_scoped_overrides(
     pool: &PgPool,
     tenant_id: &str,
@@ -453,7 +457,6 @@ pub async fn fetch_active_scoped_overrides(
     Ok(out)
 }
 
-/// Fetches specific `OverrideAttestation` rows by UUIDs for `ExportArchive` packaging.
 pub async fn fetch_overrides_by_ids(
     pool: &PgPool,
     tenant_id: &str,
@@ -494,7 +497,6 @@ pub async fn fetch_overrides_by_ids(
     Ok(out)
 }
 
-/// Fetches all `OverrideAttestation` rows (with `is_superseded` status) for Vault Explorer / REST inspection.
 pub async fn fetch_tenant_overrides(
     pool: &PgPool,
     tenant_id: &str,

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod checkpoints;
 pub mod compile;
 pub mod export;
 pub mod ingest;
@@ -132,9 +133,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/replay", post(replay::handle_replay))
         .route("/v1/verify", post(verify::handle_verify_archive))
         .route("/v1/overrides", post(overrides::handle_attest_override))
+        .route("/v1/anchors", post(checkpoints::handle_anchor_checkpoint))
         .route(
             "/v1/tenants/:tenant_id/overrides",
             get(overrides::handle_list_overrides),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/checkpoint",
+            get(checkpoints::handle_get_checkpoint),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/anchors",
+            get(checkpoints::handle_list_anchors),
         )
         .route(
             "/v1/tenants/:tenant_id/vault",

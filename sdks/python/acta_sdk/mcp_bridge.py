@@ -8,7 +8,7 @@ Solves multi-repo, multi-business context routing with ZERO per-repo secret file
    - Fallback `default_tenant` from `~/.config/acta/credentials.json` + directory basename.
 3. Mints the exact `acta_tk_v1:<tenant>:<mac>` token in RAM (when master key is configured),
    attaches `X-Acta-Tenant`, auto-fills omitted `tenant_id` & `scope`, and verifies Ed25519
-   receipts locally on the client before returning results to Claude / Gemini / Cursor / pi.
+   receipts + RFC 6962 Merkle checkpoints locally on the client before returning results.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -26,8 +25,10 @@ from typing import Any, BinaryIO, Mapping
 
 from .client import DEFAULT_CLOUDRUN_URL, ActaClient
 from .crypto import (
+    dump_archive_preimages,
     extract_token_tenant,
     mint_tenant_api_key,
+    verify_export_archive,
 )
 
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".config" / "acta" / "credentials.json"
@@ -102,66 +103,63 @@ def resolve_git_workspace_context(
     *,
     fallback_tenant: str = "sandbox-local",
 ) -> WorkspaceRouting:
-    """Determines `(tenant_id, default_scope)` from `.acta.json` or Git `remote.origin.url`."""
     work_dir = Path(cwd or os.getcwd()).resolve()
-    git_root, acta_json_path = _find_git_root_and_acta_config(work_dir)
-
+    git_root, acta_cfg = _find_git_root_and_acta_config(work_dir)
     remote_url = _read_git_origin_url(git_root) if git_root else None
     parsed_remote = parse_git_remote_url(remote_url) if remote_url else None
 
+    if acta_cfg is not None:
+        raw_cfg = json.loads(acta_cfg.read_text(encoding="utf-8"))
+        cfg_tenant = _sanitize_slug(
+            str(raw_cfg.get("tenant") or (parsed_remote[0] if parsed_remote else fallback_tenant)),
+            fallback_tenant,
+        )
+        cfg_scope = _sanitize_slug(
+            str(
+                raw_cfg.get("default_scope")
+                or (parsed_remote[1] if parsed_remote else work_dir.name)
+            ),
+            "default-scope",
+        )
+        return WorkspaceRouting(
+            tenant_id=cfg_tenant,
+            default_scope=cfg_scope,
+            source=f".acta.json:{acta_cfg}",
+            git_remote=remote_url,
+            cwd=str(work_dir),
+        )
+
     env_tenant = (os.environ.get("ACTA_TENANT_ID") or "").strip()
     env_scope = (os.environ.get("ACTA_DEFAULT_SCOPE") or "").strip()
-
-    cfg_tenant: str | None = None
-    cfg_scope: str | None = None
-    if acta_json_path is not None:
-        raw_cfg = json.loads(acta_json_path.read_text(encoding="utf-8"))
-        if isinstance(raw_cfg, Mapping):
-            if raw_cfg.get("tenant"):
-                cfg_tenant = _sanitize_slug(str(raw_cfg["tenant"]), fallback_tenant)
-            if raw_cfg.get("default_scope"):
-                cfg_scope = _sanitize_slug(str(raw_cfg["default_scope"]), work_dir.name)
-
     if env_tenant:
-        tenant = _sanitize_slug(env_tenant, fallback_tenant)
-        source = "env:ACTA_TENANT_ID"
-    elif cfg_tenant:
-        tenant = cfg_tenant
-        source = f"file:{acta_json_path}"
-    elif parsed_remote:
-        tenant = parsed_remote[0]
-        source = "git:remote.origin.owner"
-    else:
-        tenant = _sanitize_slug(fallback_tenant, "sandbox-local")
-        source = "credentials:default_tenant"
+        return WorkspaceRouting(
+            tenant_id=_sanitize_slug(env_tenant, fallback_tenant),
+            default_scope=_sanitize_slug(
+                env_scope or (parsed_remote[1] if parsed_remote else work_dir.name),
+                "default-scope",
+            ),
+            source="env:ACTA_TENANT_ID",
+            git_remote=remote_url,
+            cwd=str(work_dir),
+        )
 
-    if env_scope:
-        scope = _sanitize_slug(env_scope, "general")
-    elif cfg_scope:
-        scope = cfg_scope
-    elif parsed_remote:
-        scope = parsed_remote[1]
-    elif git_root is not None:
-        scope = _sanitize_slug(git_root.name, "general")
-    else:
-        scope = _sanitize_slug(work_dir.name, "general")
+    if parsed_remote is not None:
+        return WorkspaceRouting(
+            tenant_id=parsed_remote[0],
+            default_scope=parsed_remote[1],
+            source="git:remote.origin.url",
+            git_remote=remote_url,
+            cwd=str(work_dir),
+        )
 
+    dir_slug = _sanitize_slug((git_root or work_dir).name, "workspace")
     return WorkspaceRouting(
-        tenant_id=tenant,
-        default_scope=scope,
-        source=source,
-        git_remote=remote_url,
+        tenant_id=_sanitize_slug(fallback_tenant, "sandbox-local"),
+        default_scope=dir_slug,
+        source="fallback:cwd",
+        git_remote=None,
         cwd=str(work_dir),
     )
-
-
-def load_credentials(path: Path | None = None) -> dict[str, Any]:
-    cred_path = path or Path(
-        os.environ.get("ACTA_CREDENTIALS_FILE", str(DEFAULT_CREDENTIALS_PATH))
-    )
-    if cred_path.is_file():
-        return json.loads(cred_path.read_text(encoding="utf-8"))
-    return {}
 
 
 def save_credentials(
@@ -189,60 +187,61 @@ def save_credentials(
     return cred_path
 
 
-def _merge_mcp_entry_into_json_file(file_path: Path, server_name: str, entry: dict[str, Any]) -> None:
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+def load_credentials(path: Path | None = None) -> dict[str, Any]:
+    cred_path = path or DEFAULT_CREDENTIALS_PATH
+    if not cred_path.is_file():
+        return {}
+    return json.loads(cred_path.read_text(encoding="utf-8"))
+
+
+def _upsert_mcp_json_config(target_path: Path, command_path: str) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, Any] = {}
-    if file_path.is_file():
+    if target_path.is_file():
         try:
-            loaded = json.loads(file_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
+            existing = json.loads(target_path.read_text(encoding="utf-8"))
         except Exception:
             existing = {}
-    servers = existing.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-        existing["mcpServers"] = servers
-    servers[server_name] = entry
-    file_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    servers = existing.setdefault("mcpServers", {})
+    servers["acta"] = {
+        "command": command_path,
+        "args": ["serve"],
+    }
+    target_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
 
-def install_global_mcp_configs(command_path: str | None = None) -> list[str]:
-    """Registers `acta-mcp` once in user-global Gemini CLI, Cursor, and Claude configs."""
-    resolved_bin = (
-        command_path
-        or shutil.which("acta-mcp")
-        or f"{sys.executable}"
+def install_global_mcp_configs(home_dir: Path | None = None) -> list[Path]:
+    home = home_dir or Path.home()
+    python_exe = sys.executable
+    wrapper_bin = home / ".local" / "bin" / "acta-mcp"
+    wrapper_bin.parent.mkdir(parents=True, exist_ok=True)
+    sdk_dir = Path(__file__).resolve().parents[1]
+    wrapper_bin.write_text(
+        f'#!/usr/bin/env bash\nPYTHONPATH="{sdk_dir}:${{PYTHONPATH:-}}" exec "{python_exe}" -m acta_sdk.cli "$@"\n',
+        encoding="utf-8",
     )
-    if resolved_bin == sys.executable:
-        stdio_entry = {"command": sys.executable, "args": ["-m", "acta_sdk.cli", "mcp-serve"]}
-    else:
-        stdio_entry = {"command": resolved_bin, "args": ["serve"]}
+    os.chmod(wrapper_bin, 0o755)
 
-    updated: list[str] = []
-    home = Path.home()
+    cmd_str = str(wrapper_bin)
+    targets = [
+        home / ".claude.json",
+        home / ".gemini" / "settings.json",
+        home / ".cursor" / "mcp.json",
+    ]
+    macos_claude = home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if macos_claude.parent.exists():
+        targets.append(macos_claude)
 
-    gemini_cfg = home / ".gemini" / "settings.json"
-    _merge_mcp_entry_into_json_file(gemini_cfg, "acta", stdio_entry)
-    updated.append(str(gemini_cfg))
-
-    cursor_cfg = home / ".cursor" / "mcp.json"
-    _merge_mcp_entry_into_json_file(cursor_cfg, "acta", stdio_entry)
-    updated.append(str(cursor_cfg))
-
-    claude_cfg = home / ".claude.json"
-    _merge_mcp_entry_into_json_file(
-        claude_cfg,
-        "acta",
-        {"type": "stdio", **stdio_entry},
-    )
-    updated.append(str(claude_cfg))
+    updated: list[Path] = []
+    for t in targets:
+        _upsert_mcp_json_config(t, cmd_str)
+        updated.append(t)
 
     return updated
 
 
 class ActaGitMcpBridge:
-    """Zero-trust local `stdio` MCP server that routes by Git repo & verifies Ed25519 receipts."""
+    """Zero-trust local `stdio` MCP server that routes by Git repo & verifies Ed25519/Merkle receipts."""
 
     def __init__(
         self,
@@ -367,7 +366,7 @@ class ActaGitMcpBridge:
             },
             {
                 "name": "acta_attest_override",
-                "description": f"Signs and notarizes an immutable dispute-override attestation on Git tenant '{t}' after explicit human/supervisor authorization.",
+                "description": f"Signs and notarizes an immutable dispute-override attestation on Git tenant '{t}'. Custom adjudicator_id requires client_signature_hex + client_public_key_hex.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["winning_claim_id", "justification"],
@@ -375,8 +374,43 @@ class ActaGitMcpBridge:
                         "scope": {"type": "string", "default": s},
                         "winning_claim_id": {"type": "string"},
                         "source_bundle_hash_hex": {"type": "string"},
-                        "adjudicator_id": {"type": "string", "default": "supervisor"},
+                        "adjudicator_id": {"type": "string"},
                         "justification": {"type": "string"},
+                        "client_signature_hex": {"type": "string"},
+                        "client_public_key_hex": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "acta_get_checkpoint",
+                "description": f"Returns the RFC 6962 Ed25519-signed Merkle SignedTreeHead checkpoint (and optional O(log N) consistency proof) for Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tree_size": {"type": "integer"},
+                        "since_size": {"type": "integer"},
+                    },
+                },
+            },
+            {
+                "name": "acta_anchor_checkpoint",
+                "description": f"Appends an external witness Ed25519 cosignature to a SignedTreeHead checkpoint on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": [
+                        "tree_size",
+                        "checkpoint_hash_hex",
+                        "witness_id",
+                        "witness_public_key_hex",
+                        "witness_signature_hex",
+                    ],
+                    "properties": {
+                        "tree_size": {"type": "integer"},
+                        "checkpoint_hash_hex": {"type": "string"},
+                        "witness_id": {"type": "string"},
+                        "witness_public_key_hex": {"type": "string"},
+                        "witness_signature_hex": {"type": "string"},
+                        "external_uri": {"type": "string"},
                     },
                 },
             },
@@ -397,11 +431,15 @@ class ActaGitMcpBridge:
             },
             {
                 "name": "acta_verify_bundle",
-                "description": "Downloads ExportArchive and verifies RFC 8785 JCS + BLAKE3 + Ed25519 signatures locally on this machine.",
+                "description": "Downloads ExportArchive (`merkle` O(log N) or `full` linear chain) and verifies RFC 8785 JCS + BLAKE3 + Ed25519 signatures locally.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["bundle_hash"],
-                    "properties": {"bundle_hash": {"type": "string"}},
+                    "properties": {
+                        "bundle_hash": {"type": "string"},
+                        "proof_mode": {"type": "string", "enum": ["merkle", "full"], "default": "merkle"},
+                        "dump_preimages": {"type": "boolean", "default": False},
+                    },
                 },
             },
             {
@@ -485,7 +523,7 @@ class ActaGitMcpBridge:
             )
 
         if name == "acta_attest_override":
-            adj_raw = str(args.get("adjudicator_id") or "supervisor").strip()
+            adj_opt = str(args["adjudicator_id"]).strip() if args.get("adjudicator_id") else None
             return self.client.attest_override(
                 scope=scope,
                 winning_claim_id=str(args["winning_claim_id"]),
@@ -494,8 +532,34 @@ class ActaGitMcpBridge:
                     if args.get("source_bundle_hash_hex") is not None
                     else None
                 ),
-                adjudicator_id=adj_raw,
+                adjudicator_id=adj_opt,
                 justification=str(args["justification"]),
+                client_signature_hex=(
+                    str(args["client_signature_hex"])
+                    if args.get("client_signature_hex") is not None
+                    else None
+                ),
+                client_public_key_hex=(
+                    str(args["client_public_key_hex"])
+                    if args.get("client_public_key_hex") is not None
+                    else None
+                ),
+            )
+
+        if name == "acta_get_checkpoint":
+            return self.client.get_checkpoint(
+                tree_size=int(args["tree_size"]) if args.get("tree_size") is not None else None,
+                since_size=int(args["since_size"]) if args.get("since_size") is not None else None,
+            )
+
+        if name == "acta_anchor_checkpoint":
+            return self.client.anchor_checkpoint(
+                tree_size=int(args["tree_size"]),
+                checkpoint_hash_hex=str(args["checkpoint_hash_hex"]),
+                witness_id=str(args["witness_id"]),
+                witness_public_key_hex=str(args["witness_public_key_hex"]),
+                witness_signature_hex=str(args["witness_signature_hex"]),
+                external_uri=str(args["external_uri"]) if args.get("external_uri") is not None else None,
             )
 
         if name == "acta_replay_counterfactual":
@@ -516,9 +580,13 @@ class ActaGitMcpBridge:
             )
 
         if name == "acta_verify_bundle":
-            summary = self.client.verify_bundle_offline(str(args["bundle_hash"]))
-            return {
+            mode = "full" if str(args.get("proof_mode") or "merkle") == "full" else "merkle"
+            pk = self.client.ensure_host_public_key()
+            archive = self.client.export_bundle(str(args["bundle_hash"]), mode=mode)
+            summary = verify_export_archive(archive, pk)
+            out: dict[str, Any] = {
                 "verified_locally": True,
+                "verification_mode": summary.verification_mode,
                 "tenant_id": summary.tenant_id,
                 "bundle_hash_hex": summary.bundle_hash_hex,
                 "state_commitment_hex": summary.state_commitment_hex,
@@ -527,9 +595,15 @@ class ActaGitMcpBridge:
                 "verified_overrides": summary.verified_overrides,
                 "verified_refusals": summary.verified_refusals,
                 "verified_evidence_entries": summary.verified_evidence_entries,
+                "merkle_tree_size": summary.merkle_tree_size,
+                "merkle_root_hex": summary.merkle_root_hex,
+                "verified_witness_anchors": summary.verified_witness_anchors,
                 "non_default_thresholds": summary.non_default_thresholds,
                 "resolver_manifest": summary.resolver_manifest,
             }
+            if args.get("dump_preimages"):
+                out["preimages"] = dump_archive_preimages(archive)
+            return out
 
         if name == "acta_list_evidence":
             return self.client.list_tenant_evidence()
@@ -558,7 +632,7 @@ class ActaGitMcpBridge:
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "acta-mcp-git-bridge",
-                        "version": "1.5.0",
+                        "version": "1.6.0",
                     },
                 },
             }

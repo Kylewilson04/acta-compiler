@@ -1,25 +1,27 @@
-use acta_crypto::verify_export_archive;
+use acta_crypto::{dump_archive_preimages, verify_export_archive, verify_signed_tree_head};
 use acta_engine::ResolverConfig;
 use acta_store::{evidence_repo, overrides_repo};
 use acta_types::{
     validate_budget, validate_identifier, validate_priority, validate_provenance_class,
-    validate_query_text, validate_scope, AttestOverrideRequest, CompileRequest, ContextBudget,
-    IngestClaimRequest, IngestObjectRequest, LifecycleStatus, ObjectType, PolicyDecision,
-    PolicyResultTag,
+    validate_query_text, validate_scope, AnchorCheckpointRequest, AttestOverrideRequest,
+    CompileRequest, ContextBudget, IngestClaimRequest, IngestObjectRequest, LifecycleStatus,
+    ObjectType, PolicyDecision, PolicyResultTag,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, SubsecRound, Utc};
+use ed25519_dalek::VerifyingKey;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::routes::{
+    checkpoints::{handle_anchor_checkpoint, handle_get_checkpoint, CheckpointQueryParams},
     compile::handle_compile,
-    export::build_export_archive,
+    export::build_export_archive_with_mode,
     ingest::{handle_ingest_claim, handle_ingest_object},
     oauth::apply_oauth_cors,
     overrides::handle_attest_override,
@@ -31,7 +33,7 @@ fn mcp_tools_schema() -> Value {
     json!([
         {
             "name": "acta_whoami",
-            "description": "Returns the verified GitHub organization / tenant vault locked to this MCP session, active resolver thresholds, host Ed25519 verifying key, Cedar permission root, recent signed overrides, and recent signed evidence_history entries (with readable refusal_metadata).",
+            "description": "Returns the verified GitHub organization / tenant vault and OAuth principal locked to this MCP session, active resolver thresholds, host Ed25519 verifying key, Cedar permission root, latest RFC 6962 SignedTreeHead checkpoint, active overrides, and recent signed evidence_history entries.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -39,7 +41,7 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "acta_compile_context",
-            "description": "Compiles a deterministic, Ed25519-signed ContextBundle binding resolver_manifest inside the bundle and enforcing Policy-Before-Read and explicit [DISPUTE] markers.",
+            "description": "Compiles a deterministic, Ed25519-signed ContextBundle binding resolver_manifest inside the bundle, preserving compact override why=\"...\" justifications under tight token budgets, and surfacing LapsedOverrideRef provenance when unseen evidence reopens a prior override.",
             "inputSchema": {
                 "type": "object",
                 "required": ["scope", "query_text"],
@@ -109,10 +111,10 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "acta_attest_override",
-            "description": "Cryptographically notarizes a human/committee dispute adjudication (enforcing Policy-Before-Attest), signing the winning claim, all overridden competing claims, adjudicator_id, and justification into override_attestations and evidence_history. Subsequent compiles resolve the adjudicated group until unseen conflicting evidence arrives.",
+            "description": "Cryptographically notarizes a dispute adjudication (enforcing Policy-Before-Attest and Principal-Bound Identity). Omit adjudicator_id to bind your verified GitHub OAuth 2.1 login (<tenant>::oauth:<github_login>); claiming a custom third-party/committee adjudicator_id or attesting on regulated/* scopes requires a valid 64-byte Ed25519 client_signature_hex + client_public_key_hex over acta:override_client_sig:v1.",
             "inputSchema": {
                 "type": "object",
-                "required": ["scope", "winning_claim_id", "adjudicator_id", "justification"],
+                "required": ["scope", "winning_claim_id", "justification"],
                 "properties": {
                     "tenant_id": { "type": "string" },
                     "scope": { "type": "string" },
@@ -126,14 +128,20 @@ fn mcp_tools_schema() -> Value {
                     },
                     "adjudicator_id": {
                         "type": "string",
-                        "description": "Identifier of the human or committee authorizing the override (e.g. 'cfo-review', 'kylewilson04::legal')."
+                        "description": "Optional; omit to attest as your verified GitHub OAuth identity (<tenant>::oauth:<github_login>). Custom committee/third-party IDs require client_signature_hex + client_public_key_hex."
                     },
                     "justification": {
                         "type": "string",
                         "description": "Single-line evidentiary justification citing why winning_claim_id supersedes the competing claim(s)."
                     },
-                    "client_signature_hex": { "type": "string" },
-                    "client_public_key_hex": { "type": "string" }
+                    "client_signature_hex": {
+                        "type": "string",
+                        "description": "64-byte Ed25519 signature (128 hex chars) over compute_override_client_intent_hash (acta:override_client_sig:v1)."
+                    },
+                    "client_public_key_hex": {
+                        "type": "string",
+                        "description": "32-byte Ed25519 public key (64 hex chars) corresponding to client_signature_hex."
+                    }
                 }
             }
         },
@@ -161,15 +169,26 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "acta_verify_bundle",
-            "description": "Exports a persisted ContextBundle (enforcing organization lock) and runs full Ed25519 + RFC 8785 JCS + BLAKE3 hash-chain + resolver_manifest + override + refusal_metadata verification.",
+            "description": "Exports a persisted ContextBundle and runs full Ed25519 + RFC 8785 JCS + BLAKE3 + RFC 6962 Merkle inclusion + resolver_manifest + override/lapsed_override + refusal_metadata verification. Supports proof_mode='merkle' for O(log N) verification without fetching the full linear evidence_chain, plus dump_preimages=true.",
             "inputSchema": {
                 "type": "object",
                 "required": ["bundle_hash"],
                 "properties": {
                     "bundle_hash": { "type": "string", "description": "64-character hex bundle hash" },
+                    "proof_mode": {
+                        "type": "string",
+                        "enum": ["full", "merkle"],
+                        "default": "full",
+                        "description": "'full' verifies both linear evidence_chain and Merkle proof; 'merkle' builds and verifies an O(log N) MerkleBundleProof with empty evidence_chain."
+                    },
                     "include_archive": {
                         "type": "boolean",
                         "default": true
+                    },
+                    "dump_preimages": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, includes explicit domain-separated preimage digests and canonical JCS metadata for independent verification."
                     }
                 }
             }
@@ -181,6 +200,43 @@ fn mcp_tools_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "tenant_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "acta_get_checkpoint",
+            "description": "Returns the deterministic Ed25519-signed RFC 6962 Merkle SignedTreeHead checkpoint for your vault (at latest head or optional tree_size), plus an O(log N) Merkle consistency_proof from since_size proving append-only prefix integrity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "tree_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional ledger size N (defaults to latest head)."
+                    },
+                    "since_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional earlier checkpoint size M <= tree_size to generate an RFC 6962 consistency proof."
+                    }
+                }
+            }
+        },
+        {
+            "name": "acta_anchor_checkpoint",
+            "description": "Records an immutable external witness Ed25519 cosignature (acta:witness_sig:v1) anchoring a SignedTreeHead checkpoint at (tenant_id, tree_size, checkpoint_hash).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["tree_size", "checkpoint_hash", "witness_id", "witness_public_key_hex", "witness_signature_hex"],
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "tree_size": { "type": "integer", "minimum": 1 },
+                    "checkpoint_hash": { "type": "string", "description": "64-char hex checkpoint_hash from acta_get_checkpoint." },
+                    "witness_id": { "type": "string", "description": "Identifier of the external witness (e.g. 'rekor-mirror-1', 'cfo-notary')." },
+                    "witness_public_key_hex": { "type": "string", "description": "32-byte Ed25519 public key (64 hex chars)." },
+                    "witness_signature_hex": { "type": "string", "description": "64-byte Ed25519 signature (128 hex chars) over witness_anchor_signing_preimage." },
+                    "external_uri": { "type": "string", "description": "Optional transparency log / anchor URI." }
                 }
             }
         }
@@ -301,18 +357,22 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
         }
     }
 
-    let locked_tenant = state
+    let (locked_tenant, verified_principal) = state
         .inspect_caller_auth(&headers)
         .ok()
-        .and_then(|info| match info {
-            VerifiedKeyInfo::TenantBound { locked_tenant } => Some(locked_tenant),
+        .map(|info| match info {
+            VerifiedKeyInfo::TenantBound {
+                locked_tenant,
+                verified_principal,
+            } => (Some(locked_tenant), verified_principal),
             VerifiedKeyInfo::Master {
                 header_locked_tenant,
             }
             | VerifiedKeyInfo::Anonymous {
                 header_locked_tenant,
-            } => header_locked_tenant,
-        });
+            } => (header_locked_tenant, None),
+        })
+        .unwrap_or((None, None));
 
     let base = state.resolve_public_base_url(&headers);
     let body = json!({
@@ -326,10 +386,11 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
         },
         "serverInfo": {
             "name": "acta-compiler-mcp",
-            "version": "1.5.0",
+            "version": "1.6.0",
             "host_public_key": hex::encode(state.host_public_key),
             "permission_root": hex::encode(state.policy_gate.permission_root()),
             "locked_tenant": locked_tenant,
+            "verified_principal": verified_principal,
         },
         "tools": mcp_tools_schema()
     });
@@ -414,7 +475,7 @@ pub async fn handle_mcp_rpc(
                     },
                     "serverInfo": {
                         "name": "acta-compiler-mcp",
-                        "version": "1.5.0"
+                        "version": "1.6.0"
                     }
                 }),
             )
@@ -472,52 +533,72 @@ async fn dispatch_mcp_tool(
     match tool_name {
         "acta_whoami" => {
             let info = state.inspect_caller_auth(&headers)?;
-            let (key_kind, locked_tenant) = match info {
-                VerifiedKeyInfo::TenantBound { locked_tenant } => {
-                    ("tenant_bound_blake3_mac", Some(locked_tenant))
+            let (key_kind, locked_tenant, verified_principal) = match info {
+                VerifiedKeyInfo::TenantBound {
+                    locked_tenant,
+                    verified_principal,
+                } => {
+                    let kind = if verified_principal.is_some() {
+                        "oauth_user_tenant_bound_blake3_mac"
+                    } else {
+                        "tenant_bound_blake3_mac"
+                    };
+                    (kind, Some(locked_tenant), verified_principal)
                 }
                 VerifiedKeyInfo::Master {
                     header_locked_tenant,
-                } => ("master", header_locked_tenant),
+                } => ("master", header_locked_tenant, None),
                 VerifiedKeyInfo::Anonymous {
                     header_locked_tenant,
-                } => ("anonymous_sandbox", header_locked_tenant),
+                } => ("anonymous_sandbox", header_locked_tenant, None),
             };
 
-            let (evidence_entry_count, recent_evidence_entries, active_override_count) =
-                if let Some(ref tid) = locked_tenant {
-                    let ev_fut = evidence_repo::fetch_tenant_evidence_chain(&state.pool, tid, None);
-                    let ov_fut = overrides_repo::fetch_tenant_overrides(&state.pool, tid, None);
-                    let (ev_res, ov_res) = tokio::join!(ev_fut, ov_fut);
-                    let (total, tail) = match ev_res {
-                        Ok(entries) => {
-                            let total = entries.len();
-                            let tail = entries
-                                .into_iter()
-                                .rev()
-                                .take(20)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect::<Vec<_>>();
-                            (Some(total), Some(tail))
-                        }
-                        Err(_) => (None, None),
-                    };
-                    let ov_cnt = ov_res
-                        .ok()
-                        .map(|v| v.into_iter().filter(|(_, sup)| !*sup).count());
-                    (total, tail, ov_cnt)
-                } else {
-                    (None, None, None)
+            let (
+                evidence_entry_count,
+                recent_evidence_entries,
+                active_override_count,
+                latest_checkpoint,
+            ) = if let Some(ref tid) = locked_tenant {
+                let ev_fut = evidence_repo::fetch_tenant_evidence_chain(&state.pool, tid, None);
+                let ov_fut = overrides_repo::fetch_tenant_overrides(&state.pool, tid, None);
+                let cp_fut = evidence_repo::build_signed_tree_head(
+                    &state.pool,
+                    &state.host_signing_key,
+                    tid,
+                    None,
+                );
+                let (ev_res, ov_res, cp_res) = tokio::join!(ev_fut, ov_fut, cp_fut);
+                let (total, tail) = match ev_res {
+                    Ok(entries) => {
+                        let total = entries.len();
+                        let tail = entries
+                            .into_iter()
+                            .rev()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>();
+                        (Some(total), Some(tail))
+                    }
+                    Err(_) => (None, None),
                 };
+                let ov_cnt = ov_res
+                    .ok()
+                    .map(|v| v.into_iter().filter(|(_, sup)| !*sup).count());
+                let cp = cp_res.ok().flatten().map(|(sth, _)| sth);
+                (total, tail, ov_cnt, cp)
+            } else {
+                (None, None, None, None)
+            };
 
             let cfg = state.pipeline.config();
             Ok(json!({
                 "connected": true,
-                "version": "1.5.0",
+                "version": "1.6.0",
                 "key_kind": key_kind,
                 "locked_tenant": locked_tenant,
+                "verified_principal": verified_principal,
                 "github_oauth_enabled": state.oauth.github_enabled(),
                 "host_public_key": hex::encode(state.host_public_key),
                 "permission_root": hex::encode(state.policy_gate.permission_root()),
@@ -528,6 +609,7 @@ async fn dispatch_mcp_tool(
                     "max_inline_omissions": cfg.max_inline_omissions,
                     "corroboration_formula": "min(0.9999, c_1 + (1.0 - c_1) * (1.0 - prod_{i>=2}(1.0 - 0.5 * c_i)))",
                 },
+                "latest_checkpoint": latest_checkpoint,
                 "active_override_count": active_override_count,
                 "evidence_entry_count": evidence_entry_count,
                 "recent_evidence_entries": recent_evidence_entries,
@@ -745,8 +827,7 @@ async fn dispatch_mcp_tool(
             let adjudicator_id = args
                 .get("adjudicator_id")
                 .and_then(Value::as_str)
-                .ok_or("missing adjudicator_id")?
-                .to_string();
+                .map(str::to_string);
             let justification = args
                 .get("justification")
                 .and_then(Value::as_str)
@@ -858,7 +939,7 @@ async fn dispatch_mcp_tool(
             validate_query_text(&query_text).map_err(|e| e.to_string())?;
             let budget = parse_mcp_token_budget(args.get("token_budget"))?;
 
-            let base_res = state.pipeline.config().resolver.clone();
+            let base_res = state.pipeline.config().resolver;
             let override_min = args.get("override_min_confidence").and_then(Value::as_f64);
             let override_dec = args
                 .get("override_decisiveness_threshold")
@@ -901,7 +982,7 @@ async fn dispatch_mcp_tool(
                 ),
                 state
                     .pipeline
-                    .simulate_compile(req, None, Some(cf_res.clone())),
+                    .simulate_compile(req, None, Some(cf_res)),
             )
             .map_err(|e| e.to_string())?;
 
@@ -1006,9 +1087,34 @@ async fn dispatch_mcp_tool(
                 .get("bundle_hash")
                 .and_then(Value::as_str)
                 .ok_or("missing bundle_hash")?;
-            let archive = build_export_archive(&state, bundle_hash_hex, Some(&headers))
-                .await
-                .map_err(|e| e.message)?;
+            let proof_mode = args
+                .get("proof_mode")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("full");
+            let include_full_chain = match proof_mode {
+                "" | "full" => true,
+                "merkle" => false,
+                other => {
+                    return Err(format!(
+                        "invalid proof_mode '{other}' (expected 'full' or 'merkle')"
+                    ))
+                }
+            };
+            let dump_preimages = args
+                .get("dump_preimages")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let archive = build_export_archive_with_mode(
+                &state,
+                bundle_hash_hex,
+                Some(&headers),
+                include_full_chain,
+            )
+            .await
+            .map_err(|e| e.message)?;
+
             let default_include = archive.objects.len() + archive.claims.len() <= 64;
             let include_archive = args
                 .get("include_archive")
@@ -1036,21 +1142,33 @@ async fn dispatch_mcp_tool(
                     return Err(format!("{err}{suffix}"));
                 }
             };
-            if include_archive {
-                Ok(json!({
+
+            let preimages_opt = if dump_preimages {
+                Some(dump_archive_preimages(&archive)?)
+            } else {
+                None
+            };
+
+            let mut out = if include_archive {
+                json!({
                     "verified": true,
                     "host_public_key": hex::encode(state.host_public_key),
                     "summary": summary,
                     "archive": archive,
-                }))
+                })
             } else {
-                Ok(json!({
+                json!({
                     "verified": true,
                     "host_public_key": hex::encode(state.host_public_key),
                     "summary": summary,
+                    "merkle_proof": archive.merkle_proof,
                     "evidence_chain": archive.evidence_chain,
-                }))
+                })
+            };
+            if let Some(p) = preimages_opt {
+                out["preimages"] = p;
             }
+            Ok(out)
         }
         "acta_list_evidence" => {
             let tenant_id = state
@@ -1064,6 +1182,112 @@ async fn dispatch_mcp_tool(
                 .await
                 .map_err(|e| e.message)?;
             serde_json::to_value(ev).map_err(|e| e.to_string())
+        }
+        "acta_get_checkpoint" => {
+            let tenant_id = state
+                .resolve_mcp_tenant_audited(
+                    &headers,
+                    args.get("tenant_id").and_then(Value::as_str),
+                    "acta_get_checkpoint",
+                )
+                .await?;
+            let tree_size = match args.get("tree_size") {
+                Some(v) if !v.is_null() => Some(
+                    v.as_i64()
+                        .ok_or_else(|| format!("tree_size must be a positive integer, got {v}"))?,
+                ),
+                _ => None,
+            };
+            let since_size = match args.get("since_size") {
+                Some(v) if !v.is_null() => Some(
+                    v.as_i64()
+                        .ok_or_else(|| format!("since_size must be a positive integer, got {v}"))?,
+                ),
+                _ => None,
+            };
+
+            let vk = VerifyingKey::from_bytes(&state.host_public_key)
+                .map_err(|e| format!("host key error: {e}"))?;
+            let Json(cp_resp) = handle_get_checkpoint(
+                State(state),
+                Path(tenant_id.clone()),
+                Query(CheckpointQueryParams {
+                    tree_size,
+                    since_size,
+                }),
+                headers,
+            )
+            .await
+            .map_err(|e| e.message)?;
+
+            let mut verified = true;
+            if let Some(ref sth) = cp_resp.checkpoint {
+                verify_signed_tree_head(sth, &tenant_id, &vk)?;
+            }
+            if let Some(ref p_sth) = cp_resp.prior_checkpoint {
+                verify_signed_tree_head(p_sth, &tenant_id, &vk)?;
+            }
+            if cp_resp.consistency_verified == Some(false) {
+                verified = false;
+            }
+
+            let mut val = serde_json::to_value(cp_resp).map_err(|e| e.to_string())?;
+            val["verified"] = json!(verified);
+            Ok(val)
+        }
+        "acta_anchor_checkpoint" => {
+            let tenant_id = state
+                .resolve_mcp_tenant_audited(
+                    &headers,
+                    args.get("tenant_id").and_then(Value::as_str),
+                    "acta_anchor_checkpoint",
+                )
+                .await?;
+            let tree_size = args
+                .get("tree_size")
+                .and_then(Value::as_i64)
+                .ok_or("missing integer tree_size")?;
+            let checkpoint_hash_hex = args
+                .get("checkpoint_hash")
+                .or_else(|| args.get("checkpoint_hash_hex"))
+                .and_then(Value::as_str)
+                .ok_or("missing checkpoint_hash")?
+                .to_string();
+            let witness_id = args
+                .get("witness_id")
+                .and_then(Value::as_str)
+                .ok_or("missing witness_id")?
+                .to_string();
+            let witness_public_key_hex = args
+                .get("witness_public_key_hex")
+                .and_then(Value::as_str)
+                .ok_or("missing witness_public_key_hex")?
+                .to_string();
+            let witness_signature_hex = args
+                .get("witness_signature_hex")
+                .and_then(Value::as_str)
+                .ok_or("missing witness_signature_hex")?
+                .to_string();
+            let external_uri = args
+                .get("external_uri")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            let req = AnchorCheckpointRequest {
+                id: None,
+                tenant_id,
+                tree_size,
+                checkpoint_hash_hex,
+                witness_id,
+                witness_public_key_hex,
+                witness_signature_hex,
+                external_uri,
+            };
+
+            let (_status, Json(anchor)) = handle_anchor_checkpoint(State(state), headers, Json(req))
+                .await
+                .map_err(|e| e.message)?;
+            serde_json::to_value(anchor).map_err(|e| e.to_string())
         }
         unknown => Err(format!("unknown MCP tool: {unknown}")),
     }

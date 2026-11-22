@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use acta_crypto::{hash_length_delimited, verify_tenant_api_key, TENANT_TOKEN_PREFIX};
+use acta_crypto::{
+    hash_length_delimited, verify_tenant_api_key, verify_tenant_api_key_with_principal,
+    TENANT_TOKEN_PREFIX,
+};
 use acta_engine::{CompilePipeline, PipelineConfig};
 use acta_policy::PolicyGate;
 use acta_store::{evidence_repo, PgActaStore};
@@ -61,8 +64,22 @@ pub fn extract_tenant_header(headers: &HeaderMap) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiedKeyInfo {
     Master { header_locked_tenant: Option<String> },
-    TenantBound { locked_tenant: String },
+    TenantBound {
+        locked_tenant: String,
+        verified_principal: Option<String>,
+    },
     Anonymous { header_locked_tenant: Option<String> },
+}
+
+impl VerifiedKeyInfo {
+    pub fn verified_principal(&self) -> Option<&str> {
+        match self {
+            VerifiedKeyInfo::TenantBound {
+                verified_principal, ..
+            } => verified_principal.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -105,7 +122,7 @@ impl AppState {
         let user_agent = std::env::var("ACTA_HTTP_USER_AGENT")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Acta-Compiler-OAuth/1.5".to_string());
+            .unwrap_or_else(|| "Acta-Compiler-OAuth/1.6".to_string());
 
         let http_client = reqwest::Client::builder()
             .user_agent(user_agent)
@@ -199,7 +216,8 @@ impl AppState {
 
         match (&self.api_key, provided) {
             (_, Some(tok)) if tok.starts_with(TENANT_TOKEN_PREFIX) => {
-                let locked = verify_tenant_api_key(self.effective_token_secret(), tok)?;
+                let (locked, verified_principal) =
+                    verify_tenant_api_key_with_principal(self.effective_token_secret(), tok)?;
                 if let Some(ref ht) = hdr_tenant {
                     if ht != &locked {
                         return Err(format!(
@@ -209,6 +227,7 @@ impl AppState {
                 }
                 Ok(VerifiedKeyInfo::TenantBound {
                     locked_tenant: locked,
+                    verified_principal,
                 })
             }
             (Some(master), Some(tok)) => {
@@ -244,7 +263,7 @@ impl AppState {
         }
 
         match self.inspect_caller_auth(headers).ok()? {
-            VerifiedKeyInfo::TenantBound { locked_tenant } => Some(locked_tenant),
+            VerifiedKeyInfo::TenantBound { locked_tenant, .. } => Some(locked_tenant),
             VerifiedKeyInfo::Master {
                 header_locked_tenant,
             } => header_locked_tenant.or_else(|| {
@@ -352,7 +371,7 @@ impl AppState {
 
     pub fn check_tenant_auth(&self, headers: &HeaderMap, tenant_id: &str) -> Result<(), String> {
         match self.inspect_caller_auth(headers)? {
-            VerifiedKeyInfo::TenantBound { locked_tenant } => {
+            VerifiedKeyInfo::TenantBound { locked_tenant, .. } => {
                 if locked_tenant != tenant_id {
                     return Err(format!(
                         "tenant lock violation: API key is cryptographically bound to tenant '{locked_tenant}', cannot access '{tenant_id}'"
@@ -452,7 +471,7 @@ impl AppState {
     ) -> Result<String, String> {
         let info = self.inspect_caller_auth(headers)?;
         let locked_opt = match &info {
-            VerifiedKeyInfo::TenantBound { locked_tenant } => Some(locked_tenant.clone()),
+            VerifiedKeyInfo::TenantBound { locked_tenant, .. } => Some(locked_tenant.clone()),
             VerifiedKeyInfo::Master {
                 header_locked_tenant,
             }

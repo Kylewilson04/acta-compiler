@@ -92,15 +92,16 @@ pub mod serde_hex {
 }
 
 pub use bundle::{
-    ContextBundle, EvidenceEntry, ExportArchive, OmissionReason, OmissionRecord, OmittedItem,
-    OverrideLedgerSummary, PolicyResultTag, RefusalMetadata, ResolverManifest,
+    AnchorCheckpointRequest, ContextBundle, EntryInclusionProof, EvidenceEntry, ExportArchive,
+    ExternalWitnessAnchor, MerkleBundleProof, OmissionReason, OmissionRecord, OmittedItem,
+    OverrideLedgerSummary, PolicyResultTag, RefusalMetadata, ResolverManifest, SignedTreeHead,
     DEFAULT_CORROBORATION_DAMPING, DEFAULT_DECISIVENESS_THRESHOLD, DEFAULT_MIN_CONFIDENCE,
     SCHEMA_VERSION,
 };
 pub use claims::{
     AttestOverrideRequest, AttestOverrideResponse, ClaimCandidate, ClaimStatus, DisputeReasonCode,
-    DisputeRecord, IngestClaimRequest, IngestClaimResponse, KnowledgeClaim, OverriddenClaimRef,
-    OverrideAttestation, OverrideResolutionRef, ResolutionRecord,
+    DisputeRecord, IngestClaimRequest, IngestClaimResponse, KnowledgeClaim, LapsedOverrideRef,
+    OverriddenClaimRef, OverrideAttestation, OverrideResolutionRef, ResolutionRecord,
 };
 pub use error::{ActaError, ActaResult};
 pub use objects::{
@@ -253,6 +254,7 @@ mod tests {
                 ],
                 reason_code: DisputeReasonCode::InsufficientMargin,
                 escalation_required: true,
+                lapsed_override: None,
             }],
             omission_record: OmissionRecord {
                 inline_items: vec![OmittedItem {
@@ -289,6 +291,7 @@ mod tests {
             claims: vec![claim_a, claim_b],
             override_attestations: vec![],
             evidence_chain: vec![evidence],
+            merkle_proof: None,
             host_public_key: [0xCD; 32],
         };
 

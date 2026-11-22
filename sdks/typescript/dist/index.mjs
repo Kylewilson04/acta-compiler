@@ -1,12 +1,17 @@
 /**
- * @acta/sdk v1.5.0 — Zero-Dependency ESM Runtime for Acta Compiler v1.5
+ * @acta/sdk v1.6.0 — Zero-Dependency ESM Runtime for Acta Compiler v1.6.0
  *
  * Bit-for-bit compatible with Rust `acta-crypto`:
  * - Spec-exact pure-JS BLAKE3 (256-bit unkeyed + Keyed BLAKE3 MAC)
- * - Stateless `acta_tk_v1:<tenant_id>:<64_hex_mac>` tenant-bound API keys & `X-Acta-Tenant` locking
+ * - Stateless 2-segment `acta_tk_v1:<tenant_id>:<64_hex_mac>` & 3-segment OAuth principal
+ *   `acta_tk_v1:<tenant_id>:<github_login>:<64_hex_mac>` keys & `X-Acta-Tenant` locking
  * - RFC 8785 JSON Canonicalization Scheme (JCS) + 8-byte LE length-delimited hashing
  * - `ResolverManifest` verification, strip/tamper-proof `RefusalMetadata` (`b"acta:refusal_meta:v2"`
- *   + `b"acta:evidence_event:v2"`), and signed `OverrideAttestation` (`b"acta:override:v1"`) verification
+ *   + `b"acta:evidence_event:v2"`), signed `OverrideAttestation` (`b"acta:override:v1"`,
+ *   `b"acta:override_client_sig:v1"`), and `LapsedOverrideRef` provenance verification
+ * - RFC 6962 Merkle `SignedTreeHead` checkpoints (`b"acta:checkpoint:v1"`, `b"acta:checkpoint_sig:v1"`),
+ *   `O(log N)` inclusion & consistency proofs, external witness cosignatures (`b"acta:witness_sig:v1"`),
+ *   and `dumpArchivePreimages`
  * - Strict Ed25519 verification via `node:crypto` rejecting all 8 torsion weak keys & `S >= L`
  * - `ActaClient` + `ActaGeminiGuard` pre-prompt circuit-breakers for `@google/genai`
  */
@@ -281,6 +286,12 @@ function hexToBytes(hexStr) {
   return Uint8Array.from(Buffer.from(String(hexStr).trim(), "hex"));
 }
 
+function asHash32(h) {
+  const b = hexToBytes(h);
+  if (b.length !== 32) throw new Error("expected 32-byte hash");
+  return b;
+}
+
 function bytesToHex(bytes) {
   return Buffer.from(bytes).toString("hex");
 }
@@ -341,52 +352,125 @@ export function blake3KeyedHash(key32, parts) {
   return hasher.digest();
 }
 
+export function normalizeGithubSlug(raw) {
+  const trimmed = String(raw || "").trim().replace(/^@+/, "").toLowerCase();
+  let out = "";
+  let prevDash = false;
+  for (const ch of trimmed) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "_" || ch === ".") {
+      out += ch;
+      prevDash = false;
+    } else if (!prevDash) {
+      out += "-";
+      prevDash = true;
+    }
+  }
+  const clean = out.replace(/^-+|-+$/g, "");
+  if (!clean || clean.length > 100) {
+    throw new Error("GitHub organization/user slug must be 1..100 valid characters");
+  }
+  return clean;
+}
+
+function validateTokenSegment(label, val) {
+  const s = String(val || "");
+  const b = utf8Encoder.encode(s);
+  if (!s || b.length > 128) throw new Error(`${label} must be 1..128 bytes`);
+  if (/[\s:\x00-\x1f\x7f]/.test(s)) {
+    throw new Error(`${label} cannot contain whitespace, control characters, or ':'`);
+  }
+}
+
 export function deriveTenantMacKey(masterApiKey) {
   return hashLengthDelimited(["acta:tenant_mac_key:v1", String(masterApiKey).trim()]);
+}
+
+function lengthDelimitedParts(parts) {
+  const out = [];
+  for (const raw of parts) {
+    const p = typeof raw === "string" ? utf8Encoder.encode(raw) : raw;
+    out.push(u64LeBytes(BigInt(p.length)), p);
+  }
+  return out;
 }
 
 export function mintTenantApiKey(masterApiKey, tenantId) {
   const masterClean = String(masterApiKey || "").trim();
   if (!masterClean) throw new Error("masterApiKey must be non-empty");
   const tenantClean = String(tenantId || "").trim();
-  const tBytes = utf8Encoder.encode(tenantClean);
-  if (!tenantClean || tBytes.length > 128) throw new Error("tenantId must be 1..128 bytes");
-  if (/[\s:\x00-\x1f\x7f]/.test(tenantClean)) {
-    throw new Error("tenantId cannot contain whitespace, control characters, or ':'");
-  }
+  validateTokenSegment("tenantId", tenantClean);
   const key32 = deriveTenantMacKey(masterClean);
-  const domain = utf8Encoder.encode("acta:tenant_token:v1");
-  const mac = blake3KeyedHash(key32, [
-    u64LeBytes(BigInt(domain.length)),
-    domain,
-    u64LeBytes(BigInt(tBytes.length)),
-    tBytes,
-  ]);
+  const mac = blake3KeyedHash(key32, lengthDelimitedParts(["acta:tenant_token:v1", tenantClean]));
   return `${TENANT_TOKEN_PREFIX}${tenantClean}:${bytesToHex(mac)}`;
 }
 
-export function extractTokenTenant(token) {
+export function mintUserTenantApiKey(masterApiKey, tenantId, githubLogin) {
+  const masterClean = String(masterApiKey || "").trim();
+  if (!masterClean) throw new Error("masterApiKey must be non-empty");
+  const tenantClean = String(tenantId || "").trim();
+  const userClean = normalizeGithubSlug(githubLogin);
+  validateTokenSegment("tenantId", tenantClean);
+  validateTokenSegment("githubLogin", userClean);
+  const key32 = deriveTenantMacKey(masterClean);
+  const mac = blake3KeyedHash(
+    key32,
+    lengthDelimitedParts(["acta:tenant_user_token:v2", tenantClean, userClean])
+  );
+  return `${TENANT_TOKEN_PREFIX}${tenantClean}:${userClean}:${bytesToHex(mac)}`;
+}
+
+function parseActaTkSegments(token) {
   if (!token) return null;
   const clean = String(token).trim();
   if (!clean.startsWith(TENANT_TOKEN_PREFIX)) return null;
   const rest = clean.slice(TENANT_TOKEN_PREFIX.length);
-  const sep = rest.lastIndexOf(":");
-  if (sep <= 0) throw new Error("malformed acta_tk_v1 token");
-  const tenantPart = rest.slice(0, sep);
-  const macHex = rest.slice(sep + 1);
+  const parts = rest.split(":");
+  let tenantPart;
+  let userPart = null;
+  let macHex;
+  if (parts.length === 2) {
+    [tenantPart, macHex] = parts;
+    validateTokenSegment("tenantId", tenantPart);
+  } else if (parts.length === 3) {
+    [tenantPart, userPart, macHex] = parts;
+    validateTokenSegment("tenantId", tenantPart);
+    validateTokenSegment("githubLogin", userPart);
+  } else {
+    throw new Error("malformed acta_tk_v1 token");
+  }
   if (!/^[0-9a-fA-F]{64}$/.test(macHex)) throw new Error("malformed acta_tk_v1 MAC");
-  return tenantPart;
+  return { tenantPart, userPart, macHex };
+}
+
+export function extractTokenTenant(token) {
+  const parsed = parseActaTkSegments(token);
+  return parsed ? parsed.tenantPart : null;
+}
+
+export function extractTokenPrincipal(token) {
+  const parsed = parseActaTkSegments(token);
+  return parsed ? parsed.userPart : null;
+}
+
+export function verifyTenantApiKeyWithPrincipal(masterApiKey, token) {
+  const parsed = parseActaTkSegments(token);
+  if (!parsed) throw new Error("token does not start with acta_tk_v1:");
+  const expectedStr = parsed.userPart
+    ? mintUserTenantApiKey(masterApiKey, parsed.tenantPart, parsed.userPart)
+    : mintTenantApiKey(masterApiKey, parsed.tenantPart);
+  const expected = Buffer.from(expectedStr, "utf8");
+  const provided = Buffer.from(String(token).trim().toLowerCase(), "utf8");
+  const providedRaw = Buffer.from(String(token).trim(), "utf8");
+  const okLower = expected.length === provided.length && nodeCrypto.timingSafeEqual(expected, provided);
+  const okRaw = expected.length === providedRaw.length && nodeCrypto.timingSafeEqual(expected, providedRaw);
+  if (!okLower && !okRaw) {
+    throw new Error("invalid or forged tenant-bound API key MAC");
+  }
+  return { tenantId: parsed.tenantPart, principal: parsed.userPart };
 }
 
 export function verifyTenantApiKey(masterApiKey, token) {
-  const tenantPart = extractTokenTenant(token);
-  if (!tenantPart) throw new Error("token does not start with acta_tk_v1:");
-  const expected = Buffer.from(mintTenantApiKey(masterApiKey, tenantPart), "utf8");
-  const provided = Buffer.from(String(token).trim(), "utf8");
-  if (expected.length !== provided.length || !nodeCrypto.timingSafeEqual(expected, provided)) {
-    throw new Error("invalid or forged tenant-bound API key MAC");
-  }
-  return tenantPart;
+  return verifyTenantApiKeyWithPrincipal(masterApiKey, token).tenantId;
 }
 
 export function parseRfc3339Micros(ts) {
@@ -440,8 +524,7 @@ function encodeOptI64(vBig) {
 function encodeOptHash32(h) {
   const out = new Uint8Array(33);
   if (h != null) {
-    const b = hexToBytes(h);
-    if (b.length !== 32) throw new Error("expected 32-byte hash");
+    const b = asHash32(h);
     out[0] = 1;
     out.set(b, 1);
   }
@@ -467,9 +550,7 @@ function normalizeRefusalMetadata(meta) {
     out.target_scope = String(meta.target_scope);
   }
   if (meta.scope_state_commitment != null) {
-    const b = hexToBytes(meta.scope_state_commitment);
-    if (b.length !== 32) throw new Error("expected 32-byte scope_state_commitment");
-    out.scope_state_commitment = bytesToHex(b).toLowerCase();
+    out.scope_state_commitment = bytesToHex(asHash32(meta.scope_state_commitment)).toLowerCase();
   }
   return out;
 }
@@ -530,7 +611,7 @@ export function computeClaimContentHash(claim) {
       "acta:claim:v1",
       uuidToBytes(claim.id),
       String(claim.tenant_id),
-      hexToBytes(claim.claim_group_key),
+      asHash32(claim.claim_group_key),
       String(claim.scope),
       String(claim.subject),
       String(claim.predicate),
@@ -539,7 +620,7 @@ export function computeClaimContentHash(claim) {
       f64LeBytes(claim.confidence),
       i32LeBytes(claim.source_provenance_class),
       String(claim.source_descriptor),
-      hexToBytes(claim.source_commitment),
+      asHash32(claim.source_commitment),
       String(claim.status),
       toCanonicalBytes(sortedContradictions),
       encodeOptI64(claim.valid_from != null ? parseRfc3339Micros(claim.valid_from) : null),
@@ -551,12 +632,53 @@ export function computeClaimContentHash(claim) {
   );
 }
 
+export function computeOverrideClientIntentHash({
+  tenantId,
+  scope,
+  winningClaimId,
+  adjudicatorId,
+  justification,
+}) {
+  const tClean = String(tenantId).trim();
+  const adjClean = String(adjudicatorId).trim();
+  const effActor = adjClean.includes("::") ? adjClean : `${tClean}::${adjClean}`;
+  return bytesToHex(
+    hashLengthDelimited([
+      "acta:override_client_sig:v1",
+      tClean,
+      String(scope).trim(),
+      uuidToBytes(winningClaimId),
+      effActor,
+      String(justification).trim(),
+    ])
+  );
+}
+
+export function signOverrideClientIntent(
+  seedHexOrBytes,
+  { tenantId, scope, winningClaimId, adjudicatorId, justification }
+) {
+  const seed = hexToBytes(seedHexOrBytes);
+  if (seed.length !== 32) throw new Error("Ed25519 private seed must be 32 bytes");
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digestHex = computeOverrideClientIntentHash({
+    tenantId,
+    scope,
+    winningClaimId,
+    adjudicatorId,
+    justification,
+  });
+  const sigHex = bytesToHex(nodeCrypto.sign(null, Buffer.from(hexToBytes(digestHex)), privKey));
+  const pkHex = deriveEd25519PublicKeyHex(seed);
+  return { clientSignatureHex: sigHex, clientPublicKeyHex: pkHex };
+}
+
 export function computeOverrideAttestationHash(att) {
   const sortedOverridden = [...(att.overridden_claims || [])]
     .map((x) => {
       const id = normalizeUuidString(x.id);
-      const chBytes = hexToBytes(x.content_hash);
-      if (chBytes.length !== 32) throw new Error("expected 32-byte content_hash in overridden_claims");
+      const chBytes = asHash32(x.content_hash);
       return { id, content_hash: bytesToHex(chBytes).toLowerCase() };
     })
     .sort((a, b) =>
@@ -569,12 +691,12 @@ export function computeOverrideAttestationHash(att) {
       uuidToBytes(att.id),
       String(att.tenant_id),
       String(att.scope),
-      hexToBytes(att.claim_group_key),
+      asHash32(att.claim_group_key),
       String(att.subject),
       String(att.predicate),
       encodeOptHash32(att.source_bundle_hash ?? null),
       uuidToBytes(att.winning_claim_id),
-      hexToBytes(att.winning_claim_content_hash),
+      asHash32(att.winning_claim_content_hash),
       toCanonicalBytes(sortedOverridden),
       String(att.adjudicator_id),
       String(att.justification),
@@ -617,7 +739,7 @@ export function computeEvidenceEventHash({
         "acta:evidence_event:v1",
         String(tenantId),
         i64LeBytes(BigInt(seqNum)),
-        hexToBytes(prevHash),
+        asHash32(prevHash),
         encodeOptHash32(bundleHash),
         encodeOptHash32(stateCommitment),
         String(policyResult),
@@ -636,7 +758,7 @@ export function computeEvidenceEventHash({
       "acta:evidence_event:v2",
       String(tenantId),
       i64LeBytes(BigInt(seqNum)),
-      hexToBytes(prevHash),
+      asHash32(prevHash),
       encodeOptHash32(bundleHash),
       encodeOptHash32(stateCommitment),
       String(policyResult),
@@ -647,13 +769,188 @@ export function computeEvidenceEventHash({
   );
 }
 
+// ============================================================================
+// Acta v1.6 RFC 6962 Binary Merkle Tree, Checkpoints & Witness Cosignatures
+// ============================================================================
+export function merkleEmptyRoot() {
+  return bytesToHex(hashLengthDelimited(["acta:merkle_empty:v1"]));
+}
+
+export function merkleLeafHash(seqNum, eventHash) {
+  return bytesToHex(
+    hashLengthDelimited([
+      "acta:merkle_leaf:v1",
+      i64LeBytes(BigInt(seqNum)),
+      asHash32(eventHash),
+    ])
+  );
+}
+
+export function merkleNodeHash(left, right) {
+  return bytesToHex(hashLengthDelimited(["acta:merkle_node:v1", asHash32(left), asHash32(right)]));
+}
+
+function largestPow2Lt(n) {
+  let k = 1;
+  while (k * 2 < n) k *= 2;
+  return k;
+}
+
+export function computeMerkleRootFromLeaves(leaves) {
+  const n = leaves.length;
+  if (n === 0) return merkleEmptyRoot();
+  if (n === 1) return bytesToHex(asHash32(leaves[0])).toLowerCase();
+  const k = largestPow2Lt(n);
+  const left = computeMerkleRootFromLeaves(leaves.slice(0, k));
+  const right = computeMerkleRootFromLeaves(leaves.slice(k));
+  return merkleNodeHash(left, right);
+}
+
+function inclusionPathSlice(leaves, index, out) {
+  const n = leaves.length;
+  if (n <= 1) return;
+  const k = largestPow2Lt(n);
+  if (index < k) {
+    inclusionPathSlice(leaves.slice(0, k), index, out);
+    out.push(computeMerkleRootFromLeaves(leaves.slice(k)));
+  } else {
+    inclusionPathSlice(leaves.slice(k), index - k, out);
+    out.push(computeMerkleRootFromLeaves(leaves.slice(0, k)));
+  }
+}
+
+export function computeMerkleInclusionProof(leaves, leafIndex) {
+  if (!leaves.length || leafIndex < 0 || leafIndex >= leaves.length) {
+    throw new Error(`leafIndex ${leafIndex} out of bounds for tree_size ${leaves.length}`);
+  }
+  const out = [];
+  inclusionPathSlice(leaves, leafIndex, out);
+  return out;
+}
+
+export function verifyMerkleInclusionProof(seqNum, eventHash, treeSize, auditPath, expectedRoot) {
+  const seq = BigInt(seqNum);
+  const size = BigInt(treeSize);
+  if (seq < 1n || size < 1n || seq > size) return false;
+  let r = merkleLeafHash(seq, eventHash);
+  const expHex = bytesToHex(asHash32(expectedRoot)).toLowerCase();
+  if (size === 1n) {
+    return auditPath.length === 0 && r === expHex;
+  }
+  let fnIdx = seq - 1n;
+  let sn = size - 1n;
+  for (const sib of auditPath) {
+    if (sn === 0n) return false;
+    const sibBytes = asHash32(sib);
+    if ((fnIdx & 1n) === 1n || fnIdx === sn) {
+      r = merkleNodeHash(sibBytes, r);
+      while ((fnIdx & 1n) === 0n) {
+        fnIdx >>= 1n;
+        sn >>= 1n;
+      }
+    } else {
+      r = merkleNodeHash(r, sibBytes);
+    }
+    fnIdx >>= 1n;
+    sn >>= 1n;
+  }
+  return sn === 0n && r === expHex;
+}
+
+function subproofSlice(m, leaves, isCompleteSubtree, out) {
+  const n = leaves.length;
+  if (m === n) {
+    if (!isCompleteSubtree) out.push(computeMerkleRootFromLeaves(leaves));
+    return;
+  }
+  const k = largestPow2Lt(n);
+  if (m <= k) {
+    subproofSlice(m, leaves.slice(0, k), isCompleteSubtree, out);
+    out.push(computeMerkleRootFromLeaves(leaves.slice(k)));
+  } else {
+    subproofSlice(m - k, leaves.slice(k), false, out);
+    out.push(computeMerkleRootFromLeaves(leaves.slice(0, k)));
+  }
+}
+
+export function computeMerkleConsistencyProof(leaves, firstSize, secondSize) {
+  if (firstSize < 1 || firstSize > secondSize || secondSize > leaves.length) {
+    throw new Error(`invalid consistency proof bounds: first=${firstSize}, second=${secondSize}`);
+  }
+  if (firstSize === secondSize) return [];
+  const out = [];
+  subproofSlice(firstSize, leaves.slice(0, secondSize), true, out);
+  return out;
+}
+
+export function verifyMerkleConsistencyProof(firstSize, firstRoot, secondSize, secondRoot, proof) {
+  const fSize = BigInt(firstSize);
+  const sSize = BigInt(secondSize);
+  if (fSize < 1n || sSize < fSize) return false;
+  const fHex = bytesToHex(asHash32(firstRoot)).toLowerCase();
+  const sHex = bytesToHex(asHash32(secondRoot)).toLowerCase();
+  if (fSize === sSize) return proof.length === 0 && fHex === sHex;
+  if (!proof || proof.length === 0) return false;
+
+  const isPow2 = (fSize & (fSize - 1n)) === 0n;
+  const chain = isPow2 ? [fHex, ...proof] : [...proof];
+
+  let fnIdx = fSize - 1n;
+  let sn = sSize - 1n;
+  while ((fnIdx & 1n) === 1n) {
+    fnIdx >>= 1n;
+    sn >>= 1n;
+  }
+
+  let fr = bytesToHex(asHash32(chain[0])).toLowerCase();
+  let sr = fr;
+  for (let i = 1; i < chain.length; i++) {
+    if (sn === 0n) return false;
+    const nodeBytes = asHash32(chain[i]);
+    if ((fnIdx & 1n) === 1n || fnIdx === sn) {
+      fr = merkleNodeHash(nodeBytes, fr);
+      sr = merkleNodeHash(nodeBytes, sr);
+      while ((fnIdx & 1n) === 0n) {
+        fnIdx >>= 1n;
+        sn >>= 1n;
+      }
+    } else {
+      sr = merkleNodeHash(sr, nodeBytes);
+    }
+    fnIdx >>= 1n;
+    sn >>= 1n;
+  }
+
+  return sn === 0n && fr === fHex && sr === sHex;
+}
+
+export function computeCheckpointHash({
+  tenantId,
+  treeSize,
+  headEventHash,
+  merkleRoot,
+  issuedAt,
+}) {
+  const micros = typeof issuedAt === "bigint" ? issuedAt : parseRfc3339Micros(issuedAt);
+  return bytesToHex(
+    hashLengthDelimited([
+      "acta:checkpoint:v1",
+      String(tenantId),
+      i64LeBytes(BigInt(treeSize)),
+      asHash32(headEventHash),
+      asHash32(merkleRoot),
+      i64LeBytes(micros),
+    ])
+  );
+}
+
 export function evidenceSigningPreimage(tenantId, seqNum, prevHash, eventHash) {
   return hashLengthDelimited([
     "acta:evidence_sig:v1",
     String(tenantId),
     i64LeBytes(BigInt(seqNum)),
-    hexToBytes(prevHash),
-    hexToBytes(eventHash),
+    asHash32(prevHash),
+    asHash32(eventHash),
   ]);
 }
 
@@ -662,7 +959,24 @@ export function overrideSigningPreimage(tenantId, evidenceSeqNum, attestationHas
     "acta:override_sig:v1",
     String(tenantId),
     i64LeBytes(BigInt(evidenceSeqNum)),
-    hexToBytes(attestationHash),
+    asHash32(attestationHash),
+  ]);
+}
+
+export function checkpointSigningPreimage(tenantId, checkpointHash) {
+  return hashLengthDelimited([
+    "acta:checkpoint_sig:v1",
+    String(tenantId),
+    asHash32(checkpointHash),
+  ]);
+}
+
+export function witnessAnchorSigningPreimage(tenantId, treeSize, checkpointHash) {
+  return hashLengthDelimited([
+    "acta:witness_sig:v1",
+    String(tenantId),
+    i64LeBytes(BigInt(treeSize)),
+    asHash32(checkpointHash),
   ]);
 }
 
@@ -705,9 +1019,89 @@ export function signOverrideAttestation(seedHexOrBytes, tenantId, evidenceSeqNum
   return bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
 }
 
+export function signCheckpointHead(seedHexOrBytes, tenantId, checkpointHash) {
+  const seed = hexToBytes(seedHexOrBytes);
+  if (seed.length !== 32) throw new Error("Ed25519 private seed must be 32 bytes");
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digest = checkpointSigningPreimage(tenantId, checkpointHash);
+  return bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
+}
+
+export function signWitnessAnchor(seedHexOrBytes, tenantId, treeSize, checkpointHash) {
+  const seed = hexToBytes(seedHexOrBytes);
+  if (seed.length !== 32) throw new Error("Ed25519 private seed must be 32 bytes");
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digest = witnessAnchorSigningPreimage(tenantId, treeSize, checkpointHash);
+  const sigHex = bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
+  const pkHex = deriveEd25519PublicKeyHex(seed);
+  return { witnessSignatureHex: sigHex, witnessPublicKeyHex: pkHex };
+}
+
 export function verifyOverrideSignature(pubkeyHexOrBytes, tenantId, evidenceSeqNum, attestationHash, sigHexOrBytes) {
   const digest = overrideSigningPreimage(tenantId, evidenceSeqNum, attestationHash);
   return verifyEd25519Strict(pubkeyHexOrBytes, digest, sigHexOrBytes);
+}
+
+export function verifyCheckpointSignature(pubkeyHexOrBytes, tenantId, checkpointHash, sigHexOrBytes) {
+  const digest = checkpointSigningPreimage(tenantId, checkpointHash);
+  return verifyEd25519Strict(pubkeyHexOrBytes, digest, sigHexOrBytes);
+}
+
+export function verifyWitnessAnchorSignature(witnessPubkeyHexOrBytes, tenantId, treeSize, checkpointHash, sigHexOrBytes) {
+  const digest = witnessAnchorSigningPreimage(tenantId, treeSize, checkpointHash);
+  return verifyEd25519Strict(witnessPubkeyHexOrBytes, digest, sigHexOrBytes);
+}
+
+export function verifySignedTreeHead(sth, expectedTenant, expectedPubkeyHex) {
+  if (String(sth.tenant_id) !== String(expectedTenant)) {
+    throw new ActaVerificationError(`checkpoint tenant_id '${sth.tenant_id}' != expected '${expectedTenant}'`);
+  }
+  const treeSize = Number(sth.tree_size);
+  if (!Number.isInteger(treeSize) || treeSize < 1) {
+    throw new ActaVerificationError(`invalid checkpoint tree_size=${sth.tree_size}`);
+  }
+  const recomputedCp = computeCheckpointHash({
+    tenantId: sth.tenant_id,
+    treeSize,
+    headEventHash: sth.head_event_hash,
+    merkleRoot: sth.merkle_root,
+    issuedAt: sth.issued_at,
+  });
+  const storedCp = String(sth.checkpoint_hash).toLowerCase();
+  if (recomputedCp !== storedCp) {
+    throw new ActaVerificationError(
+      `tampered SignedTreeHead: recomputed checkpoint_hash ${recomputedCp} != stored ${storedCp}`
+    );
+  }
+  if (!verifyCheckpointSignature(expectedPubkeyHex, sth.tenant_id, recomputedCp, sth.host_signature)) {
+    throw new ActaVerificationError("Ed25519 host_signature verification failed on SignedTreeHead");
+  }
+  const anchors = sth.witness_anchors || [];
+  for (const anchor of anchors) {
+    if (
+      String(anchor.tenant_id) !== String(sth.tenant_id) ||
+      Number(anchor.tree_size) !== treeSize ||
+      String(anchor.checkpoint_hash).toLowerCase() !== storedCp
+    ) {
+      throw new ActaVerificationError(`witness_anchor[id=${anchor.id}] metadata mismatch against SignedTreeHead`);
+    }
+    if (
+      !verifyWitnessAnchorSignature(
+        anchor.witness_public_key,
+        anchor.tenant_id,
+        treeSize,
+        recomputedCp,
+        anchor.witness_signature
+      )
+    ) {
+      throw new ActaVerificationError(
+        `Ed25519 witness_signature verification failed on witness_anchor[id=${anchor.id}]`
+      );
+    }
+  }
+  return anchors.length;
 }
 
 export function deriveEd25519PublicKeyHex(seedHexOrBytes) {
@@ -767,6 +1161,37 @@ function expectedNonDefaultFlag(rm) {
     Math.abs(decT - DEFAULT_DECISIVENESS_THRESHOLD) > 1e-9 ||
     Math.abs(damp - DEFAULT_CORROBORATION_DAMPING) > 1e-9
   );
+}
+
+function verifyEntryInclusion(proof, sth, expectedPubkeyHex) {
+  const entry = proof.entry;
+  if (String(entry.tenant_id) !== String(sth.tenant_id)) {
+    throw new ActaVerificationError("merkle_proof entry tenant_id mismatch");
+  }
+  try {
+    verifyEvidenceEntry(entry, expectedPubkeyHex);
+  } catch (err) {
+    throw new ActaVerificationError(err.message);
+  }
+  if (
+    !verifyMerkleInclusionProof(
+      entry.seq_num,
+      entry.event_hash,
+      sth.tree_size,
+      proof.audit_path || [],
+      sth.merkle_root
+    )
+  ) {
+    throw new ActaVerificationError(
+      `Merkle inclusion proof failed for seq_num=${entry.seq_num} against tree_size=${sth.tree_size}`
+    );
+  }
+  if (
+    Number(entry.seq_num) === Number(sth.tree_size) &&
+    String(entry.event_hash).toLowerCase() !== String(sth.head_event_hash).toLowerCase()
+  ) {
+    throw new ActaVerificationError(`head entry event_hash mismatch at tree_size=${sth.tree_size}`);
+  }
 }
 
 export function verifyExportArchive(archive, expectedPubkeyHex) {
@@ -872,7 +1297,24 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
       );
     }
     if (att.client_signature != null && att.client_public_key != null) {
-      if (!verifyEd25519Strict(att.client_public_key, hexToBytes(recomputedAtt), att.client_signature)) {
+      const intentHex = computeOverrideClientIntentHash({
+        tenantId: att.tenant_id,
+        scope: att.scope,
+        winningClaimId: att.winning_claim_id,
+        adjudicatorId: att.adjudicator_id,
+        justification: att.justification,
+      });
+      const okIntent = verifyEd25519Strict(
+        att.client_public_key,
+        hexToBytes(intentHex),
+        att.client_signature
+      );
+      const okFull = verifyEd25519Strict(
+        att.client_public_key,
+        hexToBytes(recomputedAtt),
+        att.client_signature
+      );
+      if (!okIntent && !okFull) {
         throw new ActaVerificationError(
           `client Ed25519 signature verification failed on override_attestation[id=${aid}]`
         );
@@ -931,6 +1373,27 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
         throw new ActaVerificationError(`tampered dispute_record claim[id=${c.id}]`);
       }
     }
+    if (disp.lapsed_override != null) {
+      const lapsed = disp.lapsed_override;
+      const aid = normalizeUuidString(lapsed.attestation_id);
+      const verifiedAtt = overridesById.get(aid);
+      if (!verifiedAtt) {
+        throw new ActaVerificationError(
+          `dispute_record.lapsed_override references missing override_attestation[id=${aid}]`
+        );
+      }
+      if (
+        String(verifiedAtt.attestation_hash).toLowerCase() !== String(lapsed.attestation_hash).toLowerCase() ||
+        normalizeUuidString(verifiedAtt.winning_claim_id) !== normalizeUuidString(lapsed.prior_winning_claim_id) ||
+        String(verifiedAtt.adjudicator_id) !== String(lapsed.adjudicator_id) ||
+        String(verifiedAtt.justification) !== String(lapsed.justification) ||
+        Number(verifiedAtt.evidence_seq_num) !== Number(lapsed.evidence_seq_num)
+      ) {
+        throw new ActaVerificationError(
+          `tampered lapsed_override reference on dispute_record[id=${aid}]`
+        );
+      }
+    }
   }
 
   const { hashHex: recomputedBundleHash } = computeBundleHash(bundle);
@@ -941,10 +1404,14 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
   }
 
   const chain = archive.evidence_chain || [];
-  if (chain.length === 0) throw new ActaVerificationError("evidence_chain cannot be empty");
+  const merkleProof = archive.merkle_proof ?? null;
+  if (chain.length === 0 && merkleProof == null) {
+    throw new ActaVerificationError("ExportArchive must contain either evidence_chain or merkle_proof");
+  }
 
   let foundBinding = false;
   let verifiedRefusals = 0;
+  let verifiedEvidenceEntries = 0;
   const evidenceBySeq = new Map();
   const zeroHex = "00".repeat(32);
 
@@ -972,6 +1439,7 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     } catch (err) {
       throw new ActaVerificationError(err.message);
     }
+    verifiedEvidenceEntries += 1;
 
     if (entry.bundle_hash && String(entry.bundle_hash).toLowerCase() === recomputedBundleHash) {
       if (String(entry.state_commitment).toLowerCase() !== String(bundle.state_commitment).toLowerCase()) {
@@ -982,11 +1450,55 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     evidenceBySeq.set(Number(entry.seq_num), entry);
   }
 
+  let merkleTreeSize = null;
+  let merkleRootHex = null;
+  let verifiedWitnessAnchors = 0;
+
+  if (merkleProof != null) {
+    const sth = merkleProof.checkpoint;
+    verifiedWitnessAnchors = verifySignedTreeHead(sth, bundle.tenant_id, expectedClean);
+    verifyEntryInclusion(merkleProof.bundle_entry_proof, sth, expectedClean);
+    const bEntry = merkleProof.bundle_entry_proof.entry;
+    if (
+      !bEntry.bundle_hash ||
+      String(bEntry.bundle_hash).toLowerCase() !== recomputedBundleHash ||
+      !bEntry.state_commitment ||
+      String(bEntry.state_commitment).toLowerCase() !== String(bundle.state_commitment).toLowerCase()
+    ) {
+      throw new ActaVerificationError(
+        "merkle_proof.bundle_entry_proof does not bind archive bundle_hash and state_commitment"
+      );
+    }
+    foundBinding = true;
+    if (chain.length === 0) verifiedEvidenceEntries += 1;
+    evidenceBySeq.set(Number(bEntry.seq_num), bEntry);
+
+    for (const ovrProof of merkleProof.override_entry_proofs || []) {
+      verifyEntryInclusion(ovrProof, sth, expectedClean);
+      const oEntry = ovrProof.entry;
+      if (chain.length === 0 && Number(oEntry.seq_num) !== Number(bEntry.seq_num)) {
+        verifiedEvidenceEntries += 1;
+      }
+      evidenceBySeq.set(Number(oEntry.seq_num), oEntry);
+    }
+
+    if (chain.length > 0 && Number(chain[0].seq_num) === 1 && chain.length === Number(sth.tree_size)) {
+      const leaves = chain.map((e) => merkleLeafHash(e.seq_num, e.event_hash));
+      const chainRoot = computeMerkleRootFromLeaves(leaves);
+      if (chainRoot !== String(sth.merkle_root).toLowerCase()) {
+        throw new ActaVerificationError("merkle_proof.checkpoint.merkle_root mismatch against evidence_chain");
+      }
+    }
+
+    merkleTreeSize = Number(sth.tree_size);
+    merkleRootHex = String(sth.merkle_root).toLowerCase();
+  }
+
   for (const [aid, att] of overridesById.entries()) {
     const ev = evidenceBySeq.get(Number(att.evidence_seq_num));
     if (!ev) {
       throw new ActaVerificationError(
-        `override_attestation[id=${aid}] references missing evidence_chain seq_num=${att.evidence_seq_num}`
+        `override_attestation[id=${aid}] references missing verified evidence seq_num=${att.evidence_seq_num}`
       );
     }
     if (!ev.state_commitment || String(ev.state_commitment).toLowerCase() !== String(att.attestation_hash).toLowerCase()) {
@@ -1000,6 +1512,13 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     throw new ActaVerificationError(`no verified evidence_history entry binds bundle_hash ${recomputedBundleHash}`);
   }
 
+  const verificationMode =
+    chain.length > 0 && merkleProof != null
+      ? "full_chain_and_merkle"
+      : chain.length > 0
+      ? "full_chain"
+      : "merkle_inclusion";
+
   return {
     tenant_id: bundle.tenant_id,
     bundle_hash_hex: recomputedBundleHash,
@@ -1008,9 +1527,86 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     verified_claims: claimsById.size,
     verified_overrides: overridesById.size,
     verified_refusals: verifiedRefusals,
-    verified_evidence_entries: chain.length,
+    verified_evidence_entries: verifiedEvidenceEntries,
+    verification_mode: verificationMode,
+    merkle_tree_size: merkleTreeSize,
+    merkle_root_hex: merkleRootHex,
+    verified_witness_anchors: verifiedWitnessAnchors,
     non_default_thresholds: rm != null ? Boolean(rm.non_default_thresholds) : false,
     resolver_manifest: rm,
+  };
+}
+
+export function dumpArchivePreimages(archive) {
+  const bundleJcs = toCanonicalBytes(archive.bundle);
+  const overridesDump = (archive.override_attestations || []).map((att) => ({
+    id: normalizeUuidString(att.id),
+    evidence_seq_num: Number(att.evidence_seq_num),
+    attestation_hash: String(att.attestation_hash).toLowerCase(),
+    host_sig_preimage_domain: "acta:override_sig:v1",
+    host_sig_digest_hex: bytesToHex(
+      overrideSigningPreimage(att.tenant_id, att.evidence_seq_num, att.attestation_hash)
+    ),
+    client_sig_domain: "acta:override_client_sig:v1",
+    client_sig_digest_hex: computeOverrideClientIntentHash({
+      tenantId: att.tenant_id,
+      scope: att.scope,
+      winningClaimId: att.winning_claim_id,
+      adjudicatorId: att.adjudicator_id,
+      justification: att.justification,
+    }),
+  }));
+
+  let entriesSrc = [];
+  if (archive.evidence_chain && archive.evidence_chain.length > 0) {
+    entriesSrc = archive.evidence_chain;
+  } else if (archive.merkle_proof != null) {
+    entriesSrc = [
+      archive.merkle_proof.bundle_entry_proof.entry,
+      ...(archive.merkle_proof.override_entry_proofs || []).map((op) => op.entry),
+    ];
+  }
+
+  const evidenceDump = entriesSrc.map((entry) => ({
+    seq_num: Number(entry.seq_num),
+    event_domain:
+      entry.refusal_metadata == null && entry.override_summary == null
+        ? "acta:evidence_event:v1"
+        : "acta:evidence_event:v2",
+    event_hash: String(entry.event_hash).toLowerCase(),
+    merkle_leaf_hash: merkleLeafHash(entry.seq_num, entry.event_hash),
+    host_sig_preimage_domain: "acta:evidence_sig:v1",
+    host_sig_digest_hex: bytesToHex(
+      evidenceSigningPreimage(entry.tenant_id, entry.seq_num, entry.prev_hash, entry.event_hash)
+    ),
+    refusal_metadata_canonical_jcs:
+      entry.refusal_metadata != null ? toCanonicalJson(normalizeRefusalMetadata(entry.refusal_metadata)) : null,
+  }));
+
+  const cpDump =
+    archive.merkle_proof != null
+      ? {
+          tree_size: Number(archive.merkle_proof.checkpoint.tree_size),
+          merkle_root: String(archive.merkle_proof.checkpoint.merkle_root).toLowerCase(),
+          checkpoint_hash: String(archive.merkle_proof.checkpoint.checkpoint_hash).toLowerCase(),
+          host_sig_preimage_domain: "acta:checkpoint_sig:v1",
+          host_sig_digest_hex: bytesToHex(
+            checkpointSigningPreimage(
+              archive.merkle_proof.checkpoint.tenant_id,
+              archive.merkle_proof.checkpoint.checkpoint_hash
+            )
+          ),
+          bundle_audit_path_len: (archive.merkle_proof.bundle_entry_proof.audit_path || []).length,
+        }
+      : null;
+
+  return {
+    bundle_domain: "acta:bundle:v1",
+    bundle_canonical_jcs_len: bundleJcs.length,
+    bundle_hash: String(archive.bundle_hash).toLowerCase(),
+    checkpoint: cpDump,
+    override_attestations: overridesDump,
+    evidence_entries: evidenceDump,
   };
 }
 
@@ -1067,6 +1663,7 @@ export class ActaClient {
       (typeof process !== "undefined" ? process.env?.ACTA_API_KEY : undefined);
 
     const tokTenant = this.apiKey ? extractTokenTenant(this.apiKey) : null;
+    this.verifiedPrincipal = this.apiKey ? extractTokenPrincipal(this.apiKey) : null;
     const explicitTenant =
       (
         options.defaultTenantId ||
@@ -1158,11 +1755,13 @@ export class ActaClient {
     return data;
   }
 
-  async mintTenantKey(tenantId) {
+  async mintTenantKey(tenantId, principal = undefined) {
+    const body = { tenant_id: tenantId };
+    if (principal !== undefined) body.principal = principal;
     const { data } = await this._requestJson(
       "POST",
       "/v1/auth/mint-tenant-key",
-      { tenant_id: tenantId },
+      body,
       [200],
       false
     );
@@ -1224,9 +1823,9 @@ export class ActaClient {
       tenant_id: effTenant,
       scope: req.scope,
       winning_claim_id: req.winningClaimId,
-      adjudicator_id: req.adjudicatorId,
       justification: req.justification,
     };
+    if (req.adjudicatorId !== undefined) body.adjudicator_id = req.adjudicatorId;
     if (req.sourceBundleHashHex) body.source_bundle_hash_hex = req.sourceBundleHashHex;
     if (req.id) body.id = req.id;
     if (req.clientSignatureHex) body.client_signature_hex = req.clientSignatureHex;
@@ -1255,6 +1854,82 @@ export class ActaClient {
     const { data } = await this._requestJson(
       "GET",
       `/v1/tenants/${encodeURIComponent(effTenant)}/overrides${qs}`,
+      undefined,
+      [200]
+    );
+    return data;
+  }
+
+  async getCheckpoint(params = {}) {
+    const effTenant = this._enforceTenant(params.tenantId);
+    const hostPk = await this.ensureHostPublicKey();
+    const q = [];
+    if (params.treeSize !== undefined) q.push(`tree_size=${Number(params.treeSize)}`);
+    if (params.sinceSize !== undefined) q.push(`since_size=${Number(params.sinceSize)}`);
+    const qs = q.length > 0 ? `?${q.join("&")}` : "";
+    const { data } = await this._requestJson(
+      "GET",
+      `/v1/tenants/${encodeURIComponent(effTenant)}/checkpoint${qs}`,
+      undefined,
+      [200]
+    );
+    if (data.checkpoint) {
+      verifySignedTreeHead(data.checkpoint, effTenant, hostPk);
+      if (data.consistency_proof && data.prior_checkpoint) {
+        verifySignedTreeHead(data.prior_checkpoint, effTenant, hostPk);
+        if (
+          !verifyMerkleConsistencyProof(
+            data.prior_checkpoint.tree_size,
+            data.prior_checkpoint.merkle_root,
+            data.checkpoint.tree_size,
+            data.checkpoint.merkle_root,
+            data.consistency_proof
+          )
+        ) {
+          throw new ActaVerificationError(
+            `RFC 6962 consistency proof failed from first_size=${data.prior_checkpoint.tree_size} to second_size=${data.checkpoint.tree_size}`
+          );
+        }
+      }
+    }
+    return data;
+  }
+
+  async anchorCheckpoint(req) {
+    const effTenant = this._enforceTenant(req.tenantId);
+    const body = {
+      tenant_id: effTenant,
+      tree_size: req.treeSize,
+      checkpoint_hash_hex: req.checkpointHashHex,
+      witness_id: req.witnessId,
+      witness_public_key_hex: req.witnessPublicKeyHex,
+      witness_signature_hex: req.witnessSignatureHex,
+    };
+    if (req.externalUri) body.external_uri = req.externalUri;
+    const { data } = await this._requestJson("POST", "/v1/anchors", body, [200, 201]);
+    const anchor = data.anchor || data;
+    if (
+      !verifyWitnessAnchorSignature(
+        anchor.witness_public_key,
+        effTenant,
+        anchor.tree_size,
+        anchor.checkpoint_hash,
+        anchor.witness_signature
+      )
+    ) {
+      throw new ActaSignatureVerificationError(
+        "Ed25519 witness_signature verification failed on anchorCheckpoint response"
+      );
+    }
+    return data;
+  }
+
+  async listAnchors(params = {}) {
+    const effTenant = this._enforceTenant(params.tenantId);
+    const qs = params.treeSize !== undefined ? `?tree_size=${Number(params.treeSize)}` : "";
+    const { data } = await this._requestJson(
+      "GET",
+      `/v1/tenants/${encodeURIComponent(effTenant)}/anchors${qs}`,
       undefined,
       [200]
     );
@@ -1358,15 +2033,16 @@ export class ActaClient {
     return data;
   }
 
-  async exportBundle(bundleHash) {
+  async exportBundle(bundleHash, mode = "full") {
     const clean = encodeURIComponent(String(bundleHash).trim().toLowerCase());
-    const { data } = await this._requestJson("GET", `/v1/bundles/${clean}/export`, undefined, [200]);
+    const qs = mode === "merkle" ? "?mode=merkle" : "";
+    const { data } = await this._requestJson("GET", `/v1/bundles/${clean}/export${qs}`, undefined, [200]);
     return data;
   }
 
-  async verifyBundleOffline(bundleHash, expectedPubkeyHex = undefined) {
+  async verifyBundleOffline(bundleHash, expectedPubkeyHex = undefined, mode = "full") {
     const pk = (expectedPubkeyHex || (await this.ensureHostPublicKey())).trim().toLowerCase();
-    const archive = await this.exportBundle(bundleHash);
+    const archive = await this.exportBundle(bundleHash, mode);
     return verifyExportArchive(archive, pk);
   }
 }

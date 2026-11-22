@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live end-to-end verification of `acta-sdk` v1.5.0 (Python) against Cloud Run."""
+"""Live end-to-end verification of `acta-sdk` v1.6.0 (Python) against Cloud Run."""
 
 from __future__ import annotations
 
@@ -17,9 +17,13 @@ from acta_sdk import (  # noqa: E402
     ActaClient,
     ActaDisputeEscalationError,
     ActaGeminiGuard,
+    ActaHttpError,
     ActaPolicyEscalatedError,
     ActaTenantLockError,
+    ContextBudget,
     extract_token_tenant,
+    sign_override_client_intent,
+    sign_witness_anchor,
 )
 
 
@@ -31,12 +35,12 @@ def main() -> None:
     scope = f"settlement-{secrets.token_hex(3)}"
 
     with ActaClient(base_url, api_key=api_key, default_tenant_id=explicit_tenant) as client:
-        active_tenant = client.locked_tenant or explicit_tenant
-        print(f"[py-sdk v1.5] Connected to {base_url} (locked_tenant={active_tenant}, scope={scope})")
+        active_tenant = client.locked_tenant or explicit_tenant or "sandbox-py-sdk"
+        print(f"[py-sdk v1.6] Connected to {base_url} (locked_tenant={active_tenant}, scope={scope})")
         health = client.health()
-        print(f"[py-sdk v1.5] Health v{health.get('version')} OK -> host Ed25519 key: {health['host_public_key']}")
+        print(f"[py-sdk v1.6] Health v{health.get('version')} OK -> host Ed25519 key: {health['host_public_key']}")
 
-        # 1. Verify local cross-tenant lock prevents accidental cross-business calls before network!
+        # 1. Local cross-tenant lock prevents accidental cross-business calls before network!
         try:
             client.compile(
                 tenant_id="other-unrelated-business",
@@ -46,7 +50,7 @@ def main() -> None:
             )
             raise AssertionError("Expected ActaTenantLockError")
         except ActaTenantLockError:
-            print(f"[py-sdk v1.5] Local tenant lock verified: blocked cross-tenant call from '{active_tenant}'")
+            print(f"[py-sdk v1.6] Local tenant lock verified: blocked cross-tenant call from '{active_tenant}'")
 
         # 2. Ingest standing intent + two competing claims (290 bps vs 240 bps)
         client.ingest_object(
@@ -54,7 +58,7 @@ def main() -> None:
             scope=scope,
             priority=100,
             importance=1.0,
-            tags=["sdk-v1.5"],
+            tags=["sdk-v1.6"],
             body={"directive": "Halt automated payout when fee_bps is disputed"},
         )
         client.ingest_claim(
@@ -99,7 +103,7 @@ def main() -> None:
             assert not llm_invoked
             disputed_hash = err.bundle_hash
             print(
-                f"[py-sdk v1.5] Dispute circuit-breaker TRIPPED before LLM! "
+                f"[py-sdk v1.6] Dispute circuit-breaker TRIPPED before LLM! "
                 f"bundle_hash={disputed_hash} (seq=#{err.evidence['seq_num']} Ed25519 verified locally)"
             )
 
@@ -117,40 +121,110 @@ def main() -> None:
             rmeta = err.evidence.get("refusal_metadata") or {}
             assert rmeta.get("reason_code") == "POLICY_ESCALATE", f"missing refusal_metadata: {err.evidence}"
             print(
-                f"[py-sdk v1.5] Policy-Before-Read Escalate TRIPPED with v2 RefusalMetadata! "
+                f"[py-sdk v1.6] Policy-Before-Read Escalate TRIPPED with v2 RefusalMetadata! "
                 f"seq=#{err.evidence['seq_num']} target_scope={rmeta.get('target_scope')}"
             )
 
-        # 4. Attest signed human dispute override for contract 240 bps claim & re-compile!
+        # 4. Verify v1.5.1 Gap 1: Unauthenticated custom adjudicator_id ("cfo-committee") is REFUSED (403)!
+        justification = "Signed enterprise MSA schedule §4.2 confirms 240 bps"
+        try:
+            client.attest_override(
+                scope=scope,
+                winning_claim_id=str(c2["id"]),
+                source_bundle_hash_hex=disputed_hash,
+                adjudicator_id="cfo-committee",
+                justification=justification,
+            )
+            raise AssertionError("Expected HTTP 403 on unsigned custom adjudicator_id")
+        except ActaHttpError as err:
+            assert err.status_code == 403, f"expected 403, got {err.status_code}"
+            print("[py-sdk v1.6] Unsigned custom adjudicator_id 'cfo-committee' REFUSED (HTTP 403) as required!")
+
+        # 5. Sign override intent offline with committee Ed25519 key & notarize!
+        committee_seed = secrets.token_bytes(32)
+        csig_hex, cpk_hex = sign_override_client_intent(
+            committee_seed,
+            tenant_id=active_tenant,
+            scope=scope,
+            winning_claim_id=str(c2["id"]),
+            adjudicator_id="cfo-committee",
+            justification=justification,
+        )
         att = client.attest_override(
             scope=scope,
             winning_claim_id=str(c2["id"]),
             source_bundle_hash_hex=disputed_hash,
-            adjudicator_id="cfo-review",
-            justification="Signed enterprise MSA schedule §4.2 confirms 240 bps",
+            adjudicator_id="cfo-committee",
+            justification=justification,
+            client_signature_hex=csig_hex,
+            client_public_key_hex=cpk_hex,
         )
+        assert att.get("adjudicator_auth_kind") == "ed25519_client_sig"
         print(
-            f"[py-sdk v1.5] Signed OverrideAttestation notarized! "
-            f"id={att['id']} seq=#{att['evidence_seq_num']}"
+            f"[py-sdk v1.6] Ed25519 Client-Signed OverrideAttestation notarized! "
+            f"id={att['id']} seq=#{att['evidence_seq_num']} auth={att['adjudicator_auth_kind']}"
         )
 
-        adjudicated = guard.generate_content(
+        # 6. Verify v1.5.1 Gap 3: Tight budget (80 tokens) preserves bounded `why="..."` snippet!
+        tight = client.compile_guarded(
             actor_id="python-sdk-auditor",
             scope=scope,
-            prompt="Approve merchant:global payout.",
-            llm_callable=lambda prompt, _comp: "OK" if "OVERRIDE" in prompt else "MISSING",
+            query_text="Approve merchant:global payout.",
+            budget=ContextBudget.tokens(80),
         )
-        assert adjudicated.text == "OK"
+        assert tight.context_text and 'why="Signed enterprise' in tight.context_text, (
+            f"expected bounded why snippet at budget 80, got: {tight.context_text}"
+        )
+        print(f"[py-sdk v1.6] Tight-budget (80 tokens) justification snippet preserved: {tight.context_text}")
 
-        # 5. Offline ExportArchive audit verifying ResolverManifest + RefusalMetadata + OverrideAttestation!
-        summary = client.verify_bundle_offline(adjudicated.bundle_hash)
-        assert summary.verified_overrides == 1
-        assert summary.resolver_manifest is not None
+        # 7. Verify v1.6 Merkle SignedTreeHead checkpoint + external witness cosignature + compact O(log N) verify!
+        cp_resp = client.get_checkpoint()
+        sth = cp_resp["checkpoint"]
+        witness_seed = secrets.token_bytes(32)
+        wsig_hex, wpk_hex = sign_witness_anchor(
+            witness_seed, active_tenant, int(sth["tree_size"]), str(sth["checkpoint_hash"])
+        )
+        client.anchor_checkpoint(
+            tree_size=int(sth["tree_size"]),
+            checkpoint_hash_hex=str(sth["checkpoint_hash"]),
+            witness_id="e2e-witness-log",
+            witness_public_key_hex=wpk_hex,
+            witness_signature_hex=wsig_hex,
+            external_uri="https://witness.ardyn.example/v1",
+        )
+        merkle_summary = client.verify_bundle_offline(tight.bundle_hash or "", mode="merkle")
+        assert merkle_summary.verification_mode == "merkle_inclusion"
+        assert merkle_summary.verified_overrides == 1
+        assert merkle_summary.verified_witness_anchors >= 1
         print(
-            f"[py-sdk v1.5] Offline zero-trust ExportArchive audit PASSED: "
-            f"tenant={summary.tenant_id}, claims={summary.verified_claims}, "
-            f"overrides={summary.verified_overrides}, refusals={summary.verified_refusals}, "
-            f"decisiveness_threshold={summary.resolver_manifest['decisiveness_threshold']}"
+            f"[py-sdk v1.6] Compact O(log N) Merkle ExportArchive audit PASSED: "
+            f"tree_size={merkle_summary.merkle_tree_size}, entries_checked={merkle_summary.verified_evidence_entries}, "
+            f"witness_anchors={merkle_summary.verified_witness_anchors}"
+        )
+
+        # 8. Verify v1.5.1 Gap 2: Unseen conflicting Claim C (310 bps) re-escalates with `lapsed_override`!
+        c3 = client.ingest_claim(
+            scope=scope,
+            subject="merchant:global",
+            predicate="fee_bps",
+            object_val=310,
+            object_type="int",
+            confidence=0.79,
+            source_provenance_class=2,
+            source_descriptor="erp-amendment",
+        )
+        reopened = client.compile(
+            actor_id="python-sdk-auditor",
+            scope=scope,
+            query_text="Approve merchant:global payout.",
+        )
+        lapsed = reopened.dispute_records[0].get("lapsed_override")
+        assert lapsed is not None and str(c3["id"]) in lapsed.get("reopened_by_claim_ids", [])
+        reopened_summary = client.verify_bundle_offline(reopened.bundle_hash or "", mode="merkle")
+        assert reopened_summary.verified_overrides == 1
+        print(
+            f"[py-sdk v1.6] LapsedOverrideRef verified on re-escalated dispute! "
+            f"reopened_by={lapsed['reopened_by_claim_ids']} prior_seq=#{lapsed['evidence_seq_num']}"
         )
 
 
