@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/acta-types",
+    "crates/acta-crypto",
+    "crates/acta-policy",
+    "crates/acta-engine",
+    "crates/acta-store",
+    "crates/acta-server",
+    "crates/acta-verify",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros", "sync", "net", "signal"] }
+axum = { version = "0.7", features = ["json", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "derive"] }
+# Pin pgvector to =0.4.1 because pgvector 0.4.2 specifies `sqlx >=0.8, <0.10`, which
+# causes Cargo (without a lockfile) to resolve pgvector against sqlx 0.9 alongside sqlx 0.8.
+pgvector = { version = "=0.4.1", features = ["sqlx"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "0.1"
+blake3 = "1"
+sha2 = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+cedar-policy = "4"
+tiktoken-rs = "0.6"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+hex = "0.4"
+dotenvy = "0.15"
+proptest = "1"
+rand = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+acta-types = { path = "crates/acta-types" }
+acta-crypto = { path = "crates/acta-crypto" }
+acta-policy = { path = "crates/acta-policy" }
+acta-engine = { path = "crates/acta-engine" }
+acta-store = { path = "crates/acta-store" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

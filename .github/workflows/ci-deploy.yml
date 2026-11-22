@@ -1,0 +1,101 @@
+name: Acta Compiler CI & Cloud Run Deploy
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  GCP_PROJECT_ID: compounder-core-prod-487014
+  GCP_REGION: us-west1
+  CLOUD_RUN_SERVICE: acta-server
+  ARTIFACT_REPO: acta-repo
+  CLOUDSQL_INSTANCE: acta-pg17
+
+jobs:
+  verify:
+    name: Rust + PostgreSQL 17 + OAuth 2.1 + SDK Suite
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: acta
+          POSTGRES_PASSWORD: acta_ci_password
+          POSTGRES_DB: acta
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust workspace unit, OAuth 2.1, property, and PG17 E2E tests
+        env:
+          DATABASE_URL: postgres://acta:acta_ci_password@127.0.0.1:5432/acta
+        run: |
+          cargo check --workspace --bins
+          cargo test --workspace
+
+      - name: Run Python SDK & Git-Aware acta-mcp tests
+        run: |
+          python3 -m pip install --upgrade cryptography httpx
+          PYTHONPATH=sdks/python python3 -m unittest discover -s sdks/python/tests -v
+
+      - name: Run TypeScript @acta/sdk tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node sdks/typescript/tests/test_sdk.mjs
+
+  deploy:
+    name: Deploy to Google Cloud Run (us-west1)
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via Keyless Workload Identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build distroless image via Cloud Build & deploy to Cloud Run
+        run: |
+          IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${CLOUD_RUN_SERVICE}:${GITHUB_SHA}"
+          gcloud builds submit --project "${GCP_PROJECT_ID}" --tag "${IMAGE_URI}" --machine-type=e2-highcpu-32 .
+          SECRETS_SPEC="DATABASE_URL=acta-database-url:latest,ACTA_HOST_PRIVATE_KEY_HEX=acta-host-private-key:latest,ACTA_API_KEY=acta-api-key:latest"
+          if gcloud secrets describe acta-github-client-id --project "${GCP_PROJECT_ID}" >/dev/null 2>&1 && \
+             gcloud secrets describe acta-github-client-secret --project "${GCP_PROJECT_ID}" >/dev/null 2>&1; then
+            SECRETS_SPEC="${SECRETS_SPEC},GITHUB_CLIENT_ID=acta-github-client-id:latest,GITHUB_CLIENT_SECRET=acta-github-client-secret:latest"
+          fi
+          gcloud run deploy "${CLOUD_RUN_SERVICE}" \
+            --project "${GCP_PROJECT_ID}" \
+            --image "${IMAGE_URI}" \
+            --region "${GCP_REGION}" \
+            --platform managed \
+            --add-cloudsql-instances "${GCP_PROJECT_ID}:${GCP_REGION}:${CLOUDSQL_INSTANCE}" \
+            --update-secrets "${SECRETS_SPEC}" \
+            --update-env-vars "MIN_CONFIDENCE=0.70,DECISIVENESS_THRESHOLD=0.15,MAX_INLINE_OMISSIONS=25,ACTA_PUBLIC_SANDBOX_PREFIX=sandbox" \
+            --quiet
+          SERVICE_URL="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format='value(status.url)')"
+          curl -sf "${SERVICE_URL}/v1/health"
+          curl -sf "${SERVICE_URL}/.well-known/oauth-protected-resource"

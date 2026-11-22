@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acta-sdk"
+version = "1.5.0"
+description = "Official Python SDK, Git-Aware Global MCP Bridge (acta-mcp), Offline Epistemic Notary Verifier, and Gemini Guard for Acta Compiler v1.5"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "cryptography>=38.0.0",
+]
+
+[project.scripts]
+acta-sdk = "acta_sdk.cli:main"
+acta-mcp = "acta_sdk.mcp_bridge:main_mcp_entry"
+
+[project.optional-dependencies]
+http = ["httpx>=0.25.0"]
+blake3 = ["blake3>=0.4.1"]
+gemini = ["google-genai>=1.0.0"]
+all = ["httpx>=0.25.0", "blake3>=0.4.1", "google-genai>=1.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["acta_sdk*"]

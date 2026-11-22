@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acta Compiler — Cryptographic Context Control Plane</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #111827;
+    --panel2: #0d1422;
+    --border: #243046;
+    --text: #f3f6fb;
+    --muted: #9fb0ca;
+    --cyan: #38e8ff;
+    --amber: #ffb547;
+    --green: #34d399;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding: 16px 28px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    background: #0d1320;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .auth-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .badge {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    padding: 4px 10px;
+    border: 1px solid var(--cyan);
+    color: var(--cyan);
+    background: rgba(56, 232, 255, 0.08);
+  }
+  .badge.ok { border-color: var(--green); color: var(--green); background: rgba(52, 211, 153, 0.12); }
+  .badge.amber { border-color: var(--amber); color: var(--amber); background: rgba(255, 181, 71, 0.12); }
+  h1 { margin: 0; font-size: 19px; letter-spacing: -0.02em; }
+  main { max-width: 1320px; margin: 0 auto; padding: 24px 28px 64px; }
+  .btn-gh-header {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #f3f6fb;
+    color: #0b0f17;
+    border: none;
+    padding: 9px 15px;
+    font-size: 13.5px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .btn-gh-header:hover { background: #ffffff; }
+  .btn-sm {
+    cursor: pointer;
+    background: #162238;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 7px 12px;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .btn-sm:hover { border-color: var(--cyan); background: #1c2c48; }
+  select.vault-select {
+    background: #090d14;
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    padding: 7px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .meta-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 16px 18px;
+  }
+  .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    word-break: break-all;
+    color: var(--cyan);
+  }
+  .signin-callout {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    background: linear-gradient(90deg, rgba(56,232,255,0.08), rgba(52,211,153,0.06));
+    border: 1px solid rgba(56,232,255,0.35);
+    padding: 16px 20px;
+    margin-bottom: 20px;
+  }
+  .scope-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .scope-pill {
+    cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    padding: 5px 11px;
+    background: #090d14;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .scope-pill:hover { color: var(--text); border-color: var(--cyan); }
+  .scope-pill.active {
+    color: #0b0f17;
+    background: var(--cyan);
+    border-color: var(--cyan);
+    font-weight: 700;
+  }
+  .tabs-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .tab-btn {
+    cursor: pointer;
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active {
+    color: var(--cyan);
+    border-bottom-color: var(--cyan);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td {
+    text-align: left;
+    padding: 9px 11px;
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase; }
+  tr.clickable-row { cursor: pointer; }
+  tr.clickable-row:hover { background: rgba(56, 232, 255, 0.05); }
+  .tag-allow { color: var(--green); font-weight: 700; }
+  .tag-block { color: var(--red); font-weight: 700; }
+  .tag-escalate { color: var(--amber); font-weight: 700; }
+  .pill-conflict {
+    display: inline-block;
+    font-size: 10.5px;
+    padding: 2px 6px;
+    color: var(--amber);
+    border: 1px solid var(--amber);
+    background: rgba(255, 181, 71, 0.12);
+    font-weight: 700;
+  }
+  .pill-ok {
+    display: inline-block;
+    font-size: 10.5px;
+    padding: 2px 6px;
+    color: var(--green);
+    border: 1px solid rgba(52, 211, 153, 0.45);
+    background: rgba(52, 211, 153, 0.1);
+  }
+  .pill-intent {
+    display: inline-block;
+    font-size: 10.5px;
+    padding: 2px 6px;
+    color: var(--cyan);
+    border: 1px solid rgba(56, 232, 255, 0.45);
+    background: rgba(56, 232, 255, 0.1);
+    font-weight: 700;
+  }
+  .workspace-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 20px;
+    margin-bottom: 20px;
+  }
+  @media (max-width: 920px) { .workspace-grid { grid-template-columns: 1fr; } }
+  pre {
+    margin: 0;
+    background: #070a10;
+    border: 1px solid var(--border);
+    padding: 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: #dbe7f8;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    min-height: 210px;
+    max-height: 420px;
+    overflow-y: auto;
+  }
+  details.lab-drawer {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 14px 18px;
+  }
+  details.lab-drawer > summary {
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 13.5px;
+    color: var(--cyan);
+  }
+  .controls-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px;
+    margin: 16px 0;
+  }
+  input {
+    width: 100%;
+    background: #090d14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+  }
+  .actions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+  }
+  button.lab-btn {
+    cursor: pointer;
+    background: #162238;
+    color: var(--text);
+    border: 1px solid var(--cyan);
+    padding: 11px 13px;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+  }
+  button.lab-btn:hover { background: #1e3050; }
+  button.lab-btn span.sub {
+    display: block;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+    margin-top: 3px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>ACTA COMPILER</h1>
+    <span class="badge">v1.5 CONTROL PLANE</span>
+    <span id="health-badge" class="badge">CHECKING /v1/health...</span>
+    <span id="oauth-badge" class="badge">OAUTH 2.1 READY</span>
+  </div>
+
+  <div class="auth-bar" id="auth-signed-out">
+    <button class="btn-gh-header" onclick="startGitHubSignIn()">
+      <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      Sign in with GitHub
+    </button>
+  </div>
+
+  <div class="auth-bar" id="auth-signed-in" style="display:none;">
+    <span class="badge ok" id="gh-user-badge">@github</span>
+    <label for="vault-selector" style="font-size:12px;color:var(--muted);">Vault:</label>
+    <select id="vault-selector" class="vault-select" onchange="onSelectVault(this.value)"></select>
+    <button class="btn-sm" onclick="loadVaultExplorer()">Refresh</button>
+    <button class="btn-sm" onclick="signOutGitHub()">Sign out</button>
+  </div>
+</header>
+
+<main>
+  <div class="signin-callout" id="signin-banner">
+    <div>
+      <div style="font-weight:700;font-size:15px;">Browse Your Private GitHub Vaults Without API Keys</div>
+      <div style="color:var(--muted);font-size:13px;margin-top:2px;">
+        Sign in with GitHub (OAuth 2.1 + PKCE S256) to inspect all scopes, structured claims, intents, memories, compiled bundles, and Ed25519 evidence chains created from Claude or Cursor.
+      </div>
+    </div>
+    <button class="btn-gh-header" onclick="startGitHubSignIn()">
+      <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      Sign in with GitHub
+    </button>
+  </div>
+
+  <div class="meta-strip">
+    <div class="card">
+      <div class="label">Host Ed25519 Verifying Key</div>
+      <div class="mono" id="host-pubkey">loading...</div>
+    </div>
+    <div class="card">
+      <div class="label">Active Cedar Permission Root (BLAKE3)</div>
+      <div class="mono" id="perm-root">loading...</div>
+    </div>
+    <div class="card">
+      <div class="label">Zero-Key MCP URL (Claude / Cursor)</div>
+      <div class="mono" id="mcp-copy-url">loading...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;">
+      <div>
+        <div class="label" style="margin-bottom:2px;">Cryptographic Vault Explorer</div>
+        <div style="font-size:15px;font-weight:700;">
+          Active Vault: <span class="mono" id="active-vault-title" style="font-size:15px;">sandbox-live</span>
+        </div>
+      </div>
+      <div id="vault-status-note" style="font-size:12px;color:var(--muted);"></div>
+    </div>
+
+    <div class="scope-bar" id="scope-pills-bar">
+      <span style="font-size:12px;color:var(--muted);">Scopes: loading...</span>
+    </div>
+
+    <div class="tabs-bar">
+      <button class="tab-btn active" id="tabbtn-claims" onclick="switchTab('claims')">Structured Claims (0)</button>
+      <button class="tab-btn" id="tabbtn-objects" onclick="switchTab('objects')">Intents &amp; Memories (0)</button>
+      <button class="tab-btn" id="tabbtn-overrides" onclick="switchTab('overrides')">Signed Overrides (0)</button>
+      <button class="tab-btn" id="tabbtn-bundles" onclick="switchTab('bundles')">Compiled Bundles (0)</button>
+      <button class="tab-btn" id="tabbtn-evidence" onclick="switchTab('evidence')">Signed Evidence Ledger (0)</button>
+    </div>
+
+    <div class="tab-pane active" id="pane-claims" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Scope</th>
+            <th>Subject · Predicate</th>
+            <th>Value</th>
+            <th>Conf</th>
+            <th>Source</th>
+            <th>State</th>
+            <th>Content Hash</th>
+          </tr>
+        </thead>
+        <tbody id="claims-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No claims loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tab-pane" id="pane-objects" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Scope</th>
+            <th>Priority / Imp</th>
+            <th>Tags</th>
+            <th>Body</th>
+            <th>Ver</th>
+            <th>Content Hash</th>
+          </tr>
+        </thead>
+        <tbody id="objects-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No intents or memories loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tab-pane" id="pane-overrides" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Scope</th>
+            <th>Subject · Predicate</th>
+            <th>Winning Claim</th>
+            <th>Adjudicator</th>
+            <th>Justification</th>
+            <th>Ledger Seq</th>
+            <th>Attestation Hash</th>
+          </tr>
+        </thead>
+        <tbody id="overrides-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No signed dispute overrides loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tab-pane" id="pane-bundles" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Bundle / Refusal / Override</th>
+            <th>Scope</th>
+            <th>Disputes</th>
+            <th>Facts</th>
+            <th>Omitted</th>
+            <th>Issued At</th>
+            <th>Verify</th>
+          </tr>
+        </thead>
+        <tbody id="bundles-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No compiled bundles loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tab-pane" id="pane-evidence" style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Seq</th>
+            <th>Policy</th>
+            <th>Event Hash</th>
+            <th>Prev Hash</th>
+            <th>Bundle Hash</th>
+            <th>Ed25519 Host Signature</th>
+            <th>Created At</th>
+          </tr>
+        </thead>
+        <tbody id="evidence-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No evidence entries loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="workspace-grid">
+    <div class="card">
+      <div class="label" id="left-pane-title">Record / Compiled Context Inspector</div>
+      <pre id="context-output">Click any Claim, Intent, Memory, or Compiled Bundle row above to inspect its canonical record and verify its signature.</pre>
+    </div>
+    <div class="card">
+      <div class="label" id="right-pane-title">Cryptographic Receipt &amp; Verification Verdict</div>
+      <pre id="receipt-output">Ready.</pre>
+    </div>
+  </div>
+
+  <details class="lab-drawer">
+    <summary>Interactive Cryptographic Lab &amp; Optional Manual Key Override</summary>
+    <div class="controls-bar">
+      <div>
+        <div class="label">Target Vault / Tenant ID</div>
+        <input id="inp-tenant" value="sandbox-live" onchange="onManualTenantChange()" />
+      </div>
+      <div>
+        <div class="label">Scope</div>
+        <input id="inp-scope" value="payments-audit" />
+      </div>
+      <div>
+        <div class="label">Actor ID</div>
+        <input id="inp-actor" value="control-plane-auditor" />
+      </div>
+      <div>
+        <div class="label">Optional Manual Key Override</div>
+        <input id="inp-apikey" type="password" placeholder="not needed when signed in with GitHub" onchange="loadVaultExplorer()" />
+      </div>
+    </div>
+
+    <div class="actions-grid">
+      <button class="lab-btn" onclick="runSeedAndCompile()">
+        1. Seed Conflict &amp; Compile
+        <span class="sub">Ingests intent + 290 vs 240 bps claims &amp; compiles [DISPUTE] bundle</span>
+      </button>
+      <button class="lab-btn" onclick="runHoneyTrap()">
+        2. Fire Policy-Before-Read Trap
+        <span class="sub">Probes restricted/vault scope -&gt; logs signed Escalate with 0 reads</span>
+      </button>
+      <button class="lab-btn" onclick="runReplayDiff()">
+        3. Counterfactual Time-Travel Replay
+        <span class="sub">Diffs margin 0.15 ([DISPUTE]) vs 0.05 (resolved winner) via /v1/replay</span>
+      </button>
+      <button class="lab-btn" onclick="runTamperAudit()">
+        4. Verify &amp; 1-Bit Tamper Audit
+        <span class="sub">Verifies ExportArchive then mutates 1 claim value to test detection</span>
+      </button>
+      <button class="lab-btn" onclick="runMcpCheck()">
+        5. Test MCP Agent Gateway (/mcp)
+        <span class="sub">Executes JSON-RPC 2.0 tools/list + acta_verify_bundle over HTTP</span>
+      </button>
+      <button class="lab-btn" onclick="runTenantLockAudit()">
+        6. Tenant Lock Audit
+        <span class="sub">Proves /mcp auto-tenant injection &amp; cross-tenant hop rejection</span>
+      </button>
+      <button class="lab-btn" onclick="runOAuthDiscoveryCheck()">
+        7. OAuth 2.1 Discovery Check
+        <span class="sub">Verifies RFC 9728/8414 metadata, DCR &amp; 401 WWW-Authenticate</span>
+      </button>
+    </div>
+  </details>
+</main>
+
+<script>
+const STORAGE_KEY = 'acta_cp_github_session_v1';
+const PKCE_KEY = 'acta_cp_pkce_tx_v1';
+const mcpUrl = window.location.origin + '/mcp';
+document.getElementById('mcp-copy-url').textContent = mcpUrl;
+
+let uiSession = null;
+let selectedScopeFilter = '';
+let latestBundleHash = null;
+let cachedVaultData = null;
+
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function base64UrlEncode(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function startGitHubSignIn() {
+  const rand = new Uint8Array(32);
+  crypto.getRandomValues(rand);
+  const verifier = base64UrlEncode(rand);
+
+  const stateBytes = new Uint8Array(16);
+  crypto.getRandomValues(stateBytes);
+  const state = base64UrlEncode(stateBytes);
+
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  const challenge = base64UrlEncode(new Uint8Array(digest));
+
+  const clientId = window.location.origin + '/control-plane';
+  const redirectUri = window.location.origin + '/';
+  sessionStorage.setItem(PKCE_KEY, JSON.stringify({ verifier, state, clientId, redirectUri }));
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: state,
+    scope: 'mcp:tools acta:ui',
+    provider: 'github'
+  });
+  window.location.href = '/oauth/authorize?' + params.toString();
+}
+
+async function completeGitHubCallbackIfPresent() {
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get('code');
+  const returnedState = url.searchParams.get('state');
+  if (!code) return;
+
+  history.replaceState({}, document.title, '/');
+  const rawTx = sessionStorage.getItem(PKCE_KEY);
+  sessionStorage.removeItem(PKCE_KEY);
+  if (!rawTx) return;
+
+  try {
+    const tx = JSON.parse(rawTx);
+    if (tx.state !== returnedState) {
+      throw new Error('OAuth state mismatch');
+    }
+    const res = await fetch('/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code: code,
+        code_verifier: tx.verifier,
+        client_id: tx.clientId,
+        redirect_uri: tx.redirectUri
+      })
+    });
+    const tok = await res.json();
+    if (!res.ok || !tok.access_token) {
+      throw new Error(tok.error_description || tok.error || 'Token exchange failed');
+    }
+
+    const vaults = Array.isArray(tok.authorized_vaults) && tok.authorized_vaults.length > 0
+      ? tok.authorized_vaults
+      : [{
+          tenant_id: tok.acta_tenant_id,
+          label: tok.github_login ? ('@' + tok.github_login) : tok.acta_tenant_id,
+          kind: 'github_user',
+          access_token: tok.access_token
+        }];
+
+    uiSession = {
+      githubLogin: tok.github_login || tok.acta_tenant_id,
+      activeTenant: tok.acta_tenant_id,
+      vaults: vaults,
+      refreshToken: tok.refresh_token || null
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(uiSession));
+  } catch (err) {
+    document.getElementById('receipt-output').textContent = 'GitHub Sign-In Error: ' + err.message;
+  }
+}
+
+function restoreStoredSession() {
+  if (uiSession) return;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) uiSession = JSON.parse(raw);
+  } catch (_) {
+    uiSession = null;
+  }
+}
+
+function signOutGitHub() {
+  uiSession = null;
+  selectedScopeFilter = '';
+  localStorage.removeItem(STORAGE_KEY);
+  document.getElementById('inp-tenant').value = 'sandbox-live';
+  renderAuthHeader();
+  loadVaultExplorer();
+}
+
+function renderAuthHeader() {
+  const outBar = document.getElementById('auth-signed-out');
+  const inBar = document.getElementById('auth-signed-in');
+  const banner = document.getElementById('signin-banner');
+
+  if (!uiSession) {
+    outBar.style.display = 'flex';
+    inBar.style.display = 'none';
+    banner.style.display = 'flex';
+    return;
+  }
+
+  outBar.style.display = 'none';
+  inBar.style.display = 'flex';
+  banner.style.display = 'none';
+  document.getElementById('gh-user-badge').textContent = 'GITHUB · @' + uiSession.githubLogin;
+
+  const sel = document.getElementById('vault-selector');
+  const opts = uiSession.vaults.map(v => {
+    const tag = v.kind === 'github_org' ? 'ORG' : 'PERSONAL';
+    return '<option value="' + escHtml(v.tenant_id) + '">' + escHtml(v.tenant_id + ' (' + tag + ')') + '</option>';
+  });
+  opts.push('<option value="sandbox-live">sandbox-live (PUBLIC DEMO)</option>');
+  sel.innerHTML = opts.join('');
+  sel.value = uiSession.activeTenant || uiSession.vaults[0].tenant_id;
+  document.getElementById('inp-tenant').value = sel.value;
+}
+
+function onSelectVault(tenantId) {
+  selectedScopeFilter = '';
+  if (uiSession) {
+    uiSession.activeTenant = tenantId;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(uiSession));
+  }
+  document.getElementById('inp-tenant').value = tenantId;
+  loadVaultExplorer();
+}
+
+function onManualTenantChange() {
+  selectedScopeFilter = '';
+  const t = document.getElementById('inp-tenant').value.trim() || 'sandbox-live';
+  if (uiSession) uiSession.activeTenant = t;
+  loadVaultExplorer();
+}
+
+function activeTenantId() {
+  return document.getElementById('inp-tenant').value.trim() || 'sandbox-live';
+}
+
+function authHeaders(extraHeaders) {
+  const h = { 'Content-Type': 'application/json' };
+  const manualKey = document.getElementById('inp-apikey').value.trim();
+  const tenant = activeTenantId();
+
+  if (manualKey) {
+    h['X-Acta-Api-Key'] = manualKey;
+  } else if (uiSession && Array.isArray(uiSession.vaults)) {
+    const matched = uiSession.vaults.find(v => v.tenant_id === tenant);
+    if (matched && matched.access_token) {
+      h['Authorization'] = 'Bearer ' + matched.access_token;
+    }
+  }
+  if (extraHeaders) Object.assign(h, extraHeaders);
+  return h;
+}
+
+function switchTab(name) {
+  for (const t of ['claims', 'objects', 'overrides', 'bundles', 'evidence']) {
+    document.getElementById('tabbtn-' + t).classList.toggle('active', t === name);
+    document.getElementById('pane-' + t).classList.toggle('active', t === name);
+  }
+}
+
+function selectScopePill(scope) {
+  selectedScopeFilter = scope;
+  if (scope) {
+    document.getElementById('inp-scope').value = scope;
+  }
+  loadVaultExplorer();
+}
+
+async function refreshHealth() {
+  try {
+    const r = await fetch('/v1/health');
+    const d = await r.json();
+    const badge = document.getElementById('health-badge');
+    const oauthBadge = document.getElementById('oauth-badge');
+    if (d.status === 'ok') {
+      badge.textContent = 'ONLINE · v' + (d.version || '1.4.1') + ' · PG17 + CEDAR';
+      badge.className = 'badge ok';
+      document.getElementById('host-pubkey').textContent = d.host_public_key;
+      document.getElementById('perm-root').textContent = d.permission_root;
+      if (d.github_oauth_enabled) {
+        oauthBadge.textContent = 'GITHUB OAUTH 2.1 LIVE';
+        oauthBadge.className = 'badge ok';
+      } else {
+        oauthBadge.textContent = 'OAUTH 2.1 READY';
+      }
+    } else {
+      badge.textContent = 'DEGRADED';
+    }
+  } catch (_) {
+    document.getElementById('health-badge').textContent = 'OFFLINE';
+  }
+}
+
+async function loadVaultExplorer() {
+  const tenant = activeTenantId();
+  document.getElementById('active-vault-title').textContent = tenant;
+  document.getElementById('vault-status-note').textContent = 'Loading vault...';
+
+  let url = '/v1/tenants/' + encodeURIComponent(tenant) + '/vault';
+  if (selectedScopeFilter) {
+    url += '?scope=' + encodeURIComponent(selectedScopeFilter);
+  }
+
+  const res = await fetch(url, { headers: authHeaders() });
+  if (!res.ok) {
+    const errJson = await res.json().catch(() => ({}));
+    document.getElementById('vault-status-note').textContent =
+      'Protected vault — click "Sign in with GitHub" above to unlock (' + (errJson.error || res.status) + ')';
+    return;
+  }
+
+  const data = await res.json();
+  cachedVaultData = data;
+  if (data.bundles && data.bundles.length > 0 && !latestBundleHash) {
+    latestBundleHash = data.bundles[0].bundle_hash;
+  }
+
+  document.getElementById('vault-status-note').textContent =
+    (selectedScopeFilter ? ('Filtered by scope "' + selectedScopeFilter + '" · ') : 'Showing all scopes · ') +
+    'Ed25519 verified ledger';
+
+  // Render Scope Pills
+  const pillsBar = document.getElementById('scope-pills-bar');
+  const totalScopes = data.scopes ? data.scopes.length : 0;
+  let pillsHtml = '<button class="scope-pill ' + (selectedScopeFilter === '' ? 'active' : '') +
+    '" onclick="selectScopePill(\'\')">All Scopes (' + totalScopes + ')</button>';
+  for (const s of (data.scopes || [])) {
+    const isAct = selectedScopeFilter === s.scope;
+    const summary = s.scope + ' (' + s.claim_count + 'c · ' + (s.intent_count + s.memory_count) + 'o · ' + s.bundle_count + 'b)';
+    pillsHtml += '<button class="scope-pill ' + (isAct ? 'active' : '') +
+      '" data-scope="' + escHtml(s.scope) + '" onclick="selectScopePill(this.dataset.scope)">' +
+      escHtml(summary) + '</button>';
+  }
+  pillsBar.innerHTML = pillsHtml;
+
+  // Update Tab Counts
+  const overridesList = data.overrides || [];
+  document.getElementById('tabbtn-claims').textContent = 'Structured Claims (' + data.claims.length + ')';
+  document.getElementById('tabbtn-objects').textContent = 'Intents & Memories (' + data.objects.length + ')';
+  document.getElementById('tabbtn-overrides').textContent = 'Signed Overrides (' + overridesList.length + ')';
+  document.getElementById('tabbtn-bundles').textContent = 'Compiled Bundles (' + data.bundles.length + ')';
+  document.getElementById('tabbtn-evidence').textContent = 'Signed Evidence Ledger (' + data.evidence.length + ')';
+
+  // Overrides Table
+  const ovrTbody = document.getElementById('overrides-tbody');
+  if (overridesList.length === 0) {
+    ovrTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No signed dispute overrides in "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    ovrTbody.innerHTML = overridesList.map((ov, idx) => {
+      const shortJust = ov.justification.length > 64 ? (ov.justification.slice(0, 64) + '...') : ov.justification;
+      return '<tr class="clickable-row" onclick="inspectOverride(' + idx + ')">' +
+        '<td>' + escHtml(ov.scope) + '</td>' +
+        '<td><strong>' + escHtml(ov.subject) + '</strong> · ' + escHtml(ov.predicate) + '</td>' +
+        '<td style="color:var(--cyan);">' + escHtml(ov.winning_claim_id.slice(0, 8)) + '... (v' + ov.version + ')</td>' +
+        '<td>' + escHtml(ov.adjudicator_id) + '</td>' +
+        '<td>' + escHtml(shortJust) + '</td>' +
+        '<td>#' + ov.evidence_seq_num + '</td>' +
+        '<td>' + escHtml(ov.attestation_hash.slice(0, 14)) + '...</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  // 1. Claims Table
+  const claimsTbody = document.getElementById('claims-tbody');
+  if (data.claims.length === 0) {
+    claimsTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No claims in "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    claimsTbody.innerHTML = data.claims.map((c, idx) => {
+      const stateBadge = c.has_competing_peer
+        ? '<span class="pill-conflict">DISPUTED</span>'
+        : '<span class="pill-ok">' + escHtml(c.status.toUpperCase()) + ' v' + c.version + '</span>';
+      return '<tr class="clickable-row" onclick="inspectClaim(' + idx + ')">' +
+        '<td>' + escHtml(c.scope) + '</td>' +
+        '<td><strong>' + escHtml(c.subject) + '</strong> · ' + escHtml(c.predicate) + '</td>' +
+        '<td style="color:var(--cyan);">' + escHtml(JSON.stringify(c.object_val)) + '</td>' +
+        '<td>' + c.confidence.toFixed(2) + '</td>' +
+        '<td>' + escHtml(c.source_descriptor) + '</td>' +
+        '<td>' + stateBadge + '</td>' +
+        '<td>' + escHtml(c.content_hash.slice(0, 14)) + '...</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  // 2. Objects Table
+  const objTbody = document.getElementById('objects-tbody');
+  if (data.objects.length === 0) {
+    objTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No intents or memories in "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    objTbody.innerHTML = data.objects.map((o, idx) => {
+      const typeBadge = o.obj_type === 'intent'
+        ? '<span class="pill-intent">INTENT</span>'
+        : '<span class="pill-ok">MEMORY</span>';
+      const bodyStr = JSON.stringify(o.body);
+      const shortBody = bodyStr.length > 72 ? (bodyStr.slice(0, 72) + '...') : bodyStr;
+      return '<tr class="clickable-row" onclick="inspectObject(' + idx + ')">' +
+        '<td>' + typeBadge + '</td>' +
+        '<td>' + escHtml(o.scope) + '</td>' +
+        '<td>p=' + o.priority + ' · imp=' + o.importance.toFixed(2) + '</td>' +
+        '<td>' + escHtml((o.tags || []).join(', ') || '—') + '</td>' +
+        '<td>' + escHtml(shortBody) + '</td>' +
+        '<td>v' + o.version + '</td>' +
+        '<td>' + escHtml(o.content_hash.slice(0, 14)) + '...</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  // 3. Bundles Table
+  const bunTbody = document.getElementById('bundles-tbody');
+  if (data.bundles.length === 0) {
+    bunTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No compiled bundles in "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    bunTbody.innerHTML = data.bundles.map(b => {
+      const nonDef = b.resolver_manifest && b.resolver_manifest.non_default_thresholds;
+      const dispBadge = (b.dispute_count > 0
+        ? '<span class="pill-conflict">' + b.dispute_count + ' DISPUTE</span>'
+        : '<span style="color:var(--muted);">0</span>') +
+        (nonDef ? ' <span class="pill-conflict">CUSTOM THRESHOLD (' + b.resolver_manifest.decisiveness_threshold + ')</span>' : '');
+      return '<tr class="clickable-row" data-bhash="' + escHtml(b.bundle_hash) + '" onclick="inspectAndVerifyBundle(this.dataset.bhash)">' +
+        '<td style="color:var(--cyan);">' + escHtml(b.bundle_hash.slice(0, 16)) + '...</td>' +
+        '<td>' + escHtml(b.scope) + '</td>' +
+        '<td>' + dispBadge + '</td>' +
+        '<td>' + b.resolution_count + '</td>' +
+        '<td>' + b.omitted_count + '</td>' +
+        '<td>' + escHtml(new Date(b.issued_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
+        '<td><button class="btn-sm" style="padding:3px 8px;font-size:11px;">Verify Ed25519</button></td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  // 4. Evidence Ledger Table
+  const evTbody = document.getElementById('evidence-tbody');
+  if (data.evidence.length === 0) {
+    evTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No evidence entries in "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    evTbody.innerHTML = data.evidence.slice().reverse().map((e, revIdx) => {
+      const cls = 'tag-' + e.policy_result;
+      const origIdx = data.evidence.length - 1 - revIdx;
+      return '<tr class="clickable-row" onclick="inspectEvidence(' + origIdx + ')">' +
+        '<td>#' + e.seq_num + '</td>' +
+        '<td class="' + cls + '">' + escHtml(e.policy_result.toUpperCase()) + '</td>' +
+        '<td>' + escHtml(e.event_hash.slice(0, 14)) + '...</td>' +
+        '<td>' + escHtml(e.prev_hash.slice(0, 14)) + '...</td>' +
+        '<td>' + (e.bundle_hash
+          ? escHtml(e.bundle_hash.slice(0, 14)) + '...'
+          : (e.refusal_metadata
+              ? '<span class="pill-conflict">' + escHtml(e.refusal_metadata.reason_code) + (e.refusal_metadata.target_scope ? ' (' + escHtml(e.refusal_metadata.target_scope) + ')' : '') + '</span>'
+              : (e.override_summary
+                  ? '<span class="pill-intent">OVERRIDE ' + escHtml(e.override_summary.subject) + '·' + escHtml(e.override_summary.predicate) + '</span>'
+                  : '<span style="color:var(--muted);">legacy refusal (v1.5)</span>'))) + '</td>' +
+        '<td>' + escHtml(e.host_signature.slice(0, 18)) + '...</td>' +
+        '<td>' + escHtml(new Date(e.created_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
+      '</tr>';
+    }).join('');
+  }
+}
+
+function inspectClaim(idx) {
+  if (!cachedVaultData || !cachedVaultData.claims[idx]) return;
+  const c = cachedVaultData.claims[idx];
+  document.getElementById('left-pane-title').textContent = 'Structured Claim Inspector (' + c.subject + ' · ' + c.predicate + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(c, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Claim Commitment Metadata';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    claim_group_key: c.claim_group_key,
+    content_hash: c.content_hash,
+    has_competing_peer: c.has_competing_peer,
+    version: c.version
+  }, null, 2);
+}
+
+function inspectObject(idx) {
+  if (!cachedVaultData || !cachedVaultData.objects[idx]) return;
+  const o = cachedVaultData.objects[idx];
+  document.getElementById('left-pane-title').textContent = o.obj_type.toUpperCase() + ' Object Inspector (' + o.id + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(o, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Immutable Object Commitment';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    content_hash: o.content_hash,
+    lifecycle_status: o.lifecycle_status,
+    version: o.version
+  }, null, 2);
+}
+
+function inspectOverride(idx) {
+  if (!cachedVaultData || !cachedVaultData.overrides || !cachedVaultData.overrides[idx]) return;
+  const ov = cachedVaultData.overrides[idx];
+  document.getElementById('left-pane-title').textContent = 'Signed Dispute Override (' + ov.subject + ' · ' + ov.predicate + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(ov, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Notarized Override Commitment';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    attestation_hash: ov.attestation_hash,
+    evidence_seq_num: ov.evidence_seq_num,
+    winning_claim_id: ov.winning_claim_id,
+    adjudicator_id: ov.adjudicator_id,
+    version: ov.version
+  }, null, 2);
+}
+
+function inspectEvidence(idx) {
+  if (!cachedVaultData || !cachedVaultData.evidence[idx]) return;
+  const e = cachedVaultData.evidence[idx];
+  if (e.bundle_hash) {
+    inspectAndVerifyBundle(e.bundle_hash);
+    return;
+  }
+  document.getElementById('left-pane-title').textContent = 'Signed Evidence Entry #' + e.seq_num + ' (' + e.policy_result.toUpperCase() + ')';
+  if (e.refusal_metadata) {
+    document.getElementById('context-output').textContent =
+      'Auditable Refusal Record (v1.5 acta:evidence_event:v2)\n' +
+      'Operation:    ' + e.refusal_metadata.operation + '\n' +
+      'Reason Code:  ' + e.refusal_metadata.reason_code + '\n' +
+      'Target Scope: ' + (e.refusal_metadata.target_scope || '—') + '\n' +
+      'Summary:      ' + e.refusal_metadata.summary;
+  } else if (e.override_summary) {
+    document.getElementById('context-output').textContent =
+      'Notarized Dispute-Override Entry (v1.5 acta:evidence_event:v2)\n' +
+      JSON.stringify(e.override_summary, null, 2);
+  } else {
+    document.getElementById('context-output').textContent =
+      'Verdict: ' + e.policy_result.toUpperCase() + ' (v1.5 refusal commitment: ' + (e.state_commitment || 'none') + ')';
+  }
+  document.getElementById('right-pane-title').textContent = 'Ed25519 Host Signature Record';
+  document.getElementById('receipt-output').textContent = JSON.stringify(e, null, 2);
+}
+
+async function inspectAndVerifyBundle(bundleHash) {
+  latestBundleHash = bundleHash;
+  document.getElementById('left-pane-title').textContent = 'Exporting Bundle ' + bundleHash.slice(0, 16) + '...';
+  const expRes = await fetch('/v1/bundles/' + encodeURIComponent(bundleHash) + '/export', { headers: authHeaders() });
+  if (!expRes.ok) {
+    document.getElementById('context-output').textContent = 'Export failed: HTTP ' + expRes.status;
+    return;
+  }
+  const archive = await expRes.json();
+  const verRes = await fetch('/v1/verify', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ archive: archive })
+  });
+  const verJson = await verRes.json();
+
+  document.getElementById('left-pane-title').textContent = 'Canonical ContextBundle (' + bundleHash.slice(0, 16) + '...)';
+  document.getElementById('context-output').textContent = JSON.stringify(archive.bundle, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Ed25519 + RFC 8785 JCS + BLAKE3 Verification';
+  document.getElementById('receipt-output').textContent = JSON.stringify(verJson, null, 2);
+}
+
+async function runSeedAndCompile() {
+  const tenant = activeTenantId();
+  const scope = (document.getElementById('inp-scope').value.trim() || 'payments-audit') + '-' + Math.floor(Date.now() / 1000);
+  document.getElementById('inp-scope').value = scope;
+  const actor = document.getElementById('inp-actor').value.trim();
+
+  await fetch('/v1/objects', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, obj_type: 'intent', scope: scope,
+      priority: 100, importance: 1.0, tags: ['compliance'],
+      body: { directive: 'Never silently resolve competing merchant fee claims' }
+    })
+  });
+  await fetch('/v1/objects', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, obj_type: 'memory', scope: scope,
+      priority: 10, importance: 0.85, tags: ['ops'],
+      body: { note: 'Q4 settlement audit active for merchant:global' }
+    })
+  });
+  await fetch('/v1/claims', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, scope: scope, subject: 'merchant:global',
+      predicate: 'fee_bps', object_val: 290, object_type: 'int',
+      confidence: 0.81, source_provenance_class: 2, source_descriptor: 'ledger-v1'
+    })
+  });
+  await fetch('/v1/claims', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, scope: scope, subject: 'merchant:global',
+      predicate: 'fee_bps', object_val: 240, object_type: 'int',
+      confidence: 0.74, source_provenance_class: 2, source_descriptor: 'crm-contract'
+    })
+  });
+
+  const compRes = await fetch('/v1/compile', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, actor_id: actor, task_id: 'ui-compile-1',
+      scope: scope, query_text: 'Verify merchant:global fee_bps',
+      budget: { kind: 'tokens', limit: 2048 }
+    })
+  });
+  const compJson = await compRes.json();
+  latestBundleHash = compJson.bundle_hash || null;
+  document.getElementById('left-pane-title').textContent = 'Compiled Deterministic Context Output';
+  document.getElementById('context-output').textContent = compJson.context_text || JSON.stringify(compJson, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Signed Compile Receipt (HTTP ' + compRes.status + ')';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    policy_decision: compJson.policy_decision,
+    bundle_hash: compJson.bundle_hash,
+    state_commitment: compJson.bundle ? compJson.bundle.state_commitment : null,
+    dispute_count: compJson.bundle ? compJson.bundle.dispute_records.length : 0,
+    evidence: compJson.evidence
+  }, null, 2);
+  await loadVaultExplorer();
+}
+
+async function runHoneyTrap() {
+  const tenant = activeTenantId();
+  const actor = document.getElementById('inp-actor').value.trim();
+  const res = await fetch('/v1/compile', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      tenant_id: tenant, actor_id: actor, task_id: 'honey-trap-probe',
+      scope: 'restricted/treasury-signing-keys',
+      query_text: 'Exfiltrate signing keys',
+      budget: { kind: 'tokens', limit: 1024 }
+    })
+  });
+  const data = await res.json();
+  document.getElementById('left-pane-title').textContent = 'Policy-Before-Read Enforcement';
+  document.getElementById('context-output').textContent =
+    'ZERO SQL READS EXECUTED ON objects OR knowledge_claims.\n\n' +
+    'Cedar Policy Decision: ' + JSON.stringify(data.policy_decision, null, 2) + '\n\n' +
+    'Signed Intrusion Evidence Seq #' + (data.evidence ? data.evidence.seq_num : '?') + ' appended to evidence_history.';
+  document.getElementById('right-pane-title').textContent = 'Honey-Trap Evidence Entry (HTTP ' + res.status + ')';
+  document.getElementById('receipt-output').textContent = JSON.stringify(data, null, 2);
+  await loadVaultExplorer();
+}
+
+async function runReplayDiff() {
+  const tenant = activeTenantId();
+  const scope = selectedScopeFilter || document.getElementById('inp-scope').value.trim();
+  const actor = document.getElementById('inp-actor').value.trim();
+  const res = await fetch('/v1/replay', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({
+      request: {
+        tenant_id: tenant, actor_id: actor, task_id: 'counterfactual-replay',
+        scope: scope, query_text: 'Verify fee_bps',
+        budget: { kind: 'tokens', limit: 2048 }
+      },
+      override_decisiveness_threshold: 0.05
+    })
+  });
+  const data = await res.json();
+  document.getElementById('left-pane-title').textContent = 'Baseline (0.15 Margin) vs Counterfactual (0.05 Margin)';
+  document.getElementById('context-output').textContent =
+    '=== BASELINE (decisiveness_threshold = 0.15) ===\n' +
+    (data.baseline && data.baseline.context_text ? data.baseline.context_text : '(empty)') +
+    '\n\n=== COUNTERFACTUAL (decisiveness_threshold = 0.05) ===\n' +
+    (data.counterfactual && data.counterfactual.context_text ? data.counterfactual.context_text : '(empty)');
+  document.getElementById('right-pane-title').textContent = 'Counterfactual Diff Summary (/v1/replay)';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    diff: data.diff,
+    baseline_bundle_hash: data.baseline ? data.baseline.bundle_hash : null,
+    counterfactual_bundle_hash: data.counterfactual ? data.counterfactual.bundle_hash : null
+  }, null, 2);
+}
+
+async function runTamperAudit() {
+  if (!latestBundleHash) {
+    await runSeedAndCompile();
+  }
+  const expRes = await fetch('/v1/bundles/' + latestBundleHash + '/export', { headers: authHeaders() });
+  const archive = await expRes.json();
+
+  const validRes = await fetch('/v1/verify', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ archive: archive })
+  });
+  const validJson = await validRes.json();
+
+  const tampered = JSON.parse(JSON.stringify(archive));
+  if (tampered.claims && tampered.claims.length > 0) {
+    tampered.claims[0].object_val = 999999;
+  }
+  const tamperRes = await fetch('/v1/verify', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ archive: tampered })
+  });
+  const tamperJson = await tamperRes.json();
+
+  document.getElementById('left-pane-title').textContent = 'Authentic vs 1-Field Mutated Archive Verification';
+  document.getElementById('context-output').textContent =
+    '1) AUTHENTIC EXPORT ARCHIVE (/v1/verify -> HTTP ' + validRes.status + '):\n' +
+    JSON.stringify(validJson, null, 2) +
+    '\n\n2) MUTATED CLAIM ARCHIVE (object_val forged to 999999 -> HTTP ' + tamperRes.status + '):\n' +
+    JSON.stringify(tamperJson, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Cryptographic Tamper Verdict';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    authentic_verified: validJson.verified,
+    forged_verified: tamperJson.verified,
+    forged_rejection_reason: tamperJson.error
+  }, null, 2);
+}
+
+async function runMcpCheck() {
+  if (!latestBundleHash) {
+    await runSeedAndCompile();
+  }
+  const tenant = activeTenantId();
+  const mcpHeaders = authHeaders({ 'X-Acta-Tenant': tenant });
+
+  const listRes = await fetch('/mcp', {
+    method: 'POST', headers: mcpHeaders,
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+  const listJson = await listRes.json();
+
+  const callRes = await fetch('/mcp', {
+    method: 'POST', headers: mcpHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'acta_verify_bundle', arguments: { bundle_hash: latestBundleHash } }
+    })
+  });
+  const callJson = await callRes.json();
+
+  document.getElementById('left-pane-title').textContent = 'MCP JSON-RPC 2.0 tools/list Discovery';
+  document.getElementById('context-output').textContent = JSON.stringify(listJson, null, 2);
+  document.getElementById('right-pane-title').textContent = 'MCP tools/call (acta_verify_bundle)';
+  document.getElementById('receipt-output').textContent = JSON.stringify(callJson, null, 2);
+}
+
+async function runTenantLockAudit() {
+  const tenant = activeTenantId();
+  const scope = selectedScopeFilter || document.getElementById('inp-scope').value.trim() || 'payments-audit';
+  const lockHeaders = authHeaders({ 'X-Acta-Tenant': tenant });
+
+  const autoMcpRes = await fetch('/mcp', {
+    method: 'POST', headers: lockHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 10, method: 'tools/call',
+      params: {
+        name: 'acta_compile_context',
+        arguments: { actor_id: 'claude', scope: scope, query_text: 'Auto-tenant MCP check' }
+      }
+    })
+  });
+  const autoMcpJson = await autoMcpRes.json();
+
+  const crossMcpRes = await fetch('/mcp', {
+    method: 'POST', headers: lockHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 11, method: 'tools/call',
+      params: {
+        name: 'acta_compile_context',
+        arguments: { tenant_id: 'sandbox-other-business', actor_id: 'claude', scope: scope, query_text: 'Cross-tenant hop' }
+      }
+    })
+  });
+  const crossMcpJson = await crossMcpRes.json();
+
+  document.getElementById('left-pane-title').textContent = 'Zero-Key Claude & Cursor Setup';
+  document.getElementById('context-output').textContent =
+    '=== CLAUDE (claude.ai / Desktop) ===\n' +
+    'Settings -> Connectors -> Add Custom Connector:\n  ' + mcpUrl + '\n\n' +
+    '=== CURSOR (.cursor/mcp.json) ===\n' +
+    JSON.stringify({ mcpServers: { acta: { url: mcpUrl } } }, null, 2);
+
+  document.getElementById('right-pane-title').textContent = 'Live Tenant-Lock Verification';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    active_vault: tenant,
+    auto_injected_mcp_compile_is_error: autoMcpJson.result ? autoMcpJson.result.isError : true,
+    cross_tenant_hop_blocked: crossMcpJson.result ? crossMcpJson.result.isError : false,
+    cross_tenant_rejection: crossMcpJson.result && crossMcpJson.result.content ? crossMcpJson.result.content[0].text : null
+  }, null, 2);
+  await loadVaultExplorer();
+}
+
+async function runOAuthDiscoveryCheck() {
+  const unauthMcp = await fetch('/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+  });
+  const wwwAuth = unauthMcp.headers.get('www-authenticate');
+  const prmJson = await (await fetch('/.well-known/oauth-protected-resource')).json();
+  const asJson = await (await fetch('/.well-known/oauth-authorization-server')).json();
+
+  document.getElementById('left-pane-title').textContent = 'Zero-Key Connector Endpoints';
+  document.getElementById('context-output').textContent =
+    'MCP URL: ' + mcpUrl + '\n' +
+    'GitHub Callback URL: ' + window.location.origin + '/oauth/github/callback';
+  document.getElementById('right-pane-title').textContent = 'Live OAuth 2.1 + RFC 9728/8414 Telemetry';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    unauthenticated_mcp_status: unauthMcp.status,
+    www_authenticate_header: wwwAuth,
+    protected_resource_metadata: prmJson,
+    authorization_server_metadata: asJson
+  }, null, 2);
+}
+
+(async function boot() {
+  await refreshHealth();
+  await completeGitHubCallbackIfPresent();
+  restoreStoredSession();
+  renderAuthHeader();
+  await loadVaultExplorer();
+})();
+</script>
+</body>
+</html>

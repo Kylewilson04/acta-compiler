@@ -1,0 +1,16 @@
+[package]
+name = "acta-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+acta-types.workspace = true
+acta-crypto.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

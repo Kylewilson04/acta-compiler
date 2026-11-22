@@ -1,0 +1,9 @@
+target/
+sdks/
+scripts/
+.github/
+.git/
+.env
+*.zip
+*.sh
+*.log

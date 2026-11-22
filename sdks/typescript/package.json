@@ -1,0 +1,33 @@
+{
+  "name": "@acta/sdk",
+  "version": "1.5.0",
+  "description": "Official Zero-Dependency TypeScript/ESM SDK, Tenant-Bound Key Minter, Offline Epistemic Notary Verifier, and Gemini Pre-Prompt Guard for Acta Compiler v1.5",
+  "type": "module",
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node tests/test_sdk.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "@google/genai": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@google/genai": {
+      "optional": true
+    }
+  },
+  "license": "Apache-2.0"
+}
