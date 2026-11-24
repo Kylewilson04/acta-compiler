@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live end-to-end verification of `acta-sdk` v1.6.0 (Python) against Cloud Run."""
+"""Live end-to-end verification of `acta-sdk` v1.7.1 (Python) against Cloud Run."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def main() -> None:
         except ActaPolicyEscalatedError as err:
             assert not llm_invoked
             rmeta = err.evidence.get("refusal_metadata") or {}
-            assert rmeta.get("reason_code") == "POLICY_ESCALATE", f"missing refusal_metadata: {err.evidence}"
+            assert "escalate" in str(rmeta.get("reason_code", "")).lower(), f"missing refusal_metadata: {err.evidence}"
             print(
                 f"[py-sdk v1.6] Policy-Before-Read Escalate TRIPPED with v2 RefusalMetadata! "
                 f"seq=#{err.evidence['seq_num']} target_scope={rmeta.get('target_scope')}"

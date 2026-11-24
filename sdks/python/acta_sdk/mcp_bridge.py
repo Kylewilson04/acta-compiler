@@ -361,6 +361,8 @@ class ActaGitMcpBridge:
                         "confidence": {"type": "number"},
                         "source_provenance_class": {"type": "integer", "default": 2},
                         "source_descriptor": {"type": "string"},
+                        "source_content": {"type": "string"},
+                        "source_commitment_hex": {"type": "string"},
                     },
                 },
             },
@@ -389,6 +391,31 @@ class ActaGitMcpBridge:
                     "properties": {
                         "tree_size": {"type": "integer"},
                         "since_size": {"type": "integer"},
+                    },
+                },
+            },
+            {
+                "name": "acta_register_witness",
+                "description": f"Enrolls a trusted witness Ed25519 public key in trusted_witnesses on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["witness_id", "witness_public_key_hex"],
+                    "properties": {
+                        "witness_id": {"type": "string"},
+                        "witness_public_key_hex": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "acta_revoke_witness",
+                "description": f"Revokes an enrolled witness via append-only witness_revocations on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["witness_id", "reason"],
+                    "properties": {
+                        "witness_id": {"type": "string"},
+                        "reason": {"type": "string"},
                     },
                 },
             },
@@ -520,6 +547,16 @@ class ActaGitMcpBridge:
                 confidence=float(args["confidence"]),
                 source_provenance_class=int(args.get("source_provenance_class", 2)),
                 source_descriptor=str(args["source_descriptor"]),
+                source_commitment_hex=(
+                    str(args["source_commitment_hex"])
+                    if args.get("source_commitment_hex") is not None
+                    else None
+                ),
+                source_content=(
+                    str(args["source_content"])
+                    if args.get("source_content") is not None
+                    else None
+                ),
             )
 
         if name == "acta_attest_override":
@@ -550,6 +587,21 @@ class ActaGitMcpBridge:
             return self.client.get_checkpoint(
                 tree_size=int(args["tree_size"]) if args.get("tree_size") is not None else None,
                 since_size=int(args["since_size"]) if args.get("since_size") is not None else None,
+            )
+
+        if name == "acta_register_witness":
+            return self.client.register_witness(
+                witness_id=str(args["witness_id"]),
+                witness_public_key_hex=str(args["witness_public_key_hex"]),
+                description=(
+                    str(args["description"]) if args.get("description") is not None else None
+                ),
+            )
+
+        if name == "acta_revoke_witness":
+            return self.client.revoke_witness(
+                witness_id=str(args["witness_id"]),
+                reason=str(args["reason"]),
             )
 
         if name == "acta_anchor_checkpoint":
@@ -593,6 +645,8 @@ class ActaGitMcpBridge:
                 "verified_objects": summary.verified_objects,
                 "verified_claims": summary.verified_claims,
                 "verified_overrides": summary.verified_overrides,
+                "verified_writes": summary.verified_writes,
+                "verified_answer_caches": summary.verified_answer_caches,
                 "verified_refusals": summary.verified_refusals,
                 "verified_evidence_entries": summary.verified_evidence_entries,
                 "merkle_tree_size": summary.merkle_tree_size,
@@ -605,8 +659,67 @@ class ActaGitMcpBridge:
                 out["preimages"] = dump_archive_preimages(archive)
             return out
 
+        if name == "acta_retract_claim":
+            return self.client.retract_claim(
+                claim_id=str(args["claim_id"]),
+                reason=str(args["reason"]),
+                client_signature_hex=(
+                    str(args["client_signature_hex"])
+                    if args.get("client_signature_hex") is not None
+                    else None
+                ),
+                client_public_key_hex=(
+                    str(args["client_public_key_hex"])
+                    if args.get("client_public_key_hex") is not None
+                    else None
+                ),
+            )
+
+        if name == "acta_cache_answer":
+            return self.client.cache_answer(
+                source_bundle_hash=str(args["source_bundle_hash"]),
+                answer_text=str(args["answer_text"]),
+                query_text=str(args.get("query_text") or ""),
+                scope=str(args["scope"]) if args.get("scope") is not None else None,
+                task_id=str(args["task_id"]) if args.get("task_id") is not None else None,
+                ttl_seconds=int(args["ttl_seconds"]) if args.get("ttl_seconds") is not None else None,
+                validity_mode=str(args["validity_mode"]) if args.get("validity_mode") is not None else None,
+                dependency_ids=list(args["dependency_ids"]) if args.get("dependency_ids") is not None else None,
+                client_signature_hex=(
+                    str(args["client_signature_hex"])
+                    if args.get("client_signature_hex") is not None
+                    else None
+                ),
+                client_public_key_hex=(
+                    str(args["client_public_key_hex"])
+                    if args.get("client_public_key_hex") is not None
+                    else None
+                ),
+            )
+
+        if name == "acta_lookup_cached_answer":
+            return self.client.lookup_cached_answer(
+                scope=scope,
+                task_id=str(args.get("task_id") or "mcp-task"),
+                query_text=str(args.get("query_text") or ""),
+                actor_id=actor_raw,
+            )
+
+        if name == "acta_trace_claim_impact":
+            return self.client.trace_item_impact(str(args["item_id"]))
+
+        if name == "acta_verify_state_rebuild":
+            return self.client.rebuild_scope_state(
+                scope,
+                up_to_seq=int(args["up_to_seq"]) if args.get("up_to_seq") is not None else None,
+                include_proof_archive=bool(args.get("include_proof_archive", False)),
+            )
+
         if name == "acta_list_evidence":
-            return self.client.list_tenant_evidence()
+            return self.client.list_tenant_evidence(
+                from_seq=int(args["from_seq"]) if args.get("from_seq") is not None else None,
+                limit=int(args["limit"]) if args.get("limit") is not None else None,
+            )
 
         raise ValueError(f"unknown MCP tool: {name}")
 
@@ -632,7 +745,7 @@ class ActaGitMcpBridge:
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "acta-mcp-git-bridge",
-                        "version": "1.6.0",
+                        "version": "1.7.1",
                     },
                 },
             }

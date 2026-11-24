@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use acta_engine::{CompileSimulation, ResolverConfig};
+use acta_engine::{compute_resolution_changed, CompileSimulation, ResolverConfig};
 use acta_policy::PolicyGate;
 use acta_types::{
     validate_budget, validate_identifier, validate_query_text, validate_scope, CompileRequest,
@@ -39,6 +39,10 @@ pub struct ReplayBranchSummary {
     pub resolution_count: usize,
     pub dispute_count: usize,
     pub omitted_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_facts_omitted: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_token_count: Option<usize>,
     pub context_text: Option<String>,
 }
 
@@ -52,6 +56,7 @@ impl From<CompileSimulation> for ReplayBranchSummary {
             resolution_count,
             dispute_count,
             omitted_count,
+            resolved_facts_omitted,
         ) = match &sim.bundle {
             Some(b) => (
                 Some(hex::encode(b.state_commitment)),
@@ -61,8 +66,9 @@ impl From<CompileSimulation> for ReplayBranchSummary {
                 b.resolution_records.len(),
                 b.dispute_records.len(),
                 b.omission_record.total_omitted_count,
+                b.resolved_facts_omitted,
             ),
-            None => (None, None, None, 0, 0, 0, 0),
+            None => (None, None, None, 0, 0, 0, 0, None),
         };
 
         Self {
@@ -76,6 +82,8 @@ impl From<CompileSimulation> for ReplayBranchSummary {
             resolution_count,
             dispute_count,
             omitted_count,
+            resolved_facts_omitted,
+            context_token_count: sim.context_token_count,
             context_text: sim.context_text,
         }
     }
@@ -85,6 +93,7 @@ impl From<CompileSimulation> for ReplayBranchSummary {
 pub struct ReplayDiff {
     pub bundle_hash_changed: bool,
     pub state_commitment_changed: bool,
+    pub resolution_changed: bool,
     pub policy_decision_changed: bool,
     pub dispute_delta: isize,
     pub resolution_delta: isize,
@@ -178,6 +187,7 @@ pub async fn handle_replay(
             .simulate_compile(cf_req, custom_gate.as_ref(), Some(cf_resolver)),
     )?;
 
+    let resolution_changed = compute_resolution_changed(&base_sim, &cf_sim);
     let baseline = ReplayBranchSummary::from(base_sim);
     let counterfactual = ReplayBranchSummary::from(cf_sim);
 
@@ -210,6 +220,7 @@ pub async fn handle_replay(
     let diff = ReplayDiff {
         bundle_hash_changed: baseline.bundle_hash != counterfactual.bundle_hash,
         state_commitment_changed: baseline.state_commitment != counterfactual.state_commitment,
+        resolution_changed,
         policy_decision_changed: baseline.policy_decision != counterfactual.policy_decision,
         dispute_delta: counterfactual.dispute_count as isize - baseline.dispute_count as isize,
         resolution_delta: counterfactual.resolution_count as isize

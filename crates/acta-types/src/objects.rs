@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::serde_hex::{hex_32, opt_hex_vec};
+use crate::serde_hex::{hex_32, opt_hex_32, opt_hex_vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +77,12 @@ pub struct StoredObject {
     pub predecessor_id: Option<Uuid>,
     #[serde(default, with = "opt_hex_vec", skip_serializing_if = "Option::is_none")]
     pub client_signature: Option<Vec<u8>>,
+    #[serde(default, with = "opt_hex_32", skip_serializing_if = "Option::is_none")]
+    pub client_public_key: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_seq_num: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -145,5 +151,17 @@ pub struct IngestObjectResponse {
     pub id: Uuid,
     pub version: i32,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_seq_num: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_event_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_public_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
     pub created_at: DateTime<Utc>,
 }

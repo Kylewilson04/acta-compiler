@@ -1072,8 +1072,23 @@ pub async fn handle_key_login(State(state): State<AppState>, body: Bytes) -> Res
         if let Err(e) = state.check_master_admin_auth(&h) {
             return render_oauth_error_html(StatusCode::UNAUTHORIZED, "Invalid Master Key", &e);
         }
+        let requested_principal = form.get("principal").map(|s| s.trim()).unwrap_or("");
+        let opt_principal = if requested_principal.is_empty() {
+            None
+        } else {
+            match normalize_github_slug(requested_principal) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return render_oauth_error_html(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid Principal Slug",
+                        "Optional principal slug must contain only lowercase letters, digits, or hyphens.",
+                    );
+                }
+            }
+        };
         match normalize_github_slug(requested_tenant) {
-            Ok(slug) => (slug, None),
+            Ok(slug) => (slug, opt_principal),
             Err(_) => {
                 return render_oauth_error_html(
                     StatusCode::BAD_REQUEST,
@@ -1481,7 +1496,7 @@ fn render_authorize_signin_html(
 </head>
 <body>
   <div class="card">
-    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256 · v1.6.0</span>
+    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256 · v1.7.1</span>
     <h1>Connect {client_esc}</h1>
     <p class="sub">Sign in with GitHub to cryptographically bind <strong>{client_esc}</strong> to your GitHub Organization vault and OAuth principal.</p>
     {github_section}

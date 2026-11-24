@@ -31,6 +31,7 @@ export interface RefusalMetadata {
   target_scope?: string | null;
   summary: string;
   scope_state_commitment?: string | null;
+  attempted_checkpoint_hash?: string | null;
 }
 
 export interface OverrideLedgerSummary {
@@ -84,9 +85,30 @@ export interface PolicyDecision {
   reason?: string;
 }
 
+export interface WitnessRegistrationSummary {
+  witness_id: string;
+  public_key: string;
+  registered_by: string;
+  description?: string | null;
+  registration_domain: string;
+  registration_blake3_preimage_hex: string;
+}
+
+export interface WitnessRevocationSummary {
+  witness_id: string;
+  public_key: string;
+  revoked_by: string;
+  revocation_mode?: "compromise" | "retire";
+  effective_from_tree_size?: number | null;
+  reason: string;
+  revocation_domain: string;
+  revocation_blake3_preimage_hex: string;
+}
+
 export interface EvidenceEntry {
   tenant_id: string;
   seq_num: number;
+  event_domain?: string | null;
   prev_hash: string;
   event_hash: string;
   bundle_hash?: string | null;
@@ -94,6 +116,10 @@ export interface EvidenceEntry {
   policy_result: PolicyResultTag;
   refusal_metadata?: RefusalMetadata | null;
   override_summary?: OverrideLedgerSummary | null;
+  write_summary?: Record<string, any> | null;
+  answer_cache_summary?: Record<string, any> | null;
+  witness_reg_summary?: WitnessRegistrationSummary | null;
+  witness_revoke_summary?: WitnessRevocationSummary | null;
   host_signature: string;
   created_at: string;
 }
@@ -105,11 +131,15 @@ export interface VerificationSummary {
   verified_objects: number;
   verified_claims: number;
   verified_overrides: number;
+  verified_writes: number;
+  verified_answer_caches: number;
   verified_refusals: number;
   verified_evidence_entries: number;
   verification_mode: "full_chain" | "merkle_inclusion" | "full_chain_and_merkle";
   merkle_tree_size: number | null;
   merkle_root_hex: string | null;
+  anchored_tree_size?: number | null;
+  anchored_merkle_root_hex?: string | null;
   verified_witness_anchors: number;
   non_default_thresholds: boolean;
   resolver_manifest: ResolverManifest | null;
@@ -120,6 +150,9 @@ export interface CompileResult {
   policyDecision: PolicyDecision;
   bundleHash: string | null;
   contextText: string | null;
+  contextTokenCount?: number | null;
+  contextTokenIds?: number[] | null;
+  contextTokenBytesHex?: string[] | null;
   bundle: Record<string, any> | null;
   evidence: EvidenceEntry;
   verifiedHostPubkey: string;
@@ -145,7 +178,57 @@ export declare class Blake3Hasher {
 
 export declare function toCanonicalJson(value: unknown): string;
 export declare function toCanonicalBytes(value: unknown): Uint8Array;
+export declare function encodeLengthDelimited(parts: Array<Uint8Array | string>): Uint8Array;
 export declare function hashLengthDelimited(parts: Array<Uint8Array | string>): Uint8Array;
+export declare function computeSourceContentCommitment(sourceDescriptor: string, sourceContent: string | Uint8Array): string;
+export declare function witnessRegistrationPreimageBytes(
+  regDomain: string,
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  registeredBy?: string,
+  description?: string | null
+): Uint8Array;
+export declare function computeWitnessRegistrationCommitment(tenantId: string, witnessId: string, publicKeyHexOrBytes: string | Uint8Array): string;
+export declare function computeWitnessRegistrationV2Commitment(
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  registeredBy: string
+): { preimageHex: string; commitmentHex: string };
+export declare function computeWitnessRegistrationV3Commitment(
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  registeredBy: string,
+  description?: string | null
+): { preimageHex: string; commitmentHex: string };
+export declare function witnessRevocationPreimageBytes(
+  revokeDomain: string,
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  revokedBy: string,
+  reason: string,
+  revocationMode?: "compromise" | "retire",
+  effectiveFromTreeSize?: number | bigint | null
+): Uint8Array;
+export declare function computeWitnessRevocationCommitment(
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  revokedBy: string,
+  reason: string
+): { preimageHex: string; commitmentHex: string };
+export declare function computeWitnessRevocationV2Commitment(
+  tenantId: string,
+  witnessId: string,
+  publicKeyHexOrBytes: string | Uint8Array,
+  revokedBy: string,
+  revocationMode: "compromise" | "retire",
+  effectiveFromTreeSize: number | bigint | null,
+  reason: string
+): { preimageHex: string; commitmentHex: string };
 export declare function blake3KeyedHash(key32: Uint8Array, parts: Array<Uint8Array | string>): Uint8Array;
 export declare function normalizeGithubSlug(raw: string): string;
 export declare function deriveTenantMacKey(masterApiKey: string): Uint8Array;
@@ -173,7 +256,10 @@ export declare function computeLogicalClaimGroupKey(
   scope: string
 ): string;
 export declare function computeRefusalMetadataCommitment(meta: RefusalMetadata): string;
+export declare function objectContentPreimageBytes(obj: Record<string, any>): Uint8Array;
 export declare function computeObjectContentHash(obj: Record<string, any>): string;
+export declare function claimGroupPreimageBytes(claim: Record<string, any>): { domain: string; preimageBytes: Uint8Array };
+export declare function claimContentPreimageBytes(claim: Record<string, any>): Uint8Array;
 export declare function computeClaimContentHash(claim: Record<string, any>): string;
 export declare function computeOverrideClientIntentHash(params: {
   tenantId: string;
@@ -206,6 +292,11 @@ export declare function computeEvidenceEventHash(params: {
   refusalMetadata?: RefusalMetadata | null;
   overrideSummary?: OverrideLedgerSummary | null;
 }): string;
+export declare function legacyBlake3MerkleEmptyRoot(): string;
+export declare function legacyBlake3MerkleLeafHash(seqNum: number | bigint, eventHash: string | Uint8Array): string;
+export declare function legacyBlake3MerkleNodeHash(left: string | Uint8Array, right: string | Uint8Array): string;
+export declare function computeLegacyBlake3MerkleRootFromLeaves(leaves: Array<string | Uint8Array>): string;
+export declare function computeLegacyBlake3MerkleRootFromEvents(events: Array<[number | bigint, string | Uint8Array]>): string;
 export declare function merkleEmptyRoot(): string;
 export declare function merkleLeafHash(seqNum: number | bigint, eventHash: string | Uint8Array): string;
 export declare function merkleNodeHash(left: string | Uint8Array, right: string | Uint8Array): string;
@@ -367,6 +458,7 @@ export declare class ActaClient {
     sourceDescriptor: string;
     sourceProvenanceClass?: number;
     sourceCommitmentHex?: string;
+    sourceContent?: string;
     status?: LifecycleStatus;
     contradictionIds?: string[];
     validFrom?: string;
@@ -387,6 +479,20 @@ export declare class ActaClient {
   }): Promise<Record<string, any>>;
   listOverrides(params?: { tenantId?: string; scope?: string }): Promise<Record<string, any>>;
   getCheckpoint(params?: { tenantId?: string; treeSize?: number; sinceSize?: number }): Promise<Record<string, any>>;
+  registerWitness(req: {
+    tenantId?: string;
+    witnessId: string;
+    witnessPublicKeyHex: string;
+    description?: string;
+  }): Promise<Record<string, any>>;
+  revokeWitness(req: {
+    tenantId?: string;
+    witnessId: string;
+    mode?: "compromise" | "retire";
+    revocationMode?: "compromise" | "retire";
+    reason: string;
+  }): Promise<Record<string, any>>;
+  listWitnesses(params?: { tenantId?: string }): Promise<Record<string, any>>;
   anchorCheckpoint(req: {
     tenantId?: string;
     treeSize: number;
@@ -455,3 +561,42 @@ export declare class ActaGeminiGuard {
     llmCallable?: (fullPrompt: string, compiled: CompileResult) => Promise<T> | T;
   }): Promise<GuardedGenerationResult<T>>;
 }
+
+export declare function computeObjectClientIntentHash(params: Record<string, any>): string;
+export declare function signObjectClientIntent(seedHexOrBytes: string | Uint8Array, params: Record<string, any>): { clientSignatureHex: string; clientPublicKeyHex: string };
+export declare function computeClaimClientIntentHash(params: Record<string, any>): string;
+export declare function signClaimClientIntent(seedHexOrBytes: string | Uint8Array, params: Record<string, any>): { clientSignatureHex: string; clientPublicKeyHex: string };
+export declare function computeRetractClaimClientIntentHash(params: { tenantId: string; claimId: string; reason: string }): string;
+export declare function signRetractClaimClientIntent(seedHexOrBytes: string | Uint8Array, params: { tenantId: string; claimId: string; reason: string }): { clientSignatureHex: string; clientPublicKeyHex: string };
+export declare function computeQueryTextHash(queryText: string): string;
+export declare function computeAnswerTextHash(answerText: string): string;
+export declare function computeAnswerCacheClientIntentHash(params: Record<string, any>): string;
+export declare function computeWriteSummaryCommitment(ws: Record<string, any>): string;
+export declare function computeAnswerCacheSummaryCommitment(acs: Record<string, any>): string;
+export declare function verifyAnswerCacheSignature(pubkeyHexOrBytes: string | Uint8Array, tenantId: string, evidenceSeqNum: number | bigint, cacheCommitment: string | Uint8Array, sigHexOrBytes: string | Uint8Array): boolean;
+
+export declare const SCHEMA_VERSION: string;
+export declare const STATE_REBUILD_ARCHIVE_SCHEMA_V1: string;
+export declare function computeSubCommitment(hashes: Array<string | Uint8Array>): string;
+export declare function computeStateCommitment(params: {
+  schemaVersion?: string;
+  tenantId: string;
+  scope: string;
+  intentRoot: string | Uint8Array;
+  knowledgeRoot: string | Uint8Array;
+  memoryRoot: string | Uint8Array;
+  permissionRoot: string | Uint8Array;
+}): string;
+export declare function computeTaskDependencyCommitment(params: {
+  tenantId: string;
+  scope: string;
+  permissionRoot: string | Uint8Array;
+  intentRoot: string | Uint8Array;
+  selectedMemoryRoot: string | Uint8Array;
+  relevantKnowledgeRoot: string | Uint8Array;
+}): string;
+export declare function verifyAndRebuildScopeStateOffline(
+  archiveOrResponse: Record<string, any>,
+  expectedPubkeyHex: string,
+  scopeOverride?: string
+): Record<string, any>;

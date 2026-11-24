@@ -7,10 +7,17 @@ fn is_safe_unquoted_atom_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '/' | '@' | '-')
 }
 
+/// Returns `true` for Unicode Line/Paragraph Separators (`U+2028`, `U+2029`), C0 controls
+/// (`U+0000..=U+001F`), and DEL + C1 controls (`U+007F..=U+009F`, including `U+0085` NEL).
+pub fn is_line_or_control_char(c: char) -> bool {
+    let code = c as u32;
+    code <= 0x1F || (0x7F..=0x9F).contains(&code) || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// Sanitizes any untrusted metadata string (`subject`, `predicate`, `source_descriptor`, `scope`,
 /// `object_type`, `tags`, `adjudicator_id`, `justification`) at compile time so stored records
-/// containing newlines, control characters, quotes, `=`, or `[` / `]` can NEVER break out onto a
-/// new line or forge `[FACT ...]` / `[DISPUTE ...]` markers.
+/// containing newlines, Unicode line breaks, C0/C1 controls, quotes, `=`, or `[` / `]` can NEVER
+/// break out onto a new line or forge `[FACT ...]` / `[DISPUTE ...]` / `[INTENT ...]` / `[MEMORY ...]` markers.
 pub fn sanitize_header_atom(raw: &str) -> String {
     if !raw.is_empty() && raw.chars().all(is_safe_unquoted_atom_char) {
         return raw.to_string();
@@ -27,7 +34,9 @@ pub fn sanitize_header_atom(raw: &str) -> String {
             '\t' => out.push_str("\\t"),
             '[' => out.push_str("\\u005b"),
             ']' => out.push_str("\\u005d"),
-            c if c.is_control() => {
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if is_line_or_control_char(c) => {
                 let _ = write!(&mut out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
@@ -47,16 +56,69 @@ fn truncate_chars_with_ellipsis(raw: &str, max_chars: usize) -> String {
     }
 }
 
+/// Escapes `[` (`\u005b`), `]` (`\u005d`), `U+2028` (`\u2028`), `U+2029` (`\u2029`), and all
+/// C0/C1 control characters (`U+0000..=U+001F`, `U+007F..=U+009F`) inside canonical JSON strings
+/// (`v1.6.7+`) while keeping rendered JSON 100% RFC 8259-valid and leaving stored JCS hashes untouched.
+fn escape_rendered_json_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for ch in raw.chars() {
+        if in_string {
+            if prev_backslash {
+                prev_backslash = false;
+                if is_line_or_control_char(ch) {
+                    let _ = write!(&mut out, "u{:04x}", ch as u32);
+                } else {
+                    out.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    prev_backslash = true;
+                    out.push('\\');
+                }
+                '"' => {
+                    in_string = false;
+                    out.push('"');
+                }
+                '[' => out.push_str("\\u005b"),
+                ']' => out.push_str("\\u005d"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                c if is_line_or_control_char(c) => {
+                    let _ = write!(&mut out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        } else {
+            match ch {
+                '"' => {
+                    in_string = true;
+                    out.push('"');
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                c if is_line_or_control_char(c) => {
+                    let _ = write!(&mut out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+    }
+    out
+}
+
 fn canonical_single_line_json(val: &serde_json::Value) -> String {
     let raw = to_canonical_bytes(val)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| serde_json::to_string(val).unwrap_or_else(|_| "null".to_string()));
-    if raw.contains('\n') || raw.contains('\r') {
-        raw.replace('\r', "\\r").replace('\n', "\\n")
-    } else {
-        raw
-    }
+    escape_rendered_json_text(&raw)
 }
 
 /// Formats a single Intent entry deterministically in full form.
@@ -191,12 +253,21 @@ pub fn format_resolution_compact(res: &ResolutionRecord) -> Option<String> {
 pub fn format_dispute_entry(dispute: &DisputeRecord) -> String {
     let mut lines = Vec::with_capacity(dispute.competing_claims.len() + 4);
     lines.push(format!("[DISPUTE: {}]", dispute.reason_code.as_str()));
-    lines.push(format!(
-        "claim_group_key={} candidates={} escalation_required={}",
-        hex::encode(dispute.claim_group_key),
-        dispute.competing_claims.len(),
-        dispute.escalation_required
-    ));
+    match dispute.margin {
+        Some(m) => lines.push(format!(
+            "claim_group_key={} candidates={} margin={:.4} escalation_required={}",
+            hex::encode(dispute.claim_group_key),
+            dispute.competing_claims.len(),
+            m,
+            dispute.escalation_required
+        )),
+        None => lines.push(format!(
+            "claim_group_key={} candidates={} escalation_required={}",
+            hex::encode(dispute.claim_group_key),
+            dispute.competing_claims.len(),
+            dispute.escalation_required
+        )),
+    }
 
     if let Some(ref lapsed) = dispute.lapsed_override {
         let ovr_short = &lapsed.attestation_id.simple().to_string()[..8];
@@ -413,6 +484,7 @@ mod tests {
         let disp_block = format_dispute_entry(&DisputeRecord {
             claim_group_key: [0x33; 32],
             competing_claims: vec![cand],
+            margin: Some(0.0),
             reason_code: DisputeReasonCode::InsufficientMargin,
             escalation_required: true,
             lapsed_override: None,

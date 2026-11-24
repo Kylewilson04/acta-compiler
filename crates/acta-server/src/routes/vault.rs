@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use acta_store::{evidence_repo, overrides_repo};
 use acta_types::{
-    ContextBundle, EvidenceEntry, ExternalWitnessAnchor, ResolverManifest, SignedTreeHead,
+    ContextBundle, EvidenceEntry, ExternalWitnessAnchor, QuarantinedAnchorRecord,
+    ResolverManifest, SignedTreeHead, TrustedWitness,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -145,12 +146,15 @@ pub struct VaultOverrideItem {
     pub winning_claim_id: Uuid,
     pub overridden_count: usize,
     pub adjudicator_id: String,
+    pub adjudicator_auth_kind: String,
+    pub attestation_domain: String,
     pub justification: String,
     pub version: i32,
     pub attestation_hash: String,
     pub evidence_seq_num: i64,
     pub has_client_signature: bool,
     pub is_superseded: bool,
+    pub is_lapsed: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -164,6 +168,10 @@ pub struct TenantVaultResponse {
     pub latest_checkpoint: Option<SignedTreeHead>,
     #[serde(default)]
     pub witness_anchors: Vec<ExternalWitnessAnchor>,
+    #[serde(default)]
+    pub trusted_witnesses: Vec<TrustedWitness>,
+    #[serde(default)]
+    pub quarantined_anchors: Vec<QuarantinedAnchorRecord>,
     pub scopes: Vec<VaultScopeSummary>,
     pub claims: Vec<VaultClaimItem>,
     pub objects: Vec<VaultObjectItem>,
@@ -314,7 +322,7 @@ pub async fn handle_tenant_vault(
     .bind(clean_tenant)
     .fetch_all(&state.pool);
 
-    let overrides_fut = overrides_repo::fetch_tenant_overrides(
+    let overrides_fut = overrides_repo::fetch_tenant_overrides_classified(
         &state.pool,
         clean_tenant,
         scope_filter.as_deref(),
@@ -327,6 +335,9 @@ pub async fn handle_tenant_vault(
         None,
     );
     let anchors_fut = evidence_repo::fetch_recent_witness_anchors(&state.pool, clean_tenant);
+    let witnesses_fut = evidence_repo::fetch_tenant_trusted_witnesses(&state.pool, clean_tenant);
+    let quarantined_fut =
+        evidence_repo::fetch_quarantined_witness_anchors(&state.pool, clean_tenant);
 
     let (
         scopes_res,
@@ -337,6 +348,8 @@ pub async fn handle_tenant_vault(
         evidence_res,
         cp_res,
         anchors_res,
+        witnesses_res,
+        quarantined_res,
     ) = tokio::join!(
         scopes_fut,
         claims_fut,
@@ -346,6 +359,8 @@ pub async fn handle_tenant_vault(
         evidence_fut,
         cp_fut,
         anchors_fut,
+        witnesses_fut,
+        quarantined_fut,
     );
 
     let scopes = scopes_res
@@ -360,6 +375,8 @@ pub async fn handle_tenant_vault(
     let evidence = evidence_res?;
     let latest_checkpoint = cp_res?.map(|(sth, _)| sth);
     let witness_anchors = anchors_res?;
+    let trusted_witnesses = witnesses_res?;
+    let quarantined_anchors = quarantined_res?;
 
     let mut distinct_vals_by_slot: HashMap<(String, String, String), Vec<String>> = HashMap::new();
     let mut seen_source_head: HashMap<(String, String, String, String), ()> = HashMap::new();
@@ -435,21 +452,28 @@ pub async fn handle_tenant_vault(
 
     let overrides = override_pairs
         .into_iter()
-        .map(|(a, is_sup)| VaultOverrideItem {
-            id: a.id,
-            scope: a.scope,
-            subject: a.subject,
-            predicate: a.predicate,
-            winning_claim_id: a.winning_claim_id,
-            overridden_count: a.overridden_claims.len(),
-            adjudicator_id: a.adjudicator_id,
-            justification: a.justification,
+        .map(|(a, state_kind)| {
+            let auth_kind = a.effective_auth_kind().to_string();
+            let att_domain = a.effective_domain().to_string();
+            VaultOverrideItem {
+                id: a.id,
+                scope: a.scope,
+                subject: a.subject,
+                predicate: a.predicate,
+                winning_claim_id: a.winning_claim_id,
+                overridden_count: a.overridden_claims.len(),
+                adjudicator_id: a.adjudicator_id,
+                adjudicator_auth_kind: auth_kind,
+                attestation_domain: att_domain,
+                justification: a.justification,
             version: a.version,
             attestation_hash: hex::encode(a.attestation_hash),
             evidence_seq_num: a.evidence_seq_num,
             has_client_signature: a.client_signature.is_some(),
-            is_superseded: is_sup,
-            created_at: a.created_at,
+                is_superseded: state_kind == overrides_repo::OverrideStateKind::Superseded,
+                is_lapsed: state_kind == overrides_repo::OverrideStateKind::Lapsed,
+                created_at: a.created_at,
+            }
         })
         .collect();
 
@@ -490,6 +514,8 @@ pub async fn handle_tenant_vault(
         permission_root: hex::encode(state.policy_gate.permission_root()),
         latest_checkpoint,
         witness_anchors,
+        trusted_witnesses,
+        quarantined_anchors,
         scopes,
         claims,
         objects,

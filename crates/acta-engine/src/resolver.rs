@@ -156,6 +156,33 @@ fn compare_claims_desc(a: &KnowledgeClaim, b: &KnowledgeClaim) -> std::cmp::Orde
         .then_with(|| a.id.cmp(&b.id))
 }
 
+fn compute_dispute_margin_from_claims(claims: &[KnowledgeClaim]) -> f64 {
+    let mut bucket_map: BTreeMap<(ValueTypeFamily, Vec<u8>), Vec<KnowledgeClaim>> = BTreeMap::new();
+    for c in claims {
+        let (tf, jcs) = typed_value_signature(c);
+        bucket_map.entry((tf, jcs)).or_default().push(c.clone());
+    }
+    let mut buckets: Vec<ValueBucket> = bucket_map
+        .into_iter()
+        .map(|((tf, _), mut b_claims)| {
+            b_claims.sort_by(compare_claims_desc);
+            ValueBucket::from_sorted_claims(tf, b_claims)
+        })
+        .collect();
+    buckets.sort_by(|a, b| {
+        b.effective_confidence
+            .total_cmp(&a.effective_confidence)
+            .then_with(|| b.max_provenance.cmp(&a.max_provenance))
+            .then_with(|| b.claims.len().cmp(&a.claims.len()))
+            .then_with(|| compare_claims_desc(&a.claims[0], &b.claims[0]))
+    });
+    if buckets.len() >= 2 {
+        round_9(buckets[0].effective_confidence - buckets[1].effective_confidence)
+    } else {
+        0.0
+    }
+}
+
 enum OverrideEvalOutcome {
     Applied(ResolutionRecord),
     Lapsed(LapsedOverrideRef),
@@ -281,6 +308,39 @@ pub fn resolve_claims_with_overrides(
     now: DateTime<Utc>,
     config: &ResolverConfig,
 ) -> ResolverOutput {
+    resolve_claims_with_overrides_v171_compat(claims, overrides, now, config, false, false)
+}
+
+/// Same as `resolve_claims_with_overrides`, with `legacy_pre_v166_disputes` compatibility mode.
+pub fn resolve_claims_with_overrides_compat(
+    claims: Vec<KnowledgeClaim>,
+    overrides: &[OverrideAttestation],
+    now: DateTime<Utc>,
+    config: &ResolverConfig,
+    legacy_pre_v166_disputes: bool,
+) -> ResolverOutput {
+    resolve_claims_with_overrides_v171_compat(
+        claims,
+        overrides,
+        now,
+        config,
+        legacy_pre_v166_disputes,
+        false,
+    )
+}
+
+/// Full resolver entry point supporting historical `source_bundle_hash` replay compatibility:
+/// - `legacy_pre_v166_disputes`: omits `DisputeRecord.margin` and encodes reopened overrides as `INSUFFICIENT_MARGIN`.
+/// - `legacy_pre_v171_resolver`: reproduces pre-`v1.7.1` pre-bucket `min_confidence` filtering and
+///   `LifecycleExpired` on `status == Revoked` tombstones for historical bundles (`seq 1..head`).
+pub fn resolve_claims_with_overrides_v171_compat(
+    claims: Vec<KnowledgeClaim>,
+    overrides: &[OverrideAttestation],
+    now: DateTime<Utc>,
+    config: &ResolverConfig,
+    legacy_pre_v166_disputes: bool,
+    legacy_pre_v171_resolver: bool,
+) -> ResolverOutput {
     let mut active_claims = Vec::with_capacity(claims.len());
     let mut excluded_claims = Vec::new();
     let mut inactive_ids = BTreeSet::new();
@@ -309,16 +369,22 @@ pub fn resolve_claims_with_overrides(
 
         if claim.status != ClaimStatus::Active || !within_from || !within_to {
             inactive_ids.insert(claim.id);
-            excluded_claims.push((claim.id, OmissionReason::LifecycleExpired));
+            let reason = if !legacy_pre_v171_resolver && claim.status == ClaimStatus::Revoked {
+                OmissionReason::RetractionTombstone
+            } else {
+                OmissionReason::LifecycleExpired
+            };
+            excluded_claims.push((claim.id, reason));
         } else {
             active_claims.push(claim);
         }
     }
 
+    let active_id_set: BTreeSet<Uuid> = active_claims.iter().map(|c| c.id).collect();
     let mut contradicted_active_ids = BTreeSet::new();
     for c in &active_claims {
         for target_id in &c.contradiction_ids {
-            if !inactive_ids.contains(target_id) {
+            if active_id_set.contains(target_id) {
                 contradicted_active_ids.insert(c.id);
                 contradicted_active_ids.insert(*target_id);
             }
@@ -412,10 +478,16 @@ pub fn resolve_claims_with_overrides(
         // NEVER let the unseen claim auto-resolve silently over a previously human-adjudicated group!
         // Any group with a `lapsed_override` MUST surface as an explicit `[DISPUTE]` for human review.
         if group.iter().any(|c| contradicted_active_ids.contains(&c.id)) {
+            let disp_margin = if legacy_pre_v166_disputes {
+                None
+            } else {
+                Some(compute_dispute_margin_from_claims(&group))
+            };
             let competing_claims = group.iter().map(ClaimCandidate::from).collect();
             disputes.push(DisputeRecord {
                 claim_group_key: record_group_key,
                 competing_claims,
+                margin: disp_margin,
                 reason_code: DisputeReasonCode::BlockingContradiction,
                 escalation_required: true,
                 lapsed_override,
@@ -423,57 +495,131 @@ pub fn resolve_claims_with_overrides(
             continue;
         }
 
-        let mut qualifying = Vec::new();
-        let mut sub_threshold = Vec::new();
-        for c in group {
-            if c.confidence + FLOAT_EPS >= config.min_confidence {
-                qualifying.push(c);
-            } else {
-                sub_threshold.push(c);
+        let (buckets, sub_threshold, sub_lead_eff): (
+            Vec<ValueBucket>,
+            Vec<KnowledgeClaim>,
+            Option<f64>,
+        ) = if legacy_pre_v171_resolver {
+            let mut qualifying = Vec::new();
+            let mut sub = Vec::new();
+            for c in group {
+                if c.confidence + FLOAT_EPS >= config.min_confidence {
+                    qualifying.push(c);
+                } else {
+                    sub.push(c);
+                }
             }
-        }
-
-        if qualifying.is_empty() {
-            let competing_claims = sub_threshold.iter().map(ClaimCandidate::from).collect();
-            disputes.push(DisputeRecord {
-                claim_group_key: record_group_key,
-                competing_claims,
-                reason_code: DisputeReasonCode::InsufficientConfidence,
-                escalation_required: true,
-                lapsed_override,
+            if qualifying.is_empty() {
+                let disp_margin = if legacy_pre_v166_disputes {
+                    None
+                } else {
+                    Some(compute_dispute_margin_from_claims(&sub))
+                };
+                let competing_claims = sub.iter().map(ClaimCandidate::from).collect();
+                disputes.push(DisputeRecord {
+                    claim_group_key: record_group_key,
+                    competing_claims,
+                    margin: disp_margin,
+                    reason_code: DisputeReasonCode::InsufficientConfidence,
+                    escalation_required: true,
+                    lapsed_override,
+                });
+                continue;
+            }
+            let mut bmap: BTreeMap<(ValueTypeFamily, Vec<u8>), Vec<KnowledgeClaim>> =
+                BTreeMap::new();
+            for c in qualifying {
+                let (tf, jcs) = typed_value_signature(&c);
+                bmap.entry((tf, jcs)).or_default().push(c);
+            }
+            let mut bs: Vec<ValueBucket> = bmap
+                .into_iter()
+                .map(|((tf, _), mut b_claims)| {
+                    b_claims.sort_by(compare_claims_desc);
+                    ValueBucket::from_sorted_claims(tf, b_claims)
+                })
+                .collect();
+            bs.sort_by(|a, b| {
+                b.effective_confidence
+                    .total_cmp(&a.effective_confidence)
+                    .then_with(|| b.max_provenance.cmp(&a.max_provenance))
+                    .then_with(|| b.claims.len().cmp(&a.claims.len()))
+                    .then_with(|| compare_claims_desc(&a.claims[0], &b.claims[0]))
             });
-            continue;
-        }
+            let sub_top = sub.first().map(|c| c.confidence);
+            (bs, sub, sub_top)
+        } else {
+            // v1.7.1+: Pool agreeing independent sources into `ValueBucket`s BEFORE applying
+            // `min_confidence`, so damped noisy-OR corroboration (e.g. 0.60 + 0.60 -> 0.72 >= 0.70)
+            // satisfies `min_confidence` per PPA 1 §8 / SPEC §4.2!
+            let mut all_map: BTreeMap<(ValueTypeFamily, Vec<u8>), Vec<KnowledgeClaim>> =
+                BTreeMap::new();
+            for c in group {
+                let (tf, jcs) = typed_value_signature(&c);
+                all_map.entry((tf, jcs)).or_default().push(c);
+            }
+            let mut all_bs: Vec<ValueBucket> = all_map
+                .into_iter()
+                .map(|((tf, _), mut b_claims)| {
+                    b_claims.sort_by(compare_claims_desc);
+                    ValueBucket::from_sorted_claims(tf, b_claims)
+                })
+                .collect();
+            all_bs.sort_by(|a, b| {
+                b.effective_confidence
+                    .total_cmp(&a.effective_confidence)
+                    .then_with(|| b.max_provenance.cmp(&a.max_provenance))
+                    .then_with(|| b.claims.len().cmp(&a.claims.len()))
+                    .then_with(|| compare_claims_desc(&a.claims[0], &b.claims[0]))
+            });
 
-        let mut bucket_map: BTreeMap<(ValueTypeFamily, Vec<u8>), Vec<KnowledgeClaim>> =
-            BTreeMap::new();
-        for c in qualifying {
-            let (tf, jcs) = typed_value_signature(&c);
-            bucket_map.entry((tf, jcs)).or_default().push(c);
-        }
+            let mut qual_bs = Vec::new();
+            let mut sub_bs = Vec::new();
+            for b in all_bs {
+                if b.effective_confidence + FLOAT_EPS >= config.min_confidence {
+                    qual_bs.push(b);
+                } else {
+                    sub_bs.push(b);
+                }
+            }
 
-        let mut buckets: Vec<ValueBucket> = bucket_map
-            .into_iter()
-            .map(|((tf, _), mut b_claims)| {
-                b_claims.sort_by(compare_claims_desc);
-                ValueBucket::from_sorted_claims(tf, b_claims)
-            })
-            .collect();
+            if qual_bs.is_empty() {
+                let disp_margin = if sub_bs.len() >= 2 {
+                    Some(round_9(
+                        sub_bs[0].effective_confidence - sub_bs[1].effective_confidence,
+                    ))
+                } else {
+                    Some(0.0)
+                };
+                let mut competing_claims = Vec::new();
+                for sb in &sub_bs {
+                    competing_claims.extend(sb.all_annotated_candidates());
+                }
+                disputes.push(DisputeRecord {
+                    claim_group_key: record_group_key,
+                    competing_claims,
+                    margin: disp_margin,
+                    reason_code: DisputeReasonCode::InsufficientConfidence,
+                    escalation_required: true,
+                    lapsed_override,
+                });
+                continue;
+            }
 
-        buckets.sort_by(|a, b| {
-            b.effective_confidence
-                .total_cmp(&a.effective_confidence)
-                .then_with(|| b.max_provenance.cmp(&a.max_provenance))
-                .then_with(|| b.claims.len().cmp(&a.claims.len()))
-                .then_with(|| compare_claims_desc(&a.claims[0], &b.claims[0]))
-        });
+            let sub_top = sub_bs.first().map(|sb| sb.effective_confidence);
+            let mut sub_claims = Vec::new();
+            for sb in sub_bs {
+                sub_claims.extend(sb.claims);
+            }
+            sub_claims.sort_by(compare_claims_desc);
+            (qual_bs, sub_claims, sub_top)
+        };
 
         if buckets.len() == 1 && lapsed_override.is_none() {
             let winner_bucket = &buckets[0];
             let winning_claim = winner_bucket.representative_candidate();
-            let margin = sub_threshold
-                .first()
-                .map(|sub| round_9(winner_bucket.effective_confidence - sub.confidence));
+            let margin = sub_lead_eff
+                .map(|sub_eff| round_9(winner_bucket.effective_confidence - sub_eff));
 
             let mut suppressed_claim_ids: Vec<Uuid> =
                 winner_bucket.claims[1..].iter().map(|c| c.id).collect();
@@ -520,6 +666,8 @@ pub fn resolve_claims_with_overrides(
         } else {
             let reason_code = if has_type_mismatch {
                 DisputeReasonCode::TypeMismatch
+            } else if lapsed_override.is_some() && !legacy_pre_v166_disputes {
+                DisputeReasonCode::LapsedOverrideReopened
             } else {
                 DisputeReasonCode::InsufficientMargin
             };
@@ -535,6 +683,7 @@ pub fn resolve_claims_with_overrides(
             disputes.push(DisputeRecord {
                 claim_group_key: record_group_key,
                 competing_claims,
+                margin: if legacy_pre_v166_disputes { None } else { Some(margin) },
                 reason_code,
                 escalation_required: true,
                 lapsed_override,
@@ -601,6 +750,11 @@ mod tests {
             valid_to: None,
             version: 1,
             predecessor_id: None,
+            client_signature: None,
+            client_public_key: None,
+            retraction_reason: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: ts,
         };
         claim.content_hash = compute_claim_content_hash(&claim).unwrap();
@@ -629,6 +783,7 @@ mod tests {
         assert!(out_2.resolutions.is_empty());
         assert_eq!(out_2.disputes.len(), 1);
         assert_eq!(out_2.disputes[0].reason_code, DisputeReasonCode::InsufficientMargin);
+        assert_eq!(out_2.disputes[0].margin, Some(0.07));
         assert!(out_2.disputes[0].escalation_required);
         assert_eq!(out_2.disputes[0].competing_claims.len(), 2);
     }
@@ -648,6 +803,7 @@ mod tests {
         }];
         let att_id = Uuid::from_bytes([0xEE; 16]);
         let att_hash = compute_override_attestation_hash(&OverrideHashInput {
+            attestation_domain: "acta:override:v2",
             id: att_id,
             tenant_id: "tenant-1",
             scope: "ops",
@@ -659,10 +815,13 @@ mod tests {
             winning_claim_content_hash: &msa_claim.content_hash,
             overridden_claims: &overridden,
             adjudicator_id: "tenant-1::cfo",
+            adjudicator_auth_kind: "tenant_session",
             justification: "Executed MSA section 4.2 controls over unmigrated ledger",
             version: 1,
             predecessor_id: None,
             created_at: now,
+            client_public_key: None,
+            client_signature: None,
         })
         .unwrap();
 
@@ -678,10 +837,12 @@ mod tests {
             winning_claim_content_hash: msa_claim.content_hash,
             overridden_claims: overridden,
             adjudicator_id: "tenant-1::cfo".to_string(),
+            adjudicator_auth_kind: "tenant_session".to_string(),
             justification: "Executed MSA section 4.2 controls over unmigrated ledger".to_string(),
             version: 1,
             predecessor_id: None,
             created_at: now,
+            attestation_domain: "acta:override:v2".to_string(),
             attestation_hash: att_hash,
             evidence_seq_num: 12,
             host_signature: [0xAB; 64],
@@ -710,6 +871,11 @@ mod tests {
         );
         assert!(out_reescalated.resolutions.is_empty());
         assert_eq!(out_reescalated.disputes.len(), 1);
+        assert_eq!(
+            out_reescalated.disputes[0].reason_code,
+            DisputeReasonCode::LapsedOverrideReopened
+        );
+        assert_eq!(out_reescalated.disputes[0].margin, Some(0.17));
         assert_eq!(out_reescalated.disputes[0].competing_claims.len(), 3);
         let lapsed = out_reescalated.disputes[0]
             .lapsed_override
@@ -865,5 +1031,81 @@ mod tests {
             let b = resolve_claims(reversed, now, &cfg);
             prop_assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn test_explicit_contradiction_blocks_when_active_and_clears_when_target_retracted() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 24, 8, 0, 0).unwrap();
+        let cfg = ResolverConfig::default();
+
+        let target = make_claim(10, "vendor:alpha", json!("legacy"), 0.85, 2, ClaimStatus::Active, vec![]);
+        let challenger = make_claim(
+            11,
+            "vendor:alpha",
+            json!("updated"),
+            0.95,
+            3,
+            ClaimStatus::Active,
+            vec![target.id],
+        );
+
+        // Both active -> BLOCKING_CONTRADICTION even though 0.95 - 0.85 = 0.10 or even if margin >= 0.15!
+        let out_blocked = resolve_claims(vec![target.clone(), challenger.clone()], now, &cfg);
+        assert!(out_blocked.resolutions.is_empty());
+        assert_eq!(out_blocked.disputes.len(), 1);
+        assert_eq!(
+            out_blocked.disputes[0].reason_code,
+            DisputeReasonCode::BlockingContradiction
+        );
+
+        // Once target is retracted (omitted upstream via predecessor tombstone, leaving only challenger active),
+        // challenger resolves cleanly instead of staying stuck on a ghost contradiction edge!
+        let out_cleared = resolve_claims(vec![challenger.clone()], now, &cfg);
+        assert_eq!(out_cleared.resolutions.len(), 1);
+        assert!(out_cleared.disputes.is_empty());
+        assert_eq!(out_cleared.resolutions[0].winning_claim.id, challenger.id);
+    }
+
+    #[test]
+    fn test_v171_two_independent_060_claims_corroborate_to_072_and_resolve_while_tombstone_emits_retraction_tombstone() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 24, 16, 0, 0).unwrap();
+        let cfg = ResolverConfig {
+            min_confidence: 0.70,
+            decisiveness_threshold: 0.15,
+        };
+
+        let s1 = make_claim(41, "supplier:titan", json!(14), 0.60, 2, ClaimStatus::Active, vec![]);
+        let s2 = make_claim(42, "supplier:titan", json!(14), 0.60, 2, ClaimStatus::Active, vec![]);
+        let tombstone = make_claim(43, "supplier:old", json!(99), 0.90, 2, ClaimStatus::Revoked, vec![]);
+
+        let out = resolve_claims(vec![s1.clone(), s2.clone(), tombstone.clone()], now, &cfg);
+        assert!(out.disputes.is_empty(), "two agreeing 0.60 sources must resolve at 0.72 >= 0.70");
+        assert_eq!(out.resolutions.len(), 1);
+        assert_eq!(out.resolutions[0].winning_claim.corroborating_count, 2);
+        assert_eq!(out.resolutions[0].winning_claim.effective_confidence, Some(0.72));
+        assert_eq!(
+            out.excluded_claims,
+            vec![(tombstone.id, OmissionReason::RetractionTombstone)]
+        );
+
+        // Verify legacy_pre_v171_resolver reproduces historical v1.7.0 behavior bit-for-bit!
+        let out_legacy = resolve_claims_with_overrides_v171_compat(
+            vec![s1, s2, tombstone.clone()],
+            &[],
+            now,
+            &cfg,
+            false,
+            true,
+        );
+        assert!(out_legacy.resolutions.is_empty());
+        assert_eq!(out_legacy.disputes.len(), 1);
+        assert_eq!(
+            out_legacy.disputes[0].reason_code,
+            DisputeReasonCode::InsufficientConfidence
+        );
+        assert_eq!(
+            out_legacy.excluded_claims,
+            vec![(tombstone.id, OmissionReason::LifecycleExpired)]
+        );
     }
 }

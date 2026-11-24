@@ -1,5 +1,7 @@
+pub mod answer_cache_repo;
 pub mod claims_repo;
 pub mod evidence_repo;
+pub mod impact_repo;
 pub mod objects_repo;
 pub mod overrides_repo;
 pub mod pool;
@@ -70,6 +72,60 @@ pub trait CompileStore: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn fetch_scoped_intents_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        _as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<StoredObject>>> {
+        self.fetch_scoped_intents(tenant_id, scope)
+    }
+
+    fn fetch_scoped_memories_ranked_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        query_embedding: Option<&'a [f32]>,
+        now: DateTime<Utc>,
+        limit: i64,
+        _as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<RankedMemory>>> {
+        self.fetch_scoped_memories_ranked(tenant_id, scope, query_embedding, now, limit)
+    }
+
+    fn fetch_all_active_hashes_in_scope_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        _as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<ScopedObjectScan>> {
+        self.fetch_all_active_hashes_in_scope(tenant_id, scope)
+    }
+
+    fn fetch_scoped_claims_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        _as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<(Vec<KnowledgeClaim>, Vec<(Uuid, OmissionReason)>)>> {
+        self.fetch_scoped_claims(tenant_id, scope)
+    }
+
+    fn fetch_scoped_overrides_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<OverrideAttestation>>> {
+        Box::pin(async move {
+            let all = self.fetch_scoped_overrides(tenant_id, scope).await?;
+            Ok(match as_of {
+                Some(cutoff) => all.into_iter().filter(|o| o.created_at <= cutoff).collect(),
+                None => all,
+            })
+        })
+    }
+
     fn append_evidence<'a>(
         &'a self,
         host_key: &'a SigningKey,
@@ -111,6 +167,7 @@ pub trait CompileStore: Send + Sync {
                 .await?;
             ev.state_commitment = Some(comm);
             ev.refusal_metadata = Some(meta);
+            ev.event_domain = Some("acta:evidence_event:v2".to_string());
             ev.event_hash = compute_evidence_event_hash_with_meta(
                 &ev.tenant_id,
                 ev.seq_num,
@@ -251,6 +308,73 @@ impl CompileStore for PgActaStore {
     ) -> BoxFuture<'a, ActaResult<Vec<OverrideAttestation>>> {
         Box::pin(overrides_repo::fetch_active_scoped_overrides(
             &self.pool, tenant_id, scope,
+        ))
+    }
+
+    fn fetch_scoped_intents_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<StoredObject>>> {
+        Box::pin(objects_repo::fetch_scoped_intents_as_of(
+            &self.pool, tenant_id, scope, as_of,
+        ))
+    }
+
+    fn fetch_scoped_memories_ranked_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        query_embedding: Option<&'a [f32]>,
+        now: DateTime<Utc>,
+        limit: i64,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<RankedMemory>>> {
+        Box::pin(objects_repo::fetch_scoped_memories_ranked_as_of(
+            &self.pool,
+            tenant_id,
+            scope,
+            query_embedding,
+            now,
+            limit,
+            as_of,
+        ))
+    }
+
+    fn fetch_all_active_hashes_in_scope_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<ScopedObjectScan>> {
+        if as_of.is_none() {
+            return self.fetch_all_active_hashes_in_scope(tenant_id, scope);
+        }
+        Box::pin(objects_repo::fetch_all_active_hashes_in_scope_as_of(
+            &self.pool, tenant_id, scope, as_of,
+        ))
+    }
+
+    fn fetch_scoped_claims_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<(Vec<KnowledgeClaim>, Vec<(Uuid, OmissionReason)>)>> {
+        Box::pin(claims_repo::fetch_scoped_claims_as_of(
+            &self.pool, tenant_id, scope, as_of,
+        ))
+    }
+
+    fn fetch_scoped_overrides_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<OverrideAttestation>>> {
+        Box::pin(overrides_repo::fetch_active_scoped_overrides_as_of(
+            &self.pool, tenant_id, scope, as_of,
         ))
     }
 
@@ -400,6 +524,62 @@ impl<S: CompileStore> CompileStore for QueryCountingStore<S> {
     ) -> BoxFuture<'a, ActaResult<Vec<OverrideAttestation>>> {
         self.claims_queries.fetch_add(1, Ordering::SeqCst);
         self.inner.fetch_scoped_overrides(tenant_id, scope)
+    }
+
+    fn fetch_scoped_intents_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<StoredObject>>> {
+        self.objects_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_scoped_intents_as_of(tenant_id, scope, as_of)
+    }
+
+    fn fetch_scoped_memories_ranked_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        query_embedding: Option<&'a [f32]>,
+        now: DateTime<Utc>,
+        limit: i64,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<RankedMemory>>> {
+        self.objects_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .fetch_scoped_memories_ranked_as_of(tenant_id, scope, query_embedding, now, limit, as_of)
+    }
+
+    fn fetch_all_active_hashes_in_scope_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<ScopedObjectScan>> {
+        self.objects_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .fetch_all_active_hashes_in_scope_as_of(tenant_id, scope, as_of)
+    }
+
+    fn fetch_scoped_claims_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<(Vec<KnowledgeClaim>, Vec<(Uuid, OmissionReason)>)>> {
+        self.claims_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_scoped_claims_as_of(tenant_id, scope, as_of)
+    }
+
+    fn fetch_scoped_overrides_as_of<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        scope: &'a str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> BoxFuture<'a, ActaResult<Vec<OverrideAttestation>>> {
+        self.claims_queries.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .fetch_scoped_overrides_as_of(tenant_id, scope, as_of)
     }
 
     fn append_evidence<'a>(

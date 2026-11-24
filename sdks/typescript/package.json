@@ -1,7 +1,7 @@
 {
   "name": "@acta/sdk",
-  "version": "1.6.0",
-  "description": "Official Zero-Dependency TypeScript/ESM SDK, Principal Token Minter, RFC 6962 Merkle Verifier, Epistemic Notary, and Gemini Pre-Prompt Guard for Acta Compiler v1.6.0",
+  "version": "1.7.1",
+  "description": "Official Zero-Dependency TypeScript/ESM SDK, Principal Token Minter, RFC 6962 Merkle Verifier, Epistemic Notary, and Gemini Pre-Prompt Guard for Acta Compiler v1.7.1",
   "type": "module",
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.ts",

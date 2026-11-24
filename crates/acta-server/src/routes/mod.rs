@@ -1,3 +1,4 @@
+pub mod answers;
 pub mod auth;
 pub mod checkpoints;
 pub mod compile;
@@ -133,7 +134,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/replay", post(replay::handle_replay))
         .route("/v1/verify", post(verify::handle_verify_archive))
         .route("/v1/overrides", post(overrides::handle_attest_override))
+        .route("/v1/witnesses", post(checkpoints::handle_register_witness))
+        .route(
+            "/v1/witnesses/revoke",
+            post(checkpoints::handle_revoke_witness),
+        )
         .route("/v1/anchors", post(checkpoints::handle_anchor_checkpoint))
+        .route("/v1/answers/cache", post(answers::handle_cache_answer))
+        .route(
+            "/v1/answers/lookup",
+            post(answers::handle_lookup_cached_answer),
+        )
         .route(
             "/v1/tenants/:tenant_id/overrides",
             get(overrides::handle_list_overrides),
@@ -143,8 +154,20 @@ pub fn build_router(state: AppState) -> Router {
             get(checkpoints::handle_get_checkpoint),
         )
         .route(
+            "/v1/tenants/:tenant_id/witnesses",
+            get(checkpoints::handle_list_witnesses),
+        )
+        .route(
             "/v1/tenants/:tenant_id/anchors",
             get(checkpoints::handle_list_anchors),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/impact/:item_id",
+            get(answers::handle_trace_item_impact),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/state-rebuild",
+            get(answers::handle_rebuild_scope_state),
         )
         .route(
             "/v1/tenants/:tenant_id/vault",
@@ -156,6 +179,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/objects", post(ingest::handle_ingest_object))
         .route("/v1/claims", post(ingest::handle_ingest_claim))
+        .route("/v1/claims/retract", post(ingest::handle_retract_claim))
         .route(
             "/v1/bundles/:bundle_hash/export",
             get(export::handle_export_bundle),

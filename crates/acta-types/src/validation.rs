@@ -251,3 +251,46 @@ pub fn validate_budget(budget: ContextBudget) -> ActaResult<()> {
     }
     Ok(())
 }
+
+/// Validates that a `KnowledgeClaim.object_val` JSON value strictly conforms to its declared
+/// `object_type` family at ingest time (`v1.6.7+`), rejecting type mismatches (`400 Bad Request`)
+/// before policy/DB persistence without appending to `evidence_history`.
+pub fn validate_claim_value_type(
+    object_type: &str,
+    object_val: &serde_json::Value,
+) -> ActaResult<()> {
+    if object_val.is_null() {
+        return Err(ActaError::Validation(
+            "object_val cannot be null".to_string(),
+        ));
+    }
+    let norm = object_type.trim().to_ascii_lowercase();
+    let ok = match norm.as_str() {
+        "int" | "integer" | "i64" | "i32" | "i16" | "i8" => {
+            object_val.is_i64()
+                || object_val
+                    .as_u64()
+                    .and_then(|u| i64::try_from(u).ok())
+                    .is_some()
+        }
+        "uint" | "u64" | "u32" | "u16" | "u8" | "usize" => object_val.is_u64(),
+        "float" | "f64" | "f32" | "number" | "decimal" => object_val.is_number(),
+        "bool" | "boolean" => object_val.is_boolean(),
+        "string" | "str" | "text" | "uuid" | "uri" | "url" | "date" | "datetime"
+        | "timestamp" | "enum" => object_val.is_string(),
+        "array" | "list" => object_val.is_array(),
+        "object" | "map" | "json" | "record" | "struct" => object_val.is_object(),
+        "any" => true,
+        other => {
+            return Err(ActaError::Validation(format!(
+                "unsupported object_type '{other}' (expected int, uint, float, number, bool, string, array, or object)"
+            )));
+        }
+    };
+    if !ok {
+        return Err(ActaError::Validation(format!(
+            "object_val {object_val} does not match declared object_type '{object_type}'"
+        )));
+    }
+    Ok(())
+}

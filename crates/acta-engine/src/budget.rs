@@ -31,6 +31,22 @@ pub fn count_tokens(text: &str) -> ActaResult<usize> {
     Ok(bpe()?.encode_with_special_tokens(text).len())
 }
 
+/// Encodes `text` using `cl100k_base` and returns `(token_ids, token_bytes_hex)` whose raw byte
+/// concatenation equals `text.as_bytes()` byte-for-byte.
+pub fn encode_token_spans(text: &str) -> ActaResult<(Vec<u32>, Vec<String>)> {
+    if text.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let enc = bpe()?;
+    let ranks = enc.encode_with_special_tokens(text);
+    let ids: Vec<u32> = ranks.iter().map(|&r| r as u32).collect();
+    let pieces: Vec<String> = enc
+        ._decode_native_and_split(ranks)
+        .map(hex::encode)
+        .collect();
+    Ok((ids, pieces))
+}
+
 #[derive(Debug, Clone)]
 pub struct BudgetedSelection {
     pub selected_intents: Vec<StoredObject>,
@@ -39,6 +55,7 @@ pub struct BudgetedSelection {
     pub selected_memories: Vec<RankedMemory>,
     pub selected_object_refs: Vec<SelectedObjectRef>,
     pub omission_record: OmissionRecord,
+    pub resolved_facts_omitted: usize,
     pub context_text: String,
 }
 
@@ -82,6 +99,39 @@ fn joined_fits_budget(
 }
 
 pub fn apply_budget_and_omissions(
+    intents: Vec<StoredObject>,
+    resolutions: Vec<ResolutionRecord>,
+    disputes: Vec<DisputeRecord>,
+    memories: Vec<RankedMemory>,
+    pre_excluded: Vec<(Uuid, OmissionReason)>,
+    unfetched_tail_memory_ids: Vec<Uuid>,
+    budget: ContextBudget,
+    max_inline_omissions: usize,
+) -> ActaResult<BudgetedSelection> {
+    apply_budget_and_omissions_with_mode(
+        intents,
+        resolutions,
+        disputes,
+        memories,
+        pre_excluded,
+        unfetched_tail_memory_ids,
+        budget,
+        max_inline_omissions,
+        true,
+    )
+}
+
+/// Applies deterministic tiered budgeting (`v1.6.7+`):
+/// - Tier 1a: Non-suppressible Dispute Stubs (`BudgetInsufficientForDisputes` if stubs cannot fit)
+/// - Tier 1b (`prioritize_override_resolutions == true`): Signed human/committee override-adjudicated
+///   facts reserved ahead of background intents so explicit human adjudications outrank intents under
+///   tight budgets (`35..60` tokens), then upgraded (`full -> why(64) -> why(32) -> why(18) -> compact`)
+/// - Tier 1c: Scoped Intents (`full -> compact -> stub`)
+/// - Tier 2: Standard Resolved Claims (tracking exact `resolved_facts_omitted` whenever any Tier 1b/2
+///   resolved fact is omitted under extreme budgets such as `token_budget: 1`)
+/// - Tier 3: Ranked Memories
+#[allow(clippy::too_many_arguments)]
+pub fn apply_budget_and_omissions_with_mode(
     mut intents: Vec<StoredObject>,
     mut resolutions: Vec<ResolutionRecord>,
     mut disputes: Vec<DisputeRecord>,
@@ -90,6 +140,7 @@ pub fn apply_budget_and_omissions(
     unfetched_tail_memory_ids: Vec<Uuid>,
     budget: ContextBudget,
     max_inline_omissions: usize,
+    prioritize_override_resolutions: bool,
 ) -> ActaResult<BudgetedSelection> {
     intents.sort_by(|a, b| {
         b.priority
@@ -146,7 +197,43 @@ pub fn apply_budget_and_omissions(
         )));
     }
 
-    // 2. Pack Tier-1b Intents alongside the reserved Dispute Stubs (trying full -> compact -> stub).
+    let mut resolved_facts_omitted: usize = 0;
+    let mut reserved_override_resolutions: Vec<ResolutionRecord> = Vec::new();
+    let mut reserved_override_blocks: Vec<String> = Vec::new();
+    let remaining_resolutions: Vec<ResolutionRecord> = if prioritize_override_resolutions {
+        let mut standard = Vec::new();
+        for res in resolutions {
+            if res.override_attestation.is_some() {
+                let min_form = format_resolution_compact(&res)
+                    .unwrap_or_else(|| format_resolution_entry(&res));
+                reserved_override_blocks.push(min_form);
+                if joined_fits_budget(
+                    &[],
+                    &dispute_blocks,
+                    &dispute_weights,
+                    &reserved_override_blocks,
+                    reserved_override_blocks.len(),
+                    budget,
+                )? {
+                    reserved_override_resolutions.push(res);
+                } else {
+                    reserved_override_blocks.pop();
+                    resolved_facts_omitted += 1;
+                    all_excluded.push(OmittedItem {
+                        id: res.winning_claim.id,
+                        reason: OmissionReason::BudgetExceeded,
+                    });
+                }
+            } else {
+                standard.push(res);
+            }
+        }
+        standard
+    } else {
+        resolutions
+    };
+
+    // 2. Pack Intents alongside reserved Dispute Stubs (+ reserved compact Override Facts in v1.6.7+).
     let mut selected_intents = Vec::new();
     let mut selected_intent_blocks = Vec::new();
     for intent in intents {
@@ -162,8 +249,8 @@ pub fn apply_budget_and_omissions(
                 &selected_intent_blocks,
                 &dispute_blocks,
                 &dispute_weights,
-                &[],
-                0,
+                &reserved_override_blocks,
+                reserved_override_blocks.len(),
                 budget,
             )? {
                 fitted = true;
@@ -191,12 +278,40 @@ pub fn apply_budget_and_omissions(
             &selected_intent_blocks,
             &dispute_blocks,
             &dispute_weights,
-            &[],
-            0,
+            &reserved_override_blocks,
+            reserved_override_blocks.len(),
             budget,
         )? {
             dispute_blocks[idx] = prev_block;
             dispute_weights[idx] = prev_weight;
+        }
+    }
+
+    // 3b. Upgrade each reserved compact Override Fact -> richest form (full -> why(64) -> why(32) -> why(18) -> compact).
+    for (idx, res) in reserved_override_resolutions.iter().enumerate() {
+        let mut richer_forms = vec![format_resolution_entry(res)];
+        if let Some(c64) = format_resolution_compact_with_why(res, 64) {
+            richer_forms.push(c64);
+        }
+        if let Some(c32) = format_resolution_compact_with_why(res, 32) {
+            richer_forms.push(c32);
+        }
+        if let Some(c18) = format_resolution_compact_with_why(res, 18) {
+            richer_forms.push(c18);
+        }
+        for candidate_form in richer_forms {
+            let prev = std::mem::replace(&mut reserved_override_blocks[idx], candidate_form);
+            if joined_fits_budget(
+                &selected_intent_blocks,
+                &dispute_blocks,
+                &dispute_weights,
+                &reserved_override_blocks,
+                reserved_override_blocks.len(),
+                budget,
+            )? {
+                break;
+            }
+            reserved_override_blocks[idx] = prev;
         }
     }
 
@@ -205,6 +320,7 @@ pub fn apply_budget_and_omissions(
     let prefix_joined = selected_intent_blocks
         .iter()
         .chain(dispute_blocks.iter())
+        .chain(reserved_override_blocks.iter())
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
@@ -215,7 +331,9 @@ pub fn apply_budget_and_omissions(
         0
     };
     let mut used_bytes = prefix_joined.len();
-    let mut used_records = selected_intent_blocks.len() + dispute_weights.iter().sum::<usize>();
+    let mut used_records = selected_intent_blocks.len()
+        + dispute_weights.iter().sum::<usize>()
+        + reserved_override_blocks.len();
 
     let mut try_consume_lower_tier = |rendered: &str, weight: usize| -> ActaResult<bool> {
         let sep = usize::from(has_any_block);
@@ -247,10 +365,10 @@ pub fn apply_budget_and_omissions(
         Ok(true)
     };
 
-    // 4. Tier 2: Resolved Claims (progressive fallback: full -> why(64) -> why(32) -> why(18) -> bare compact)
-    let mut selected_resolutions = Vec::new();
-    let mut selected_resolution_blocks = Vec::new();
-    for res in resolutions {
+    // 4. Tier 2: Remaining Resolved Claims
+    let mut selected_resolutions = reserved_override_resolutions;
+    let mut selected_resolution_blocks = reserved_override_blocks;
+    for res in remaining_resolutions {
         let mut candidate_forms = vec![format_resolution_entry(&res)];
         if let Some(c64) = format_resolution_compact_with_why(&res, 64) {
             candidate_forms.push(c64);
@@ -277,6 +395,7 @@ pub fn apply_budget_and_omissions(
             selected_resolution_blocks.push(chosen);
             selected_resolutions.push(res);
         } else {
+            resolved_facts_omitted += 1;
             all_excluded.push(OmittedItem {
                 id: res.winning_claim.id,
                 reason: OmissionReason::BudgetExceeded,
@@ -356,6 +475,7 @@ pub fn apply_budget_and_omissions(
         selected_memories,
         selected_object_refs,
         omission_record,
+        resolved_facts_omitted,
         context_text,
     })
 }
@@ -395,6 +515,9 @@ mod tests {
             version: 1,
             predecessor_id: None,
             client_signature: None,
+            client_public_key: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: ts,
         };
         obj.content_hash = compute_object_content_hash(&obj).unwrap();
@@ -441,6 +564,7 @@ mod tests {
                     effective_confidence: None,
                 },
             ],
+            margin: Some(0.07),
             reason_code: DisputeReasonCode::InsufficientMargin,
             escalation_required: true,
             lapsed_override: None,
@@ -559,6 +683,9 @@ mod tests {
             version: 1,
             predecessor_id: None,
             client_signature: None,
+            client_public_key: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: ts,
         };
         intent.content_hash = compute_object_content_hash(&intent).unwrap();
@@ -676,5 +803,21 @@ mod tests {
         assert_eq!(packed.selected_intents.len(), 1);
         assert!(count_tokens(&packed.context_text).unwrap() <= 60);
         assert_eq!(packed.omission_record.inline_items.len(), 25);
+    }
+
+    #[test]
+    fn test_encode_token_spans_exact_utf8_partition() {
+        let sample = "[FACT] contract:epsilon.fee_bps = 240 (conf=0.7500, override_by=kylewilson04::oauth:kylewilson04, why=\"Signed Master Services Agreement v2026 Schedule A section 4.2 g\u{2026}\")";
+        let cnt = count_tokens(sample).unwrap();
+        let (ids, hex_pieces) = encode_token_spans(sample).unwrap();
+        assert_eq!(ids.len(), cnt);
+        assert_eq!(hex_pieces.len(), cnt);
+        let mut rebuilt = Vec::new();
+        for piece in &hex_pieces {
+            let raw = hex::decode(piece).unwrap();
+            assert!(!raw.is_empty());
+            rebuilt.extend_from_slice(&raw);
+        }
+        assert_eq!(rebuilt, sample.as_bytes());
     }
 }

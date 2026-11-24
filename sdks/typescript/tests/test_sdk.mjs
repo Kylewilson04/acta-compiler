@@ -27,6 +27,8 @@ import {
   computeOmissionListHash,
   computeOverrideAttestationHash,
   computeRefusalMetadataCommitment,
+  computeWitnessRevocationV2Commitment,
+  witnessRevocationPreimageBytes,
   deriveEd25519PublicKeyHex,
   dumpArchivePreimages,
   extractTokenPrincipal,
@@ -139,7 +141,7 @@ assert.equal(ev2, "1e1aa455fbcea3e6e698dce7efd85219ac006bd2470d70429452463bfd938
   }
 }
 
-// 4. Offline ExportArchive verification & v1.6.0 Epistemic Notary + Merkle-only proof tests
+// 4. Offline ExportArchive verification & v1.6.5 Epistemic Notary + Merkle-only proof tests
 function buildFixture(seedHex, disputed = true) {
   const pkHex = deriveEd25519PublicKeyHex(seedHex);
   const ts = "2026-11-20T16:37:01.215313Z";
@@ -312,7 +314,7 @@ const forged = JSON.parse(JSON.stringify(archive));
 forged.claims[0].object_val = 999999;
 assert.throws(() => verifyExportArchive(forged, pkHex), ActaVerificationError);
 
-// v1.6.0 Merkle-only ExportArchive with client-signed LapsedOverrideRef & ExternalWitnessAnchor
+// v1.6.5 Merkle-only ExportArchive with client-signed LapsedOverrideRef & ExternalWitnessAnchor
 {
   const tenant = archive.bundle.tenant_id;
   const scope = archive.bundle.scope;
@@ -545,7 +547,7 @@ let forgeSig = false;
 const srv = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "1.6.0", host_public_key: pkHex, permission_root: permRoot }));
+    res.end(JSON.stringify({ status: "ok", version: "1.7.1", host_public_key: pkHex, permission_root: permRoot }));
     return;
   }
   if (req.method === "GET" && req.url.includes("/export")) {
@@ -761,7 +763,7 @@ try {
     ActaAuthError
   );
 
-  console.log("ALL TYPESCRIPT @acta/sdk v1.6.0 TESTS + MERKLE & EPISTEMIC NOTARY VECTORS PASSED!");
+  console.log("ALL TYPESCRIPT @acta/sdk v1.7.1 TESTS + MERKLE & EPISTEMIC NOTARY VECTORS PASSED!");
 } finally {
   srv.close();
 }
@@ -801,4 +803,330 @@ await assert.rejects(
     }),
   ActaTenantLockError
 );
-console.log("ALL v1.6.0 2-PART & 3-PART PRINCIPAL TOKEN & CLIENT LOCK TESTS PASSED!");
+console.log("ALL v1.6.5 2-PART & 3-PART PRINCIPAL TOKEN & CLIENT LOCK TESTS PASSED!");
+
+// v1.6.5 live seq 58 witness_reg:v1 & principal-bound witness_reg:v2 vectors
+import {
+  witnessRegistrationPreimageBytes,
+  computeWitnessRegistrationCommitment,
+  computeWitnessRegistrationV2Commitment,
+} from "../dist/index.mjs";
+
+const pk58 = "e5b050185444bd8e1b0892678934c70ff65f896602e9bf0faa87a4702a7ad9e4";
+assert.equal(
+  computeWitnessRegistrationCommitment("kylewilson04", "claude-witness-v161", pk58),
+  "e28df78841329df7b66aef44558586b81d952d1434a48f6605d0a6431e080fec"
+);
+const v2Oauth = computeWitnessRegistrationV2Commitment(
+  "kylewilson04",
+  "claude-witness-v162",
+  pk58,
+  "kylewilson04::oauth:kylewilson04"
+);
+const v2Session = computeWitnessRegistrationV2Commitment(
+  "kylewilson04",
+  "claude-witness-v162",
+  pk58,
+  "kylewilson04::session"
+);
+assert.notEqual(v2Oauth.commitmentHex, v2Session.commitmentHex);
+assert.equal(
+  Buffer.from(
+    witnessRegistrationPreimageBytes(
+      "acta:witness_reg:v2",
+      "kylewilson04",
+      "claude-witness-v162",
+      pk58,
+      "kylewilson04::oauth:kylewilson04"
+    )
+  ).toString("hex"),
+  v2Oauth.preimageHex
+);
+import {
+  computeWitnessRegistrationV3Commitment,
+  computeWitnessRevocationCommitment,
+} from "../dist/index.mjs";
+
+const wv3a = computeWitnessRegistrationV3Commitment(
+  "kylewilson04",
+  "claude-witness-v163",
+  pk58,
+  "kylewilson04::oauth:kylewilson04",
+  "Claude v1.6.5 Witness"
+);
+const wv3b = computeWitnessRegistrationV3Commitment(
+  "kylewilson04",
+  "claude-witness-v163",
+  pk58,
+  "kylewilson04::oauth:kylewilson04",
+  "Tampered"
+);
+assert.notStrictEqual(wv3a.commitmentHex, wv3b.commitmentHex);
+const wrev = computeWitnessRevocationCommitment(
+  "kylewilson04",
+  "claude-revoke-probe-v163",
+  pk58,
+  "kylewilson04::session",
+  "Key rotation"
+);
+assert.strictEqual(wrev.commitmentHex.length, 64);
+console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
+
+
+// Acta v1.6.5 witness_revoke:v2 retire vs compromise domain separation
+{
+  const pk = "aa".repeat(32);
+  const ret = computeWitnessRevocationV2Commitment(
+    "kylewilson04",
+    "claude-retire-probe-v164",
+    pk,
+    "kylewilson04::oauth:kylewilson04",
+    "retire",
+    86,
+    "Graceful key rotation after anchoring head 85"
+  );
+  const comp = computeWitnessRevocationV2Commitment(
+    "kylewilson04",
+    "claude-retire-probe-v164",
+    pk,
+    "kylewilson04::oauth:kylewilson04",
+    "compromise",
+    null,
+    "Graceful key rotation after anchoring head 85"
+  );
+  assert.notEqual(ret.commitmentHex, comp.commitmentHex);
+  assert.notEqual(ret.preimageHex, comp.preimageHex);
+  assert.throws(() =>
+    witnessRevocationPreimageBytes(
+      "acta:witness_revoke:v2",
+      "kylewilson04",
+      "claude-retire-probe-v164",
+      pk,
+      "kylewilson04::oauth:kylewilson04",
+      "Bad combination",
+      "retire",
+      null
+    )
+  );
+}
+
+
+// 7. v1.7.1 Claim 25 Dependency Commitment, Cache Invalidation & Offline State Rebuild
+{
+  const {
+    SCHEMA_VERSION,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    computeSubCommitment,
+    computeStateCommitment,
+    computeTaskDependencyCommitment,
+    computeObjectContentHash,
+    computeClaimContentHash,
+    computeLogicalClaimGroupKey,
+    computeWriteSummaryCommitment,
+    computeAnswerCacheSummaryCommitment,
+    computeQueryTextHash,
+    computeAnswerTextHash,
+    verifyAndRebuildScopeStateOffline,
+  } = await import("../dist/index.mjs");
+
+  const tenant = "kylewilson04";
+  const scope = "acta-test/v171-ts";
+  const ts = "2026-11-24T17:10:00.000000Z";
+  const dep1 = computeTaskDependencyCommitment({
+    tenantId: tenant,
+    scope,
+    permissionRoot: permRoot,
+    intentRoot: computeSubCommitment([]),
+    selectedMemoryRoot: computeSubCommitment([]),
+    relevantKnowledgeRoot: computeSubCommitment(["aa".repeat(32)]),
+  });
+  const dep2 = computeTaskDependencyCommitment({
+    tenantId: tenant,
+    scope,
+    permissionRoot: permRoot,
+    intentRoot: computeSubCommitment([]),
+    selectedMemoryRoot: computeSubCommitment([]),
+    relevantKnowledgeRoot: computeSubCommitment(["bb".repeat(32)]),
+  });
+  assert.equal(dep1.length, 64);
+  assert.notEqual(dep1, dep2);
+
+  const obj = {
+    id: "11111111-1111-4111-8111-111111111111",
+    tenant_id: tenant,
+    obj_type: "intent",
+    scope,
+    lifecycle_status: "active",
+    priority: 90,
+    importance: 1.0,
+    tags: ["v171"],
+    body: { directive: "Pool corroborating sources" },
+    version: 1,
+    predecessor_id: null,
+    created_at: ts,
+  };
+  obj.content_hash = computeObjectContentHash(obj);
+  const ws1 = {
+    write_domain: "acta:write_event:v1",
+    operation: "ingest_object",
+    item_id: obj.id,
+    scope,
+    version: 1,
+    content_hash: obj.content_hash,
+    written_by: `${tenant}::oauth:${tenant}`,
+    writer_auth_kind: "oauth_github_principal",
+    record_snapshot: obj,
+  };
+  const ws1Comm = computeWriteSummaryCommitment(ws1);
+  const ev1Hash = computeEvidenceEventHash({
+    tenantId: tenant,
+    seqNum: 1,
+    prevHash: "00".repeat(32),
+    stateCommitment: ws1Comm,
+    policyResult: "allow",
+    createdAt: ts,
+    writeSummary: ws1,
+  });
+  const entry1 = {
+    tenant_id: tenant,
+    seq_num: 1,
+    event_domain: "acta:evidence_event:v3",
+    prev_hash: "00".repeat(32),
+    event_hash: ev1Hash,
+    bundle_hash: null,
+    state_commitment: ws1Comm,
+    policy_result: "allow",
+    write_summary: ws1,
+    host_signature: signEvidenceEntry(seedHex, tenant, 1, "00".repeat(32), ev1Hash),
+    created_at: ts,
+  };
+
+  const clm = {
+    id: "22222222-2222-4222-8222-222222222222",
+    tenant_id: tenant,
+    claim_group_key: computeLogicalClaimGroupKey(tenant, "supplier:titan", "lead_days", scope),
+    scope,
+    subject: "supplier:titan",
+    predicate: "lead_days",
+    object_val: 14,
+    object_type: "int",
+    confidence: 0.6,
+    source_provenance_class: 2,
+    source_descriptor: "msa-a",
+    source_commitment: "cc".repeat(32),
+    status: "active",
+    contradiction_ids: [],
+    valid_from: null,
+    valid_to: null,
+    version: 1,
+    predecessor_id: null,
+    created_at: ts,
+  };
+  clm.content_hash = computeClaimContentHash(clm);
+  const ws2 = {
+    write_domain: "acta:write_event:v1",
+    operation: "ingest_claim",
+    item_id: clm.id,
+    scope,
+    version: 1,
+    content_hash: clm.content_hash,
+    written_by: `${tenant}::oauth:${tenant}`,
+    writer_auth_kind: "oauth_github_principal",
+    record_snapshot: clm,
+  };
+  const ws2Comm = computeWriteSummaryCommitment(ws2);
+  const ev2Hash = computeEvidenceEventHash({
+    tenantId: tenant,
+    seqNum: 2,
+    prevHash: ev1Hash,
+    stateCommitment: ws2Comm,
+    policyResult: "allow",
+    createdAt: ts,
+    writeSummary: ws2,
+  });
+  const entry2 = {
+    tenant_id: tenant,
+    seq_num: 2,
+    event_domain: "acta:evidence_event:v3",
+    prev_hash: ev1Hash,
+    event_hash: ev2Hash,
+    bundle_hash: null,
+    state_commitment: ws2Comm,
+    policy_result: "allow",
+    write_summary: ws2,
+    host_signature: signEvidenceEntry(seedHex, tenant, 2, ev1Hash, ev2Hash),
+    created_at: ts,
+  };
+
+  const acsInv = {
+    cache_domain: "acta:answer_cache:v1",
+    event_kind: "invalidated",
+    cache_id: "33333333-3333-4333-8333-333333333333",
+    scope,
+    task_id: "po-check",
+    query_hash: computeQueryTextHash("lead_days?"),
+    source_bundle_hash: "dd".repeat(32),
+    state_commitment: "ee".repeat(32),
+    validity_mode: "dependency_subset",
+    task_dependency_commitment: dep1,
+    answer_hash: computeAnswerTextHash("14 days"),
+    cached_by: `${tenant}::oauth:${tenant}`,
+    cacher_auth_kind: "oauth_github_principal",
+    invalidation_reason: "stale_dependency_commitment",
+    observed_state_commitment: "ff".repeat(32),
+    observed_dependency_commitment: dep2,
+  };
+  const acsComm = computeAnswerCacheSummaryCommitment(acsInv);
+  const ev3Hash = computeEvidenceEventHash({
+    tenantId: tenant,
+    seqNum: 3,
+    prevHash: ev2Hash,
+    stateCommitment: acsComm,
+    policyResult: "allow",
+    createdAt: ts,
+    answerCacheSummary: acsInv,
+  });
+  const entry3 = {
+    tenant_id: tenant,
+    seq_num: 3,
+    event_domain: "acta:evidence_event:v3",
+    prev_hash: ev2Hash,
+    event_hash: ev3Hash,
+    bundle_hash: null,
+    state_commitment: acsComm,
+    policy_result: "allow",
+    answer_cache_summary: acsInv,
+    host_signature: signEvidenceEntry(seedHex, tenant, 3, ev2Hash, ev3Hash),
+    created_at: ts,
+  };
+
+  const rebuildArchive = {
+    schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    tenant_id: tenant,
+    scope,
+    up_to_seq: 3,
+    evaluated_at: ts,
+    host_public_key: pkHex,
+    permission_root: permRoot,
+    override_attestations: [],
+    evidence_chain: [entry1, entry2, entry3],
+  };
+  const rebuilt = verifyAndRebuildScopeStateOffline(rebuildArchive, pkHex);
+  const expectedSc = computeStateCommitment({
+    schemaVersion: SCHEMA_VERSION,
+    tenantId: tenant,
+    scope,
+    intentRoot: computeSubCommitment([obj.content_hash]),
+    knowledgeRoot: computeSubCommitment([clm.content_hash]),
+    memoryRoot: computeSubCommitment([]),
+    permissionRoot: permRoot,
+  });
+  assert.equal(rebuilt.reconstructed_state_commitment_hex, expectedSc);
+  assert.equal(rebuilt.reconstructed_active_intents, 1);
+  assert.equal(rebuilt.reconstructed_active_claims, 1);
+
+  const tampered = JSON.parse(JSON.stringify(rebuildArchive));
+  tampered.evidence_chain[1].write_summary.record_snapshot.object_val = 999;
+  assert.throws(() => verifyAndRebuildScopeStateOffline(tampered, pkHex), ActaVerificationError);
+  console.log("TYPESCRIPT @acta/sdk v1.7.1 OFFLINE STATE REBUILD & CLAIM 25 VECTORS PASSED!");
+}

@@ -54,6 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: 1,
             predecessor_id: None,
             client_signature: None,
+            client_public_key: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: now,
         };
         obj.content_hash = compute_object_content_hash(&obj)?;
@@ -91,6 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     version: 1,
                     predecessor_id: None,
                     client_signature: None,
+                    client_public_key: None,
+                    written_by: None,
+                    evidence_seq_num: None,
                     created_at: now,
                 };
                 mem.content_hash = compute_object_content_hash(&mem).unwrap();
@@ -127,6 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             valid_to: None,
             version: 1,
             predecessor_id: None,
+            client_signature: None,
+            client_public_key: None,
+            retraction_reason: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: now,
         };
         claim.content_hash = compute_claim_content_hash(&claim)?;

@@ -71,10 +71,8 @@ fn is_signature_mandatory_scope(scope: &str) -> bool {
 }
 
 /// `POST /v1/overrides` -> Enforces Policy-Before-Attest (`Action::"attest"`), binds `adjudicator_id`
-/// to the authenticated GitHub OAuth 2.1 principal (`<tenant>::oauth:<github_login>`) or verifies
-/// a mandatory 64-byte Ed25519 `client_signature_hex` (`acta:override_client_sig:v1`) whenever a
-/// custom/committee adjudicator or `regulated/*` / `compliance/*` / `governance/*` scope is targeted,
-/// and atomically notarizes the `OverrideAttestation` + `EvidenceEntry`.
+/// and `adjudicator_auth_kind` into `acta:override:v2`, and atomically notarizes the
+/// `OverrideAttestation` + `EvidenceEntry`.
 pub async fn handle_attest_override(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -174,7 +172,6 @@ pub async fn handle_attest_override(
         }
     };
 
-    // 1. Cedar Policy-Before-Attest (`Action::"attest"`) runs BEFORE touching SQL!
     let (policy_decision, _perm_root) = state.policy_gate.evaluate_action(
         &req.tenant_id,
         &effective_actor,
@@ -225,7 +222,6 @@ pub async fn handle_attest_override(
         }
     }
 
-    // 2. Parse & enforce Ed25519 client signature (`acta:override_client_sig:v1`) / OAuth principal binding!
     let client_signature: Option<Vec<u8>> = match req
         .client_signature_hex
         .as_deref()
@@ -368,12 +364,16 @@ pub async fn handle_attest_override(
             let arr: [u8; 32] = decoded.try_into().map_err(|_| {
                 ApiError::bad_request("source_bundle_hash_hex must be 32 bytes (64 hex chars)")
             })?;
-            let (orig_bundle, _) =
-                evidence_repo::fetch_bundle_with_evidence_slice(&state.pool, &arr).await?;
-            if orig_bundle.tenant_id != req.tenant_id || orig_bundle.scope != req.scope {
+            let (orig_bundle, _) = evidence_repo::fetch_bundle_with_evidence_slice_scoped(
+                &state.pool,
+                evidence_repo::TenantLookupScope::Exact(&req.tenant_id),
+                &arr,
+            )
+            .await?;
+            if orig_bundle.scope != req.scope {
                 return Err(ApiError::bad_request(format!(
-                    "source_bundle_hash belongs to ({}, {}), not ({}, {})",
-                    orig_bundle.tenant_id, orig_bundle.scope, req.tenant_id, req.scope
+                    "source_bundle_hash belongs to scope '{}', not requested scope '{}'",
+                    orig_bundle.scope, req.scope
                 )));
             }
             let in_dispute = orig_bundle.dispute_records.iter().any(|d| {
@@ -525,6 +525,7 @@ pub async fn handle_attest_override(
             winning_claim_content_hash: winner.content_hash,
             overridden_claims,
             adjudicator_id: effective_actor,
+            adjudicator_auth_kind: adjudicator_auth_kind.clone(),
             justification: req.justification,
             client_signature,
             client_public_key,
@@ -539,6 +540,9 @@ pub async fn handle_attest_override(
         StatusCode::CREATED
     };
 
+    let resp_auth_kind = att.effective_auth_kind().to_string();
+    let resp_domain = att.effective_domain().to_string();
+
     Ok((
         status,
         Json(AttestOverrideResponse {
@@ -551,8 +555,9 @@ pub async fn handle_attest_override(
             winning_claim_content_hash: hex::encode(att.winning_claim_content_hash),
             overridden_claim_ids: att.overridden_claims.iter().map(|c| c.id).collect(),
             adjudicator_id: att.adjudicator_id,
-            adjudicator_auth_kind,
+            adjudicator_auth_kind: resp_auth_kind,
             justification: att.justification,
+            attestation_domain: resp_domain,
             attestation_hash: hex::encode(att.attestation_hash),
             evidence_seq_num: att.evidence_seq_num,
             host_signature: hex::encode(att.host_signature),

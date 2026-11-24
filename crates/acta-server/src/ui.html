@@ -290,7 +290,7 @@
 <header>
   <div class="brand">
     <h1>ACTA COMPILER</h1>
-    <span class="badge">v1.6 CONTROL PLANE</span>
+    <span class="badge">v1.7.1 COMPANY CONTROL PLANE</span>
     <span id="health-badge" class="badge">CHECKING /v1/health...</span>
     <span id="oauth-badge" class="badge">OAUTH 2.1 READY</span>
   </div>
@@ -344,6 +344,67 @@
     </div>
   </div>
 
+  <div class="meta-strip" id="company-kpi-strip" style="grid-template-columns:repeat(auto-fit,minmax(195px,1fr));margin-bottom:18px;">
+    <div class="card" style="padding:13px 16px;">
+      <div class="label">Open Disputed Claims</div>
+      <div id="kpi-disputes" style="font-size:20px;font-weight:700;color:var(--green);">0</div>
+      <div id="kpi-disputes-sub" style="font-size:11.5px;color:var(--muted);">Across active scopes</div>
+    </div>
+    <div class="card" style="padding:13px 16px;">
+      <div class="label">Dispute Overrides (v1/v2)</div>
+      <div id="kpi-overrides" style="font-size:20px;font-weight:700;color:var(--cyan);">0 active</div>
+      <div id="kpi-overrides-sub" style="font-size:11.5px;color:var(--muted);">0 lapsed · 0 superseded</div>
+    </div>
+    <div class="card" style="padding:13px 16px;">
+      <div class="label">Trusted Witnesses</div>
+      <div id="kpi-witnesses" style="font-size:20px;font-weight:700;color:var(--green);">0 active</div>
+      <div id="kpi-witnesses-sub" style="font-size:11.5px;color:var(--muted);">0 retired · 0 compromised</div>
+    </div>
+    <div class="card" style="padding:13px 16px;">
+      <div class="label">Quarantined Anchors</div>
+      <div id="kpi-quarantined" style="font-size:20px;font-weight:700;color:var(--text);">0</div>
+      <div id="kpi-quarantined-sub" style="font-size:11.5px;color:var(--muted);">Append-only preserved rows</div>
+    </div>
+    <div class="card" style="padding:13px 16px;">
+      <div class="label">Signed Ledger Entries</div>
+      <div id="kpi-ledger" style="font-size:20px;font-weight:700;color:var(--cyan);">0</div>
+      <div id="kpi-ledger-sub" style="font-size:11.5px;color:var(--muted);">Ed25519 + RFC 6962 SHA-256</div>
+    </div>
+  </div>
+
+  <div class="card" id="adjudicate-drawer" style="display:none;margin-bottom:18px;border-color:var(--amber);">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;">
+      <div>
+        <div class="label" style="color:var(--amber);margin-bottom:2px;">Adjudicate Competing Claim (acta:override:v2)</div>
+        <div id="adj-target-summary" style="font-size:13.5px;font-weight:600;"></div>
+      </div>
+      <button class="btn-sm" onclick="closeAdjudicateDrawer()">Close</button>
+    </div>
+    <div class="controls-bar" style="margin:10px 0;">
+      <div style="grid-column:span 2;">
+        <div class="label">Evidentiary Justification (Required)</div>
+        <input id="adj-justification" placeholder="e.g. Executed MSA Schedule A section 4.2 governs over legacy export (#MSA-2026)" />
+      </div>
+      <div>
+        <div class="label">Custom Committee ID (Optional — omit for GitHub OAuth identity)</div>
+        <input id="adj-custom-id" placeholder="leave blank for verified GitHub OAuth principal" />
+      </div>
+    </div>
+    <div class="controls-bar" style="margin:8px 0;">
+      <div>
+        <div class="label">Optional Ed25519 Client Public Key Hex (64 hex chars)</div>
+        <input id="adj-client-pk" placeholder="required only when specifying a custom committee ID" />
+      </div>
+      <div>
+        <div class="label">Optional Ed25519 Client Signature Hex (128 hex chars)</div>
+        <input id="adj-client-sig" placeholder="signature over acta:override_client_sig:v1" />
+      </div>
+      <div style="display:flex;align-items:flex-end;">
+        <button class="btn-gh-header" style="width:100%;justify-content:center;" onclick="submitOverrideFromUi()">Notarize Signed Override</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;">
       <div>
@@ -363,8 +424,10 @@
       <button class="tab-btn active" id="tabbtn-claims" onclick="switchTab('claims')">Structured Claims (0)</button>
       <button class="tab-btn" id="tabbtn-objects" onclick="switchTab('objects')">Intents &amp; Memories (0)</button>
       <button class="tab-btn" id="tabbtn-overrides" onclick="switchTab('overrides')">Signed Overrides (0)</button>
+      <button class="tab-btn" id="tabbtn-witnesses" onclick="switchTab('witnesses')">Witnesses &amp; Anchors (0)</button>
       <button class="tab-btn" id="tabbtn-bundles" onclick="switchTab('bundles')">Compiled Bundles (0)</button>
       <button class="tab-btn" id="tabbtn-evidence" onclick="switchTab('evidence')">Signed Evidence Ledger (0)</button>
+      <button class="tab-btn" id="tabbtn-onboarding" onclick="switchTab('onboarding')">Client &amp; SDK Setup</button>
     </div>
 
     <div class="tab-pane active" id="pane-claims" style="overflow-x:auto;">
@@ -422,6 +485,70 @@
           <tr><td colspan="7" style="color:var(--muted);">No signed dispute overrides loaded yet.</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="tab-pane" id="pane-witnesses" style="overflow-x:auto;">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;padding:12px;background:#090d14;border:1px solid var(--border);margin-bottom:14px;">
+        <div style="flex:1;min-width:170px;">
+          <div class="label">New Witness ID</div>
+          <input id="wit-new-id" placeholder="e.g. company-notary-2026" />
+        </div>
+        <div style="flex:2;min-width:260px;">
+          <div class="label">Ed25519 Public Key (64 hex chars)</div>
+          <input id="wit-new-pk" placeholder="32-byte Ed25519 verifying key hex" />
+        </div>
+        <div style="flex:2;min-width:220px;">
+          <div class="label">Description (bound into acta:witness_reg:v3)</div>
+          <input id="wit-new-desc" placeholder="Production transparency witness" />
+        </div>
+        <button class="btn-sm" style="border-color:var(--cyan);padding:8px 14px;" onclick="enrollWitnessFromUi()">Enroll Witness</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Witness ID</th>
+            <th>Status &amp; Mode</th>
+            <th>Domain</th>
+            <th>Registered By</th>
+            <th>Description / Reason</th>
+            <th>Public Key</th>
+            <th>Governance Actions</th>
+          </tr>
+        </thead>
+        <tbody id="witnesses-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">No witnesses enrolled yet.</td></tr>
+        </tbody>
+      </table>
+      <div style="margin-top:16px;" class="label">Quarantined Historical Checkpoint Anchors (Preserved Append-Only Rows)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Tree Size</th>
+            <th>Witness ID</th>
+            <th>Reason</th>
+            <th>Merkle Scheme</th>
+            <th>Merkle Root</th>
+            <th>Checkpoint Hash</th>
+            <th>Anchored At</th>
+          </tr>
+        </thead>
+        <tbody id="quarantined-tbody">
+          <tr><td colspan="7" style="color:var(--muted);">Zero quarantined anchors.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tab-pane" id="pane-onboarding">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;">
+        <div>
+          <div class="label">Claude / Cursor Zero-Key OAuth 2.1 MCP Connector</div>
+          <pre id="onboard-mcp-snippet" style="min-height:140px;"></pre>
+        </div>
+        <div>
+          <div class="label">Python SDK (acta_sdk v1.7.1) &amp; TypeScript SDK (@acta/sdk v1.7.1)</div>
+          <pre id="onboard-sdk-snippet" style="min-height:140px;"></pre>
+        </div>
+      </div>
     </div>
 
     <div class="tab-pane" id="pane-bundles" style="overflow-x:auto;">
@@ -514,7 +641,7 @@
       </button>
       <button class="lab-btn" onclick="runMcpCheck()">
         5. Test MCP Agent Gateway (/mcp)
-        <span class="sub">Executes JSON-RPC 2.0 tools/list (10 tools) + acta_verify_bundle</span>
+        <span class="sub">Executes JSON-RPC 2.0 tools/list (12 tools) + acta_verify_bundle</span>
       </button>
       <button class="lab-btn" onclick="runTenantLockAudit()">
         6. Tenant Lock Audit
@@ -725,10 +852,14 @@ function authHeaders(extraHeaders) {
   return h;
 }
 
+let pendingAdjudicationClaim = null;
+
 function switchTab(name) {
-  for (const t of ['claims', 'objects', 'overrides', 'bundles', 'evidence']) {
-    document.getElementById('tabbtn-' + t).classList.toggle('active', t === name);
-    document.getElementById('pane-' + t).classList.toggle('active', t === name);
+  for (const t of ['claims', 'objects', 'overrides', 'witnesses', 'bundles', 'evidence', 'onboarding']) {
+    const btn = document.getElementById('tabbtn-' + t);
+    const pane = document.getElementById('pane-' + t);
+    if (btn) btn.classList.toggle('active', t === name);
+    if (pane) pane.classList.toggle('active', t === name);
   }
 }
 
@@ -747,7 +878,7 @@ async function refreshHealth() {
     const badge = document.getElementById('health-badge');
     const oauthBadge = document.getElementById('oauth-badge');
     if (d.status === 'ok') {
-      badge.textContent = 'ONLINE · v' + (d.version || '1.6.0') + ' · PG17 + CEDAR';
+      badge.textContent = 'ONLINE · v' + (d.version || '1.7.1') + ' · PG17 + CEDAR';
       badge.className = 'badge ok';
       document.getElementById('host-pubkey').textContent = d.host_public_key;
       document.getElementById('perm-root').textContent = d.permission_root;
@@ -816,13 +947,115 @@ async function loadVaultExplorer() {
   }
   pillsBar.innerHTML = pillsHtml;
 
-  // Update Tab Counts
+  // Update Tab Counts & Company KPI Strip
   const overridesList = data.overrides || [];
+  const witnessesList = data.trusted_witnesses || [];
+  const quarantinedList = data.quarantined_anchors || [];
+  const activeOvr = overridesList.filter(o => !o.is_lapsed && !o.is_superseded).length;
+  const lapsedOvr = overridesList.filter(o => o.is_lapsed).length;
+  const supOvr = overridesList.filter(o => o.is_superseded).length;
+  const activeWit = witnessesList.filter(w => w.active).length;
+  const retiredWit = witnessesList.filter(w => !w.active && w.revocation_mode === 'retire').length;
+  const compWit = witnessesList.filter(w => !w.active && w.revocation_mode !== 'retire').length;
+  const disputedClaims = data.claims.filter(c => c.has_competing_peer && !c.is_superseded).length;
+
+  document.getElementById('kpi-disputes').textContent = String(disputedClaims);
+  document.getElementById('kpi-disputes').style.color = disputedClaims > 0 ? 'var(--amber)' : 'var(--green)';
+  document.getElementById('kpi-disputes-sub').textContent = disputedClaims > 0 ? 'Click DISPUTED row to adjudicate' : 'Zero unresolved claim conflicts';
+  document.getElementById('kpi-overrides').textContent = activeOvr + ' active';
+  document.getElementById('kpi-overrides-sub').textContent = lapsedOvr + ' lapsed · ' + supOvr + ' superseded';
+  document.getElementById('kpi-witnesses').textContent = activeWit + ' active';
+  document.getElementById('kpi-witnesses-sub').textContent = retiredWit + ' retired · ' + compWit + ' compromised';
+  document.getElementById('kpi-quarantined').textContent = String(quarantinedList.length);
+  document.getElementById('kpi-quarantined-sub').textContent = (data.witness_anchors || []).length + ' active checkpoint cosignatures';
+  document.getElementById('kpi-ledger').textContent = '#' + data.evidence.length;
+  document.getElementById('kpi-ledger-sub').textContent = (data.scopes || []).length + ' isolated scopes';
+
   document.getElementById('tabbtn-claims').textContent = 'Structured Claims (' + data.claims.length + ')';
   document.getElementById('tabbtn-objects').textContent = 'Intents & Memories (' + data.objects.length + ')';
   document.getElementById('tabbtn-overrides').textContent = 'Signed Overrides (' + overridesList.length + ')';
+  document.getElementById('tabbtn-witnesses').textContent = 'Witnesses & Anchors (' + witnessesList.length + ')';
   document.getElementById('tabbtn-bundles').textContent = 'Compiled Bundles (' + data.bundles.length + ')';
   document.getElementById('tabbtn-evidence').textContent = 'Signed Evidence Ledger (' + data.evidence.length + ')';
+
+  // Populate Client & SDK Setup Snippets
+  document.getElementById('onboard-mcp-snippet').textContent =
+    '# 1. Claude (claude.ai / Desktop) -> Settings -> Connectors -> Add Custom Connector:
+' +
+    mcpUrl + '
+
+' +
+    '# 2. Cursor (.cursor/mcp.json):
+' +
+    JSON.stringify({ mcpServers: { acta: { url: mcpUrl } } }, null, 2) + '
+
+' +
+    '# 3. Repo-level Auto-Scope (.acta.json):
+' +
+    JSON.stringify({ tenant_id: tenant, default_scope: selectedScopeFilter || 'prod/core' }, null, 2);
+  document.getElementById('onboard-sdk-snippet').textContent =
+    '# Python (acta_sdk v1.7.1)
+' +
+    'from acta_sdk import ActaClient, ContextBudget
+' +
+    'client = ActaClient("' + window.location.origin + '", default_tenant_id="' + tenant + '")
+' +
+    'res = client.compile_guarded(actor_id="agent", scope="' + (selectedScopeFilter || 'prod/core') + '", query_text="check policy", budget=ContextBudget.tokens(2048))
+
+' +
+    '// TypeScript (@acta/sdk v1.7.1)
+' +
+    'import { ActaClient } from "@acta/sdk";
+' +
+    'const acta = new ActaClient({ baseUrl: "' + window.location.origin + '", defaultTenantId: "' + tenant + '" });';
+
+  // Witnesses & Quarantined Anchors Tables
+  const witTbody = document.getElementById('witnesses-tbody');
+  if (witnessesList.length === 0) {
+    witTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">No trusted witnesses enrolled for "' + escHtml(tenant) + '" yet.</td></tr>';
+  } else {
+    witTbody.innerHTML = witnessesList.map((w, idx) => {
+      let stPill = '<span class="pill-ok">ACTIVE (#' + w.evidence_seq_num + ')</span>';
+      if (!w.active) {
+        if (w.revocation_mode === 'retire') {
+          stPill = '<span class="pill-intent">RETIRED (from #' + (w.effective_from_tree_size || w.revocation_evidence_seq_num) + ')</span>';
+        } else {
+          stPill = '<span class="pill-conflict">COMPROMISED (#' + (w.revocation_evidence_seq_num || '?') + ')</span>';
+        }
+      }
+      const descText = w.active ? (w.description || '—') : ('[' + (w.revocation_mode || 'compromise') + '] ' + (w.revocation_reason || ''));
+      const actions = w.active
+        ? '<button class="btn-sm" style="padding:3px 7px;font-size:11px;margin-right:4px;" onclick="event.stopPropagation();promptRevokeWitness('' + escHtml(w.witness_id) + '','retire')">Retire</button>' +
+          '<button class="btn-sm" style="padding:3px 7px;font-size:11px;border-color:var(--red);color:var(--red);" onclick="event.stopPropagation();promptRevokeWitness('' + escHtml(w.witness_id) + '','compromise')">Compromise</button>'
+        : '<span style="color:var(--muted);font-size:11px;">sealed</span>';
+      return '<tr class="clickable-row" onclick="inspectWitness(' + idx + ')">' +
+        '<td><strong>' + escHtml(w.witness_id) + '</strong></td>' +
+        '<td>' + stPill + '</td>' +
+        '<td>' + escHtml(w.reg_domain || 'acta:witness_reg:v3') + '</td>' +
+        '<td>' + escHtml(w.registered_by) + '</td>' +
+        '<td>' + escHtml(descText) + '</td>' +
+        '<td>' + escHtml(w.public_key.slice(0, 16)) + '...</td>' +
+        '<td>' + actions + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  const quarTbody = document.getElementById('quarantined-tbody');
+  if (quarantinedList.length === 0) {
+    quarTbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);">Zero quarantined checkpoint anchors in "' + escHtml(tenant) + '".</td></tr>';
+  } else {
+    quarTbody.innerHTML = quarantinedList.map((qa, idx) => {
+      return '<tr class="clickable-row" onclick="inspectQuarantinedAnchor(' + idx + ')">' +
+        '<td>size=' + qa.tree_size + '</td>' +
+        '<td>' + escHtml(qa.witness_id) + '</td>' +
+        '<td><span class="pill-conflict">' + escHtml(qa.quarantine_reason) + '</span></td>' +
+        '<td>' + escHtml(qa.merkle_scheme || 'rfc6962-sha256-v1') + '</td>' +
+        '<td>' + escHtml(qa.merkle_root.slice(0, 14)) + '...</td>' +
+        '<td>' + escHtml(qa.checkpoint_hash.slice(0, 14)) + '...</td>' +
+        '<td>' + escHtml(new Date(qa.anchored_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
+      '</tr>';
+    }).join('');
+  }
 
   // Overrides Table
   const ovrTbody = document.getElementById('overrides-tbody');
@@ -831,12 +1064,21 @@ async function loadVaultExplorer() {
   } else {
     ovrTbody.innerHTML = overridesList.map((ov, idx) => {
       const shortJust = ov.justification.length > 64 ? (ov.justification.slice(0, 64) + '...') : ov.justification;
-      const sigTag = ov.has_client_signature ? ' <span class="pill-ok">ED25519 CLIENT SIG</span>' : '';
+      const statePill = ov.is_superseded
+        ? '<span style="color:var(--muted);font-size:10.5px;border:1px solid var(--border);padding:2px 6px;">SUPERSEDED</span> '
+        : (ov.is_lapsed
+            ? '<span class="pill-conflict">LAPSED</span> '
+            : '<span class="pill-ok">ACTIVE</span> ');
+      const authTag = ov.has_client_signature
+        ? ' <span class="pill-ok">ED25519 SIG</span>'
+        : (ov.adjudicator_auth_kind === 'oauth_github_principal'
+            ? ' <span class="pill-intent">GITHUB OAUTH</span>'
+            : '');
       return '<tr class="clickable-row" onclick="inspectOverride(' + idx + ')">' +
         '<td>' + escHtml(ov.scope) + '</td>' +
-        '<td><strong>' + escHtml(ov.subject) + '</strong> · ' + escHtml(ov.predicate) + '</td>' +
+        '<td>' + statePill + '<strong>' + escHtml(ov.subject) + '</strong> · ' + escHtml(ov.predicate) + '</td>' +
         '<td style="color:var(--cyan);">' + escHtml(ov.winning_claim_id.slice(0, 8)) + '... (v' + ov.version + ')</td>' +
-        '<td>' + escHtml(ov.adjudicator_id) + sigTag + '</td>' +
+        '<td>' + escHtml(ov.adjudicator_id) + authTag + '</td>' +
         '<td>' + escHtml(shortJust) + '</td>' +
         '<td>#' + ov.evidence_seq_num + '</td>' +
         '<td>' + escHtml(ov.attestation_hash.slice(0, 14)) + '...</td>' +
@@ -851,7 +1093,7 @@ async function loadVaultExplorer() {
   } else {
     claimsTbody.innerHTML = data.claims.map((c, idx) => {
       const stateBadge = c.has_competing_peer
-        ? '<span class="pill-conflict">DISPUTED</span>'
+        ? '<span class="pill-conflict">DISPUTED</span> <button class="btn-sm" style="padding:2px 7px;font-size:10.5px;margin-left:4px;border-color:var(--amber);color:var(--amber);" onclick="event.stopPropagation();openAdjudicateDrawer(' + idx + ')">Adjudicate</button>'
         : '<span class="pill-ok">' + escHtml(c.status.toUpperCase()) + ' v' + c.version + '</span>';
       return '<tr class="clickable-row" onclick="inspectClaim(' + idx + ')">' +
         '<td>' + escHtml(c.scope) + '</td>' +
@@ -930,7 +1172,15 @@ async function loadVaultExplorer() {
               ? '<span class="pill-conflict">' + escHtml(e.refusal_metadata.reason_code) + (e.refusal_metadata.target_scope ? ' (' + escHtml(e.refusal_metadata.target_scope) + ')' : '') + '</span>'
               : (e.override_summary
                   ? '<span class="pill-intent">OVERRIDE ' + escHtml(e.override_summary.subject) + '·' + escHtml(e.override_summary.predicate) + '</span>'
-                  : '<span style="color:var(--muted);">legacy refusal (v1)</span>'))) + '</td>' +
+                  : (e.witness_reg_summary
+                      ? '<span class="pill-ok">WITNESS REG · ' + escHtml(e.witness_reg_summary.witness_id) + '</span>'
+                      : (e.witness_revoke_summary
+                          ? '<span class="pill-conflict">WITNESS ' + escHtml((e.witness_revoke_summary.revocation_mode || 'compromise').toUpperCase()) + ' · ' + escHtml(e.witness_revoke_summary.witness_id) + '</span>'
+                          : (e.write_summary
+                              ? '<span class="pill-ok">' + escHtml(e.write_summary.operation.toUpperCase()) + ' · ' + escHtml(e.write_summary.scope) + '</span>'
+                              : (e.answer_cache_summary
+                                  ? '<span class="pill-intent">ANSWER CACHE · ' + escHtml(e.answer_cache_summary.scope) + '</span>'
+                                  : '<span style="color:var(--muted);">legacy refusal (v1)</span>'))))))) + '</td>' +
         '<td>' + escHtml(e.host_signature.slice(0, 18)) + '...</td>' +
         '<td>' + escHtml(new Date(e.created_at).toISOString().replace('T', ' ').slice(0, 19)) + 'Z</td>' +
       '</tr>';
@@ -983,6 +1233,130 @@ function inspectObject(idx) {
   }, null, 2);
 }
 
+function inspectWitness(idx) {
+  if (!cachedVaultData || !cachedVaultData.trusted_witnesses || !cachedVaultData.trusted_witnesses[idx]) return;
+  const w = cachedVaultData.trusted_witnesses[idx];
+  document.getElementById('left-pane-title').textContent = 'Trusted Witness Record (' + w.witness_id + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(w, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Witness Registry Commitment';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    witness_id: w.witness_id,
+    active: w.active,
+    reg_domain: w.reg_domain,
+    evidence_seq_num: w.evidence_seq_num,
+    revocation_mode: w.revocation_mode || null,
+    effective_from_tree_size: w.effective_from_tree_size || null
+  }, null, 2);
+}
+
+function inspectQuarantinedAnchor(idx) {
+  if (!cachedVaultData || !cachedVaultData.quarantined_anchors || !cachedVaultData.quarantined_anchors[idx]) return;
+  const qa = cachedVaultData.quarantined_anchors[idx];
+  document.getElementById('left-pane-title').textContent = 'Quarantined Anchor Row (tree_size=' + qa.tree_size + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(qa, null, 2);
+  document.getElementById('right-pane-title').textContent = 'Quarantine Diagnostics';
+  document.getElementById('receipt-output').textContent = JSON.stringify({
+    quarantine_reason: qa.quarantine_reason,
+    merkle_scheme: qa.merkle_scheme,
+    witness_id: qa.witness_id,
+    tree_size: qa.tree_size
+  }, null, 2);
+}
+
+function openAdjudicateDrawer(claimIdx) {
+  if (!cachedVaultData || !cachedVaultData.claims[claimIdx]) return;
+  const c = cachedVaultData.claims[claimIdx];
+  pendingAdjudicationClaim = c;
+  document.getElementById('adj-target-summary').textContent =
+    'Scope "' + c.scope + '" · ' + c.subject + '.' + c.predicate + ' = ' + JSON.stringify(c.object_val) +
+    ' (winning_claim_id=' + c.id + ', source=' + c.source_descriptor + ')';
+  document.getElementById('adjudicate-drawer').style.display = 'block';
+  document.getElementById('adj-justification').focus();
+}
+
+function closeAdjudicateDrawer() {
+  pendingAdjudicationClaim = null;
+  document.getElementById('adjudicate-drawer').style.display = 'none';
+}
+
+async function submitOverrideFromUi() {
+  if (!pendingAdjudicationClaim) return;
+  const tenant = activeTenantId();
+  const just = document.getElementById('adj-justification').value.trim();
+  if (!just) {
+    alert('Please enter a single-line evidentiary justification.');
+    return;
+  }
+  const body = {
+    tenant_id: tenant,
+    scope: pendingAdjudicationClaim.scope,
+    winning_claim_id: pendingAdjudicationClaim.id,
+    justification: just
+  };
+  const customId = document.getElementById('adj-custom-id').value.trim();
+  const cPk = document.getElementById('adj-client-pk').value.trim();
+  const cSig = document.getElementById('adj-client-sig').value.trim();
+  if (customId) body.adjudicator_id = customId;
+  if (cPk) body.client_public_key_hex = cPk;
+  if (cSig) body.client_signature_hex = cSig;
+
+  const res = await fetch('/v1/overrides', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  document.getElementById('left-pane-title').textContent = 'Override Attestation Result (HTTP ' + res.status + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(data, null, 2);
+  if (res.ok) {
+    closeAdjudicateDrawer();
+    await loadVaultExplorer();
+  }
+}
+
+async function enrollWitnessFromUi() {
+  const tenant = activeTenantId();
+  const wid = document.getElementById('wit-new-id').value.trim();
+  const pk = document.getElementById('wit-new-pk').value.trim();
+  const desc = document.getElementById('wit-new-desc').value.trim();
+  if (!wid || !pk) {
+    alert('Enter both Witness ID and 64-hex Ed25519 Public Key.');
+    return;
+  }
+  const body = { tenant_id: tenant, witness_id: wid, witness_public_key_hex: pk };
+  if (desc) body.description = desc;
+  const res = await fetch('/v1/witnesses', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  document.getElementById('left-pane-title').textContent = 'Witness Enrollment Result (HTTP ' + res.status + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(data, null, 2);
+  if (res.ok) {
+    document.getElementById('wit-new-id').value = '';
+    document.getElementById('wit-new-pk').value = '';
+    document.getElementById('wit-new-desc').value = '';
+    await loadVaultExplorer();
+  }
+}
+
+async function promptRevokeWitness(witnessId, mode) {
+  const label = mode === 'retire' ? 'graceful non-retroactive retirement' : 'retroactive key-compromise revocation';
+  const reason = prompt('Enter single-line evidentiary reason for ' + label + ' of "' + witnessId + '":');
+  if (!reason || !reason.trim()) return;
+  const tenant = activeTenantId();
+  const res = await fetch('/v1/witnesses/revoke', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ tenant_id: tenant, witness_id: witnessId, mode: mode, reason: reason.trim() })
+  });
+  const data = await res.json();
+  document.getElementById('left-pane-title').textContent = 'Witness ' + mode.toUpperCase() + ' Result (HTTP ' + res.status + ')';
+  document.getElementById('context-output').textContent = JSON.stringify(data, null, 2);
+  if (res.ok) await loadVaultExplorer();
+}
+
 function inspectOverride(idx) {
   if (!cachedVaultData || !cachedVaultData.overrides || !cachedVaultData.overrides[idx]) return;
   const ov = cachedVaultData.overrides[idx];
@@ -1013,11 +1387,20 @@ function inspectEvidence(idx) {
       'Operation:    ' + e.refusal_metadata.operation + '\n' +
       'Reason Code:  ' + e.refusal_metadata.reason_code + '\n' +
       'Target Scope: ' + (e.refusal_metadata.target_scope || '—') + '\n' +
+      (e.refusal_metadata.attempted_checkpoint_hash ? 'Attempted CP: ' + e.refusal_metadata.attempted_checkpoint_hash + '\n' : '') +
       'Summary:      ' + e.refusal_metadata.summary;
   } else if (e.override_summary) {
     document.getElementById('context-output').textContent =
       'Notarized Dispute-Override Entry (acta:evidence_event:v2)\n' +
       JSON.stringify(e.override_summary, null, 2);
+  } else if (e.witness_reg_summary) {
+    document.getElementById('context-output').textContent =
+      'Trusted Witness Enrollment (' + e.witness_reg_summary.registration_domain + ')\n' +
+      JSON.stringify(e.witness_reg_summary, null, 2);
+  } else if (e.witness_revoke_summary) {
+    document.getElementById('context-output').textContent =
+      'Trusted Witness Lifecycle Transition (' + e.witness_revoke_summary.revocation_domain + ')\n' +
+      JSON.stringify(e.witness_revoke_summary, null, 2);
   } else {
     document.getElementById('context-output').textContent =
       'Verdict: ' + e.policy_result.toUpperCase() + ' (legacy v1 commitment: ' + (e.state_commitment || 'none') + ')';
@@ -1223,7 +1606,7 @@ async function runMcpCheck() {
   });
   const callJson = await callRes.json();
 
-  document.getElementById('left-pane-title').textContent = 'MCP JSON-RPC 2.0 tools/list Discovery (10 Tools)';
+  document.getElementById('left-pane-title').textContent = 'MCP JSON-RPC 2.0 tools/list Discovery (12 Tools)';
   document.getElementById('context-output').textContent = JSON.stringify(listJson, null, 2);
   document.getElementById('right-pane-title').textContent = 'MCP tools/call (acta_verify_bundle proof_mode=merkle)';
   document.getElementById('receipt-output').textContent = JSON.stringify(callJson, null, 2);

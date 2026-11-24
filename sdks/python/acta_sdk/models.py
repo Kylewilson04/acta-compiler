@@ -41,6 +41,9 @@ class CompileResult:
     bundle: dict[str, Any] | None
     evidence: dict[str, Any]
     verified_host_pubkey: str
+    context_token_count: int | None = None
+    context_token_ids: list[int] | None = None
+    context_token_bytes_hex: list[str] | None = None
 
     @property
     def is_allow(self) -> bool:
@@ -71,6 +74,21 @@ class CompileResult:
             bundle=dict(payload["bundle"]) if payload.get("bundle") is not None else None,
             evidence=dict(payload["evidence"]),
             verified_host_pubkey=verified_host_pubkey,
+            context_token_count=(
+                int(payload["context_token_count"])
+                if payload.get("context_token_count") is not None
+                else None
+            ),
+            context_token_ids=(
+                [int(x) for x in payload["context_token_ids"]]
+                if payload.get("context_token_ids") is not None
+                else None
+            ),
+            context_token_bytes_hex=(
+                [str(x) for x in payload["context_token_bytes_hex"]]
+                if payload.get("context_token_bytes_hex") is not None
+                else None
+            ),
         )
 
 

@@ -2,7 +2,7 @@ use acta_crypto::{verify_export_archive, VerificationSummary};
 use acta_store::evidence_repo;
 use acta_types::{EvidenceEntry, ExportArchive, PolicyResultTag};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -29,11 +29,22 @@ pub struct VerifyArchiveResponse {
     pub refusal_evidence_seq_num: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EvidenceQueryParams {
+    pub from_seq: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantEvidenceResponse {
     pub tenant_id: String,
     pub host_public_key: String,
+    pub total_count: usize,
     pub entry_count: usize,
+    pub from_seq: i64,
+    pub limit: i64,
+    pub has_more: bool,
+    pub next_seq: Option<i64>,
     pub entries: Vec<EvidenceEntry>,
 }
 
@@ -91,26 +102,49 @@ pub async fn handle_verify_archive(
     }
 }
 
-/// `GET /v1/tenants/:tenant_id/evidence` -> returns the full hash-chained `evidence_history`
-/// audit ledger for `tenant_id` (including `allow`, `block`, and `escalate` events + `refusal_metadata`).
+/// `GET /v1/tenants/:tenant_id/evidence?from_seq=1&limit=100` -> returns a paginated slice (`1..=500`,
+/// default `limit = 100`) of the hash-chained `evidence_history` audit ledger for `tenant_id`.
 pub async fn handle_tenant_evidence(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
+    Query(query): Query<EvidenceQueryParams>,
     headers: HeaderMap,
 ) -> Result<Json<TenantEvidenceResponse>, ApiError> {
-    if tenant_id.trim().is_empty() {
+    let clean_tenant = tenant_id.trim();
+    if clean_tenant.is_empty() {
         return Err(ApiError::bad_request("tenant_id must be non-empty"));
     }
     state
-        .check_tenant_auth_audited(&headers, &tenant_id, "list_evidence")
+        .check_tenant_auth_audited(&headers, clean_tenant, "list_evidence")
         .await
         .map_err(ApiError::unauthorized)?;
 
-    let entries = evidence_repo::fetch_tenant_evidence_chain(&state.pool, &tenant_id, None).await?;
+    let from_seq = query.from_seq.unwrap_or(1);
+    let limit = query.limit.unwrap_or(100);
+    let (total_count, entries) = evidence_repo::fetch_tenant_evidence_page(
+        &state.pool,
+        clean_tenant,
+        from_seq,
+        limit,
+        None,
+    )
+    .await?;
+
+    let next_seq = match entries.last() {
+        Some(last) if (last.seq_num as usize) < total_count => Some(last.seq_num + 1),
+        None if total_count > 0 && (from_seq as usize) <= total_count => Some(from_seq),
+        _ => None,
+    };
+
     Ok(Json(TenantEvidenceResponse {
-        tenant_id,
+        tenant_id: clean_tenant.to_string(),
         host_public_key: hex::encode(state.host_public_key),
+        total_count,
         entry_count: entries.len(),
+        from_seq,
+        limit,
+        has_more: next_seq.is_some(),
+        next_seq,
         entries,
     }))
 }

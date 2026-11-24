@@ -92,26 +92,39 @@ pub mod serde_hex {
 }
 
 pub use bundle::{
-    AnchorCheckpointRequest, ContextBundle, EntryInclusionProof, EvidenceEntry, ExportArchive,
-    ExternalWitnessAnchor, MerkleBundleProof, OmissionReason, OmissionRecord, OmittedItem,
-    OverrideLedgerSummary, PolicyResultTag, RefusalMetadata, ResolverManifest, SignedTreeHead,
+    AnchorCheckpointRequest, AnswerCacheLedgerSummary, ContextBundle, EntryInclusionProof,
+    EvidenceEntry, ExportArchive, ExternalWitnessAnchor, MerkleBundleProof, OmissionReason,
+    OmissionRecord, OmittedItem, OverrideLedgerSummary, PolicyResultTag, QuarantinedAnchorRecord,
+    RefusalMetadata, RegisterWitnessRequest, RegisterWitnessResponse, ResolverManifest,
+    RevokeWitnessRequest, RevokeWitnessResponse, SignedTreeHead, StateRebuildArchive,
+    TrustedWitness, WitnessRegistrationSummary, WitnessRevocationSummary, WriteLedgerSummary,
+    WriteOperationKind, ANSWER_CACHE_DOMAIN_V1, CACHE_DEPENDENCY_DOMAIN_V1,
     DEFAULT_CORROBORATION_DAMPING, DEFAULT_DECISIVENESS_THRESHOLD, DEFAULT_MIN_CONFIDENCE,
-    SCHEMA_VERSION,
+    SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V2,
+    WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1, WITNESS_REVOKE_DOMAIN_V2,
+    WRITE_EVENT_DOMAIN_V1,
 };
 pub use claims::{
-    AttestOverrideRequest, AttestOverrideResponse, ClaimCandidate, ClaimStatus, DisputeReasonCode,
-    DisputeRecord, IngestClaimRequest, IngestClaimResponse, KnowledgeClaim, LapsedOverrideRef,
-    OverriddenClaimRef, OverrideAttestation, OverrideResolutionRef, ResolutionRecord,
+    infer_override_auth_kind, AttestOverrideRequest, AttestOverrideResponse, ClaimCandidate,
+    ClaimStatus, DisputeReasonCode, DisputeRecord, IngestClaimRequest, IngestClaimResponse,
+    KnowledgeClaim, LapsedOverrideRef, OverriddenClaimRef, OverrideAttestation,
+    OverrideResolutionRef, ResolutionRecord, RetractClaimRequest, RetractClaimResponse,
+    OVERRIDE_DOMAIN_V1, OVERRIDE_DOMAIN_V2,
 };
 pub use error::{ActaError, ActaResult};
 pub use objects::{
     IngestObjectRequest, IngestObjectResponse, LifecycleStatus, ObjectType, RankedMemory,
     SelectedObjectRef, StoredObject,
 };
-pub use request::{CompileRequest, CompileResponse, ContextBudget, PolicyDecision};
+pub use request::{
+    CacheAnswerRequest, CacheAnswerResponse, CacheDependencySpec, CachedAnswerReceipt,
+    CompileRequest, CompileResponse,
+    ContextBudget, ImpactBundleRecord, ImpactedCachedAnswerRecord, LedgerStateRebuildResponse,
+    LookupCachedAnswerRequest, LookupCachedAnswerResponse, PolicyDecision, TraceItemImpactResponse,
+};
 pub use validation::{
-    validate_budget, validate_confidence, validate_identifier, validate_importance,
-    validate_json_payload_size, validate_justification, validate_priority,
+    validate_budget, validate_claim_value_type, validate_confidence, validate_identifier,
+    validate_importance, validate_json_payload_size, validate_justification, validate_priority,
     validate_provenance_class, validate_query_text, validate_scope, validate_tags,
 };
 
@@ -167,6 +180,8 @@ mod tests {
             OmissionReason::PolicyDenied,
             OmissionReason::Superseded,
             OmissionReason::DisputedWithheld,
+            OmissionReason::Retracted,
+            OmissionReason::RetractionTombstone,
         ];
         let encoded_reasons = serde_json::to_string(&reasons).unwrap();
         let decoded_reasons: Vec<OmissionReason> = serde_json::from_str(&encoded_reasons).unwrap();
@@ -195,6 +210,9 @@ mod tests {
             version: 1,
             predecessor_id: None,
             client_signature: Some(vec![0xAA; 64]),
+            client_public_key: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: now,
         };
 
@@ -218,6 +236,11 @@ mod tests {
             valid_to: None,
             version: 1,
             predecessor_id: None,
+            client_signature: None,
+            client_public_key: None,
+            retraction_reason: None,
+            written_by: None,
+            evidence_seq_num: None,
             created_at: now,
         };
 
@@ -252,6 +275,7 @@ mod tests {
                     ClaimCandidate::from(&claim_a),
                     ClaimCandidate::from(&claim_b),
                 ],
+                margin: Some(0.07),
                 reason_code: DisputeReasonCode::InsufficientMargin,
                 escalation_required: true,
                 lapsed_override: None,
@@ -265,6 +289,7 @@ mod tests {
                 full_excluded_hash: [0x55; 32],
                 has_unresolved_claims: true,
             },
+            resolved_facts_omitted: Some(0),
             state_commitment: [0x66; 32],
             dependency_commitment: [0x77; 32],
             issued_at: now,
@@ -273,6 +298,7 @@ mod tests {
         let evidence = EvidenceEntry {
             tenant_id: "tenant-1".to_string(),
             seq_num: 1,
+            event_domain: Some("acta:evidence_event:v1".to_string()),
             prev_hash: [0u8; 32],
             event_hash: [0x88; 32],
             bundle_hash: Some([0x99; 32]),
@@ -280,6 +306,10 @@ mod tests {
             policy_result: PolicyResultTag::Allow,
             refusal_metadata: None,
             override_summary: None,
+            write_summary: None,
+            answer_cache_summary: None,
+            witness_reg_summary: None,
+            witness_revoke_summary: None,
             host_signature: [0xAB; 64],
             created_at: now,
         };

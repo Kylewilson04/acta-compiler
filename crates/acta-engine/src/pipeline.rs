@@ -10,16 +10,16 @@ use acta_store::evidence_repo::BundleWritePayload;
 use acta_store::CompileStore;
 use acta_types::{
     ActaError, ActaResult, ClaimStatus, CompileRequest, CompileResponse, ContextBudget,
-    ContextBundle, KnowledgeClaim, OverrideAttestation, PolicyDecision, PolicyResultTag,
-    RankedMemory, RefusalMetadata, ResolverManifest, StoredObject,
+    ContextBundle, DisputeReasonCode, KnowledgeClaim, OmissionReason, OverrideAttestation,
+    PolicyDecision, PolicyResultTag, RankedMemory, RefusalMetadata, ResolverManifest, StoredObject,
     DEFAULT_CORROBORATION_DAMPING, SCHEMA_VERSION,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
 use uuid::Uuid;
 
-use crate::budget::apply_budget_and_omissions;
-use crate::resolver::{resolve_claims_with_overrides, ResolverConfig};
+use crate::budget::{apply_budget_and_omissions, apply_budget_and_omissions_with_mode, count_tokens, encode_token_spans};
+use crate::resolver::{resolve_claims_with_overrides, resolve_claims_with_overrides_v171_compat, ResolverConfig};
 
 /// Computes the deterministic state watermark timestamp across all evaluated objects, claims,
 /// and signed dispute overrides in `(tenant_id, scope)` so repeated compiles over unchanged vault
@@ -98,6 +98,26 @@ impl Default for PipelineConfig {
     }
 }
 
+/// Compatibility flags for reproducing historical pre-`v1.6.7` `source_bundle_hash` baselines bit-for-bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulationCompat {
+    pub include_resolver_manifest: bool,
+    pub legacy_pre_v166_disputes: bool,
+    pub include_resolved_facts_omitted: bool,
+    pub legacy_pre_v171_resolver: bool,
+}
+
+impl Default for SimulationCompat {
+    fn default() -> Self {
+        Self {
+            include_resolver_manifest: true,
+            legacy_pre_v166_disputes: false,
+            include_resolved_facts_omitted: true,
+            legacy_pre_v171_resolver: false,
+        }
+    }
+}
+
 /// Read-only counterfactual compile simulation result (never mutates `context_bundles` or `evidence_history` on Allow).
 #[derive(Debug, Clone)]
 pub struct CompileSimulation {
@@ -105,7 +125,64 @@ pub struct CompileSimulation {
     pub permission_root: [u8; 32],
     pub bundle_hash: Option<[u8; 32]>,
     pub context_text: Option<String>,
+    pub context_token_count: Option<usize>,
     pub bundle: Option<ContextBundle>,
+}
+
+/// Returns `true` iff the epistemic resolution outcome (policy class, resolved fact winners,
+/// or disputed claim groups) differs between `base` and `cf`.
+pub fn compute_resolution_changed(base: &CompileSimulation, cf: &CompileSimulation) -> bool {
+    let policy_class = |d: &PolicyDecision| -> u8 {
+        match d {
+            PolicyDecision::Allow => 0,
+            PolicyDecision::Block { .. } => 1,
+            PolicyDecision::Escalate { .. } => 2,
+        }
+    };
+    if policy_class(&base.policy_decision) != policy_class(&cf.policy_decision) {
+        return true;
+    }
+    let (Some(b1), Some(b2)) = (&base.bundle, &cf.bundle) else {
+        return base.bundle.is_some() != cf.bundle.is_some();
+    };
+
+    let res_sig = |b: &ContextBundle| -> Vec<([u8; 32], Uuid, [u8; 32], Option<[u8; 32]>)> {
+        b.resolution_records
+            .iter()
+            .map(|r| {
+                (
+                    r.claim_group_key,
+                    r.winning_claim.id,
+                    r.winning_claim.content_hash,
+                    r.override_attestation.as_ref().map(|o| o.attestation_hash),
+                )
+            })
+            .collect()
+    };
+
+    let disp_sig =
+        |b: &ContextBundle| -> Vec<([u8; 32], DisputeReasonCode, Vec<(Uuid, [u8; 32])>)> {
+            b.dispute_records
+                .iter()
+                .map(|d| {
+                    let norm_reason = if d.lapsed_override.is_some()
+                        && d.reason_code == DisputeReasonCode::InsufficientMargin
+                    {
+                        DisputeReasonCode::LapsedOverrideReopened
+                    } else {
+                        d.reason_code
+                    };
+                    let cands = d
+                        .competing_claims
+                        .iter()
+                        .map(|c| (c.id, c.content_hash))
+                        .collect();
+                    (d.claim_group_key, norm_reason, cands)
+                })
+                .collect()
+        };
+
+    res_sig(b1) != res_sig(b2) || disp_sig(b1) != disp_sig(b2)
 }
 
 pub struct CompilePipeline<S: CompileStore> {
@@ -182,10 +259,31 @@ impl<S: CompileStore> CompilePipeline<S> {
         resolver_override: Option<ResolverConfig>,
         include_resolver_manifest: bool,
     ) -> ActaResult<CompileSimulation> {
-        let eval_wall_clock = req
-            .evaluation_time
-            .unwrap_or_else(Utc::now)
-            .trunc_subsecs(6);
+        self.simulate_compile_with_compat(
+            req,
+            policy_override,
+            resolver_override,
+            SimulationCompat {
+                include_resolver_manifest,
+                legacy_pre_v166_disputes: false,
+                include_resolved_facts_omitted: true,
+                legacy_pre_v171_resolver: false,
+            },
+        )
+        .await
+    }
+
+    /// Time-pinned counterfactual simulation (`created_at <= evaluation_time` + supersession cutoffs)
+    /// with optional historical `source_bundle_hash` schema compatibility.
+    pub async fn simulate_compile_with_compat(
+        &self,
+        req: CompileRequest,
+        policy_override: Option<&PolicyGate>,
+        resolver_override: Option<ResolverConfig>,
+        compat: SimulationCompat,
+    ) -> ActaResult<CompileSimulation> {
+        let as_of_cutoff = req.evaluation_time.map(|t| t.trunc_subsecs(6));
+        let eval_wall_clock = as_of_cutoff.unwrap_or_else(|| Utc::now().trunc_subsecs(6));
 
         let active_gate = policy_override.unwrap_or(&self.policy_gate);
         let (policy_decision, permission_root) = active_gate.evaluate_action(
@@ -202,6 +300,7 @@ impl<S: CompileStore> CompilePipeline<S> {
                 permission_root,
                 bundle_hash: None,
                 context_text: None,
+                context_token_count: None,
                 bundle: None,
             });
         }
@@ -218,18 +317,25 @@ impl<S: CompileStore> CompilePipeline<S> {
             (scoped_claims, superseded_claims),
             scoped_overrides,
         ) = tokio::try_join!(
-            self.store.fetch_scoped_intents(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_memories_ranked(
+            self.store
+                .fetch_scoped_intents_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
+            self.store.fetch_scoped_memories_ranked_as_of(
                 &req.tenant_id,
                 &req.scope,
                 req.query_embedding.as_deref(),
                 eval_wall_clock,
                 mem_limit,
+                as_of_cutoff,
+            ),
+            self.store.fetch_all_active_hashes_in_scope_as_of(
+                &req.tenant_id,
+                &req.scope,
+                as_of_cutoff,
             ),
             self.store
-                .fetch_all_active_hashes_in_scope(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_claims(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_overrides(&req.tenant_id, &req.scope),
+                .fetch_scoped_claims_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
+            self.store
+                .fetch_scoped_overrides_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
         )?;
 
         let active_overrides: Vec<OverrideAttestation> = scoped_overrides
@@ -237,8 +343,8 @@ impl<S: CompileStore> CompilePipeline<S> {
             .filter(|o| o.created_at <= eval_wall_clock)
             .collect();
 
-        let bundle_time = match req.evaluation_time {
-            Some(explicit_t) => explicit_t.trunc_subsecs(6),
+        let bundle_time = match as_of_cutoff {
+            Some(explicit_t) => explicit_t,
             None => compute_state_watermark(
                 &intents,
                 &ranked_memories,
@@ -248,7 +354,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             ),
         };
 
-        if req.evaluation_time.is_none() && req.query_embedding.is_none() {
+        if req.query_embedding.is_none() {
             restabilize_scalar_memory_scores(&mut ranked_memories, bundle_time);
         }
 
@@ -291,18 +397,31 @@ impl<S: CompileStore> CompilePipeline<S> {
             .collect();
 
         let resolver_cfg = resolver_override.unwrap_or_else(|| self.config.resolver.clone());
-        let resolver_out = resolve_claims_with_overrides(
+        let resolver_out = resolve_claims_with_overrides_v171_compat(
             scoped_claims,
             &active_overrides,
             eval_wall_clock,
             &resolver_cfg,
+            compat.legacy_pre_v166_disputes,
+            compat.legacy_pre_v171_resolver,
         );
 
         let mut pre_excluded = object_scan.excluded_objects;
-        pre_excluded.extend(superseded_claims);
+        if compat.legacy_pre_v171_resolver {
+            pre_excluded.extend(superseded_claims.into_iter().map(|(id, r)| {
+                let mapped = match r {
+                    OmissionReason::Retracted => OmissionReason::Superseded,
+                    OmissionReason::RetractionTombstone => OmissionReason::LifecycleExpired,
+                    other => other,
+                };
+                (id, mapped)
+            }));
+        } else {
+            pre_excluded.extend(superseded_claims);
+        }
         pre_excluded.extend(resolver_out.excluded_claims);
 
-        let budgeted = apply_budget_and_omissions(
+        let budgeted = apply_budget_and_omissions_with_mode(
             intents,
             resolver_out.resolutions,
             resolver_out.disputes,
@@ -311,6 +430,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             unfetched_tail_memory_ids,
             req.budget,
             self.config.max_inline_omissions,
+            compat.include_resolved_facts_omitted,
         )?;
 
         let intent_root = compute_sub_commitment(&object_scan.active_intent_hashes);
@@ -328,7 +448,7 @@ impl<S: CompileStore> CompilePipeline<S> {
         );
         let dependency_commitment = compute_dependency_commitment(&evaluated_hashes);
 
-        let resolver_manifest = if include_resolver_manifest {
+        let resolver_manifest = if compat.include_resolver_manifest {
             Some(ResolverManifest::new(
                 resolver_cfg.min_confidence,
                 resolver_cfg.decisiveness_threshold,
@@ -352,18 +472,25 @@ impl<S: CompileStore> CompilePipeline<S> {
             resolution_records: budgeted.selected_resolutions,
             dispute_records: budgeted.selected_disputes,
             omission_record: budgeted.omission_record,
+            resolved_facts_omitted: if compat.include_resolved_facts_omitted {
+                Some(budgeted.resolved_facts_omitted)
+            } else {
+                None
+            },
             state_commitment,
             dependency_commitment,
             issued_at: bundle_time,
         };
 
         let (bundle_hash, _canonical) = compute_bundle_hash(&bundle)?;
+        let token_cnt = count_tokens(&budgeted.context_text)?;
 
         Ok(CompileSimulation {
             policy_decision: PolicyDecision::Allow,
             permission_root,
             bundle_hash: Some(bundle_hash),
             context_text: Some(budgeted.context_text),
+            context_token_count: Some(token_cnt),
             bundle: Some(bundle),
         })
     }
@@ -394,6 +521,7 @@ impl<S: CompileStore> CompilePipeline<S> {
                         req.actor_id, req.scope, reason
                     ),
                     scope_state_commitment: None,
+                    attempted_checkpoint_hash: None,
                 };
                 let evidence = self
                     .store
@@ -409,6 +537,10 @@ impl<S: CompileStore> CompilePipeline<S> {
                     policy_decision,
                     bundle_hash: None,
                     context_text: None,
+                    context_token_count: None,
+                    context_token_ids: None,
+                    context_token_bytes_hex: None,
+                    resolved_facts_omitted: None,
                     bundle: None,
                     evidence,
                 });
@@ -423,6 +555,7 @@ impl<S: CompileStore> CompilePipeline<S> {
                         req.actor_id, req.scope, reason
                     ),
                     scope_state_commitment: None,
+                    attempted_checkpoint_hash: None,
                 };
                 let evidence = self
                     .store
@@ -438,6 +571,10 @@ impl<S: CompileStore> CompilePipeline<S> {
                     policy_decision,
                     bundle_hash: None,
                     context_text: None,
+                    context_token_count: None,
+                    context_token_ids: None,
+                    context_token_bytes_hex: None,
+                    resolved_facts_omitted: None,
                     bundle: None,
                     evidence,
                 });
@@ -453,6 +590,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             _ => self.config.candidate_memory_fetch_limit,
         };
 
+        let as_of_cutoff = req.evaluation_time.map(|t| t.trunc_subsecs(6));
         let (
             intents,
             mut ranked_memories,
@@ -460,18 +598,25 @@ impl<S: CompileStore> CompilePipeline<S> {
             (scoped_claims, superseded_claims),
             scoped_overrides,
         ) = tokio::try_join!(
-            self.store.fetch_scoped_intents(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_memories_ranked(
+            self.store
+                .fetch_scoped_intents_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
+            self.store.fetch_scoped_memories_ranked_as_of(
                 &req.tenant_id,
                 &req.scope,
                 req.query_embedding.as_deref(),
                 eval_wall_clock,
                 mem_limit,
+                as_of_cutoff,
+            ),
+            self.store.fetch_all_active_hashes_in_scope_as_of(
+                &req.tenant_id,
+                &req.scope,
+                as_of_cutoff,
             ),
             self.store
-                .fetch_all_active_hashes_in_scope(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_claims(&req.tenant_id, &req.scope),
-            self.store.fetch_scoped_overrides(&req.tenant_id, &req.scope),
+                .fetch_scoped_claims_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
+            self.store
+                .fetch_scoped_overrides_as_of(&req.tenant_id, &req.scope, as_of_cutoff),
         )?;
 
         let active_overrides: Vec<OverrideAttestation> = scoped_overrides
@@ -479,8 +624,8 @@ impl<S: CompileStore> CompilePipeline<S> {
             .filter(|o| o.created_at <= eval_wall_clock)
             .collect();
 
-        let bundle_time = match req.evaluation_time {
-            Some(explicit_t) => explicit_t.trunc_subsecs(6),
+        let bundle_time = match as_of_cutoff {
+            Some(explicit_t) => explicit_t,
             None => compute_state_watermark(
                 &intents,
                 &ranked_memories,
@@ -490,7 +635,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             ),
         };
 
-        if req.evaluation_time.is_none() && req.query_embedding.is_none() {
+        if req.query_embedding.is_none() {
             restabilize_scalar_memory_scores(&mut ranked_memories, bundle_time);
         }
 
@@ -585,6 +730,7 @@ impl<S: CompileStore> CompilePipeline<S> {
                     target_scope: Some(req.scope.clone()),
                     summary: msg.clone(),
                     scope_state_commitment: Some(state_commitment),
+                    attempted_checkpoint_hash: None,
                 };
                 let ev = self
                     .store
@@ -615,6 +761,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             permission_root,
         );
 
+        let resolved_facts_omitted = budgeted.resolved_facts_omitted;
         let bundle = ContextBundle {
             schema_version: SCHEMA_VERSION.to_string(),
             tenant_id: req.tenant_id.clone(),
@@ -627,6 +774,7 @@ impl<S: CompileStore> CompilePipeline<S> {
             resolution_records: budgeted.selected_resolutions,
             dispute_records: budgeted.selected_disputes,
             omission_record: budgeted.omission_record,
+            resolved_facts_omitted: Some(resolved_facts_omitted),
             state_commitment,
             dependency_commitment,
             issued_at: bundle_time,
@@ -652,10 +800,22 @@ impl<S: CompileStore> CompilePipeline<S> {
             )
             .await?;
 
+        let token_cnt = count_tokens(&budgeted.context_text)?;
+        let (context_token_ids, context_token_bytes_hex) = if token_cnt <= 256 {
+            let (ids, bytes_hex) = encode_token_spans(&budgeted.context_text)?;
+            (Some(ids), Some(bytes_hex))
+        } else {
+            (None, None)
+        };
+
         Ok(CompileResponse {
             policy_decision: PolicyDecision::Allow,
             bundle_hash: Some(hex::encode(bundle_hash)),
             context_text: Some(budgeted.context_text),
+            context_token_count: Some(token_cnt),
+            context_token_ids,
+            context_token_bytes_hex,
+            resolved_facts_omitted: Some(resolved_facts_omitted),
             bundle: Some(bundle),
             evidence,
         })
@@ -765,6 +925,7 @@ mod tests {
                 let entry = EvidenceEntry {
                     tenant_id: tenant,
                     seq_num,
+                    event_domain: Some("acta:evidence_event:v1".to_string()),
                     prev_hash,
                     event_hash,
                     bundle_hash: bundle_hash_opt,
@@ -772,6 +933,10 @@ mod tests {
                     policy_result,
                     refusal_metadata: None,
                     override_summary: None,
+                    write_summary: None,
+                    answer_cache_summary: None,
+                    witness_reg_summary: None,
+                    witness_revoke_summary: None,
                     host_signature,
                     created_at,
                 };
@@ -814,6 +979,7 @@ mod tests {
                 let entry = EvidenceEntry {
                     tenant_id: tenant,
                     seq_num,
+                    event_domain: Some("acta:evidence_event:v2".to_string()),
                     prev_hash,
                     event_hash,
                     bundle_hash: None,
@@ -821,6 +987,10 @@ mod tests {
                     policy_result,
                     refusal_metadata: Some(meta),
                     override_summary: None,
+                    write_summary: None,
+                    answer_cache_summary: None,
+                    witness_reg_summary: None,
+                    witness_revoke_summary: None,
                     host_signature,
                     created_at,
                 };
@@ -875,11 +1045,16 @@ mod tests {
         assert!(matches!(block_resp.policy_decision, PolicyDecision::Block { .. }));
         assert!(block_resp.bundle.is_none());
         assert!(block_resp.bundle_hash.is_none());
+        assert!(block_resp.context_token_count.is_none());
         assert_eq!(spy_store.objects_query_count(), 0);
         assert_eq!(spy_store.claims_query_count(), 0);
         assert_eq!(spy_store.evidence_write_count(), 1);
         assert_eq!(block_resp.evidence.policy_result, PolicyResultTag::Block);
         assert_eq!(block_resp.evidence.seq_num, 1);
+        assert_eq!(
+            block_resp.evidence.event_domain.as_deref(),
+            Some("acta:evidence_event:v2")
+        );
         assert_eq!(
             block_resp
                 .evidence
@@ -974,6 +1149,7 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(r1.context_token_count, Some(0));
         assert_eq!(r1.bundle_hash, r2.bundle_hash, "bundle_hash must be reproducible across compiles");
         assert_eq!(r1.bundle_hash.as_deref(), sim_default.bundle_hash.map(hex::encode).as_deref());
         assert_ne!(

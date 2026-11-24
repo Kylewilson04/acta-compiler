@@ -62,6 +62,13 @@ pub fn extract_tenant_header(headers: &HeaderMap) -> Option<&str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleTenantFilter {
+    ExactTenant(String),
+    SandboxPrefix(String),
+    UnrestrictedMaster,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiedKeyInfo {
     Master { header_locked_tenant: Option<String> },
     TenantBound {
@@ -304,6 +311,33 @@ impl AppState {
         target_scope: Option<&str>,
         detail: &str,
     ) -> Option<EvidenceEntry> {
+        self.append_anchor_refusal_audit(
+            headers,
+            fallback_tenant,
+            tag,
+            operation,
+            reason_code,
+            target_scope,
+            detail,
+            None,
+        )
+        .await
+    }
+
+    /// Appends a signed `EvidenceEntry` with `RefusalMetadata` (optionally binding structured
+    /// `attempted_checkpoint_hash` for `anchor_checkpoint` refusals, `v1.6.6+`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_anchor_refusal_audit(
+        &self,
+        headers: &HeaderMap,
+        fallback_tenant: Option<&str>,
+        tag: PolicyResultTag,
+        operation: &str,
+        reason_code: &str,
+        target_scope: Option<&str>,
+        detail: &str,
+        attempted_checkpoint_hash: Option<[u8; 32]>,
+    ) -> Option<EvidenceEntry> {
         let audit_tenant = self.authenticated_audit_tenant(headers, fallback_tenant)?;
         let meta = RefusalMetadata {
             operation: sanitize_refusal_summary(operation),
@@ -313,6 +347,7 @@ impl AppState {
                 .filter(|s| !s.is_empty()),
             summary: sanitize_refusal_summary(detail),
             scope_state_commitment: None,
+            attempted_checkpoint_hash,
         };
         evidence_repo::append_refusal_metadata_tx(
             &self.pool,
@@ -531,6 +566,63 @@ impl AppState {
                     Err(format!("{msg} [logged at evidence seq_num={}]", ev.seq_num))
                 } else {
                     Err(msg)
+                }
+            }
+        }
+    }
+
+    /// Resolves the caller's tenant scope BEFORE touching `context_bundles` (`v1.6.7+`):
+    /// - If `explicit_tenant` is passed and conflicts with the caller's lock, rejects and logs
+    ///   `mcp_tenant_lock_violation` / `tenant_lock_violation` to the caller's own ledger immediately.
+    /// - If `explicit_tenant` is omitted, binds lookup SQL to the caller's locked tenant (or public
+    ///   `sandbox*` prefix for unauthenticated REST callers) so foreign hashes return identical
+    ///   `context_bundle not found` errors with zero cross-tenant oracle.
+    pub async fn resolve_bundle_lookup_scope(
+        &self,
+        headers: &HeaderMap,
+        explicit_tenant: Option<&str>,
+        operation: &str,
+        is_mcp: bool,
+    ) -> Result<BundleTenantFilter, String> {
+        if let Some(exp) = explicit_tenant.map(str::trim).filter(|s| !s.is_empty()) {
+            if is_mcp {
+                let resolved = self
+                    .resolve_mcp_tenant_audited(headers, Some(exp), operation)
+                    .await?;
+                return Ok(BundleTenantFilter::ExactTenant(resolved));
+            }
+            self.check_tenant_auth_audited(headers, exp, operation)
+                .await?;
+            return Ok(BundleTenantFilter::ExactTenant(exp.to_string()));
+        }
+
+        let info = self.inspect_caller_auth(headers)?;
+        match info {
+            VerifiedKeyInfo::TenantBound { locked_tenant, .. } => {
+                Ok(BundleTenantFilter::ExactTenant(locked_tenant))
+            }
+            VerifiedKeyInfo::Master {
+                header_locked_tenant: Some(t),
+            } => Ok(BundleTenantFilter::ExactTenant(t)),
+            VerifiedKeyInfo::Master {
+                header_locked_tenant: None,
+            } => Ok(BundleTenantFilter::UnrestrictedMaster),
+            VerifiedKeyInfo::Anonymous {
+                header_locked_tenant: Some(t),
+            } => {
+                self.check_tenant_auth_audited(headers, &t, operation)
+                    .await?;
+                Ok(BundleTenantFilter::ExactTenant(t))
+            }
+            VerifiedKeyInfo::Anonymous {
+                header_locked_tenant: None,
+            } => {
+                if self.public_sandbox_prefix.is_empty() {
+                    Err("missing authentication credentials".to_string())
+                } else {
+                    Ok(BundleTenantFilter::SandboxPrefix(
+                        self.public_sandbox_prefix.clone(),
+                    ))
                 }
             }
         }

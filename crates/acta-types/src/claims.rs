@@ -6,6 +6,26 @@ use crate::serde_hex::{hex_32, hex_64, opt_hex_32, opt_hex_vec};
 
 pub use crate::objects::LifecycleStatus as ClaimStatus;
 
+pub const OVERRIDE_DOMAIN_V1: &str = "acta:override:v1";
+pub const OVERRIDE_DOMAIN_V2: &str = "acta:override:v2";
+
+fn default_override_domain() -> String {
+    OVERRIDE_DOMAIN_V1.to_string()
+}
+
+/// Infers `adjudicator_auth_kind` / `writer_auth_kind` deterministically when not explicitly stored.
+pub fn infer_override_auth_kind(adjudicator_id: &str, has_client_signature: bool) -> &'static str {
+    if has_client_signature {
+        "ed25519_client_sig"
+    } else if adjudicator_id.contains("::oauth:") {
+        "oauth_github_principal"
+    } else if adjudicator_id.ends_with("::master-admin") {
+        "master_admin"
+    } else {
+        "tenant_session"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeClaim {
     pub id: Uuid,
@@ -30,6 +50,16 @@ pub struct KnowledgeClaim {
     pub valid_to: Option<DateTime<Utc>>,
     pub version: i32,
     pub predecessor_id: Option<Uuid>,
+    #[serde(default, with = "opt_hex_vec", skip_serializing_if = "Option::is_none")]
+    pub client_signature: Option<Vec<u8>>,
+    #[serde(default, with = "opt_hex_32", skip_serializing_if = "Option::is_none")]
+    pub client_public_key: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retraction_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_seq_num: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -39,6 +69,8 @@ pub enum DisputeReasonCode {
     InsufficientConfidence,
     #[serde(rename = "INSUFFICIENT_MARGIN")]
     InsufficientMargin,
+    #[serde(rename = "LAPSED_OVERRIDE_REOPENED")]
+    LapsedOverrideReopened,
     #[serde(rename = "BLOCKING_CONTRADICTION")]
     BlockingContradiction,
     #[serde(rename = "TYPE_MISMATCH")]
@@ -50,6 +82,7 @@ impl DisputeReasonCode {
         match self {
             DisputeReasonCode::InsufficientConfidence => "INSUFFICIENT_CONFIDENCE",
             DisputeReasonCode::InsufficientMargin => "INSUFFICIENT_MARGIN",
+            DisputeReasonCode::LapsedOverrideReopened => "LAPSED_OVERRIDE_REOPENED",
             DisputeReasonCode::BlockingContradiction => "BLOCKING_CONTRADICTION",
             DisputeReasonCode::TypeMismatch => "TYPE_MISMATCH",
         }
@@ -153,10 +186,6 @@ pub struct LapsedOverrideRef {
     pub reopened_by_claim_ids: Vec<Uuid>,
 }
 
-/// Immutable, Ed25519-notarized adjudication overriding a specific set of competing claims
-/// in `(tenant_id, scope, claim_group_key)`. If a new unseen conflicting claim arrives later,
-/// the resolver detects that its `(id, content_hash)` is absent from `overridden_claims`,
-/// attaches `LapsedOverrideRef`, and automatically re-escalates to `[DISPUTE]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverrideAttestation {
     pub id: Uuid,
@@ -173,10 +202,14 @@ pub struct OverrideAttestation {
     pub winning_claim_content_hash: [u8; 32],
     pub overridden_claims: Vec<OverriddenClaimRef>,
     pub adjudicator_id: String,
+    #[serde(default)]
+    pub adjudicator_auth_kind: String,
     pub justification: String,
     pub version: i32,
     pub predecessor_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "default_override_domain")]
+    pub attestation_domain: String,
     #[serde(with = "hex_32")]
     pub attestation_hash: [u8; 32],
     pub evidence_seq_num: i64,
@@ -186,6 +219,26 @@ pub struct OverrideAttestation {
     pub client_signature: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
     pub client_public_key: Option<[u8; 32]>,
+}
+
+impl OverrideAttestation {
+    pub fn effective_domain(&self) -> &str {
+        let d = self.attestation_domain.trim();
+        if d.is_empty() {
+            OVERRIDE_DOMAIN_V1
+        } else {
+            d
+        }
+    }
+
+    pub fn effective_auth_kind(&self) -> &str {
+        let k = self.adjudicator_auth_kind.trim();
+        if k.is_empty() {
+            infer_override_auth_kind(&self.adjudicator_id, self.client_signature.is_some())
+        } else {
+            k
+        }
+    }
 }
 
 impl From<&OverrideAttestation> for OverrideResolutionRef {
@@ -219,6 +272,8 @@ pub struct DisputeRecord {
     #[serde(with = "hex_32")]
     pub claim_group_key: [u8; 32],
     pub competing_claims: Vec<ClaimCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin: Option<f64>,
     pub reason_code: DisputeReasonCode,
     pub escalation_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +296,8 @@ pub struct IngestClaimRequest {
     pub source_descriptor: String,
     #[serde(default)]
     pub source_commitment_hex: Option<String>,
+    #[serde(default)]
+    pub source_content: Option<String>,
     #[serde(default = "default_active_status")]
     pub status: ClaimStatus,
     #[serde(default)]
@@ -265,8 +322,65 @@ fn default_active_status() -> ClaimStatus {
 pub struct IngestClaimResponse {
     pub id: Uuid,
     pub version: i32,
+    pub status: ClaimStatus,
     pub claim_group_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_commitment: String,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradiction_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_seq_num: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_event_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_public_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
+    #[serde(default)]
+    pub was_idempotent_noop: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetractClaimRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub tenant_id: String,
+    pub claim_id: Uuid,
+    pub reason: String,
+    #[serde(default)]
+    pub client_signature_hex: Option<String>,
+    #[serde(default)]
+    pub client_public_key_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetractClaimResponse {
+    pub tombstone_id: Uuid,
+    pub retracted_claim_id: Uuid,
+    pub scope: String,
+    pub subject: String,
+    pub predicate: String,
+    pub version: i32,
+    pub status: ClaimStatus,
+    pub reason: String,
+    pub content_hash: String,
+    pub evidence_seq_num: i64,
+    pub evidence_event_hash: String,
+    pub host_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_public_key_hex: Option<String>,
+    pub retracted_by: String,
+    pub was_idempotent_noop: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -301,6 +415,7 @@ pub struct AttestOverrideResponse {
     pub adjudicator_id: String,
     pub adjudicator_auth_kind: String,
     pub justification: String,
+    pub attestation_domain: String,
     pub attestation_hash: String,
     pub evidence_seq_num: i64,
     pub host_signature: String,

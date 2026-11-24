@@ -1,21 +1,36 @@
 use acta_types::{ActaError, ActaResult};
+use sha2::{Digest, Sha256};
 
 use crate::hash::hash_length_delimited;
 
-/// Domain-separated RFC 6962 empty-tree hash (`tree_size == 0`).
+/// Exact RFC 6962 §2.1 empty-tree hash (`MTH({}) = SHA-256()`).
 pub fn merkle_empty_root() -> [u8; 32] {
-    hash_length_delimited(&[b"acta:merkle_empty:v1"])
+    Sha256::digest(b"").into()
 }
 
-/// Domain-separated leaf hash binding `(seq_num, event_hash)` at 0-based index `seq_num - 1`.
-pub fn merkle_leaf_hash(seq_num: i64, event_hash: &[u8; 32]) -> [u8; 32] {
-    let seq_le = seq_num.to_le_bytes();
-    hash_length_delimited(&[b"acta:merkle_leaf:v1", &seq_le, event_hash])
+/// Exact 33-byte RFC 6962 §2.1 leaf preimage `0x00 || d(i)` where `d(i)` is the 32-byte `event_hash`
+/// at 0-based index `seq_num - 1` (`event_hash` already commits to `tenant_id`, `seq_num`, and `prev_hash`).
+#[inline]
+pub fn merkle_leaf_preimage_bytes(event_hash: &[u8; 32]) -> [u8; 33] {
+    let mut buf = [0u8; 33];
+    buf[0] = 0x00;
+    buf[1..33].copy_from_slice(event_hash);
+    buf
 }
 
-/// Domain-separated interior node hash over `(left_child, right_child)`.
+/// Exact RFC 6962 §2.1 leaf hash `MTH({d(0)}) = SHA-256(0x00 || event_hash)`.
+pub fn merkle_leaf_hash(_seq_num: i64, event_hash: &[u8; 32]) -> [u8; 32] {
+    let preimage = merkle_leaf_preimage_bytes(event_hash);
+    Sha256::digest(preimage).into()
+}
+
+/// Exact RFC 6962 §2.1 interior node hash `SHA-256(0x01 || left || right)`.
 pub fn merkle_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    hash_length_delimited(&[b"acta:merkle_node:v1", left, right])
+    let mut hasher = Sha256::new();
+    hasher.update([0x01u8]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
 }
 
 #[inline]
@@ -24,7 +39,47 @@ fn largest_power_of_two_less_than(n: usize) -> usize {
     1usize << (usize::BITS - 1 - (n - 1).leading_zeros())
 }
 
-/// Computes the RFC 6962 Merkle Tree Hash `MTH(D[0..n])` over pre-hashed leaves.
+/// Legacy `v1.6.0` BLAKE3 empty Merkle root (`b"acta:merkle_empty:v1"`), retained to verify
+/// quarantined historical `v1.6.0` anchor rows (e.g. `tree_size = 52`).
+pub fn legacy_blake3_merkle_empty_root() -> [u8; 32] {
+    hash_length_delimited(&[b"acta:merkle_empty:v1"])
+}
+
+/// Legacy `v1.6.0` BLAKE3 leaf hash `BLAKE3(len_delim([b"acta:merkle_leaf:v1", i64_le(seq_num), event_hash]))`.
+pub fn legacy_blake3_merkle_leaf_hash(seq_num: i64, event_hash: &[u8; 32]) -> [u8; 32] {
+    let seq_le = seq_num.to_le_bytes();
+    hash_length_delimited(&[b"acta:merkle_leaf:v1", &seq_le, event_hash])
+}
+
+/// Legacy `v1.6.0` BLAKE3 interior node hash `BLAKE3(len_delim([b"acta:merkle_node:v1", left, right]))`.
+pub fn legacy_blake3_merkle_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    hash_length_delimited(&[b"acta:merkle_node:v1", left, right])
+}
+
+/// Computes the legacy `v1.6.0` BLAKE3 Merkle root (`"acta-blake3-merkle-v1"`) over pre-hashed leaves.
+pub fn compute_legacy_blake3_merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
+    match leaves.len() {
+        0 => legacy_blake3_merkle_empty_root(),
+        1 => leaves[0],
+        n => {
+            let k = largest_power_of_two_less_than(n);
+            let left = compute_legacy_blake3_merkle_root_from_leaves(&leaves[..k]);
+            let right = compute_legacy_blake3_merkle_root_from_leaves(&leaves[k..]);
+            legacy_blake3_merkle_node_hash(&left, &right)
+        }
+    }
+}
+
+/// Computes the legacy `v1.6.0` BLAKE3 Merkle root (`"acta-blake3-merkle-v1"`) over `(seq_num, event_hash)` pairs.
+pub fn compute_legacy_blake3_merkle_root_from_events(events: &[(i64, [u8; 32])]) -> [u8; 32] {
+    let leaves: Vec<[u8; 32]> = events
+        .iter()
+        .map(|(seq, ev)| legacy_blake3_merkle_leaf_hash(*seq, ev))
+        .collect();
+    compute_legacy_blake3_merkle_root_from_leaves(&leaves)
+}
+
+/// Computes the RFC 6962 §2.1 Merkle Tree Hash `MTH(D[0..n])` over pre-hashed leaves.
 pub fn compute_merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     match leaves.len() {
         0 => merkle_empty_root(),
@@ -215,6 +270,7 @@ pub fn verify_merkle_consistency_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::hash_length_delimited;
 
     fn sample_events(n: usize) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
         let mut events = Vec::with_capacity(n);
@@ -226,6 +282,31 @@ mod tests {
             leaves.push(merkle_leaf_hash(seq, &ev));
         }
         (events, leaves)
+    }
+
+    #[test]
+    fn test_rfc6962_sha256_empty_leaf_and_node_exact_vectors() {
+        assert_eq!(
+            hex::encode(merkle_empty_root()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let ev0 = [0x42u8; 32];
+        let mut expected_leaf_in = vec![0x00u8];
+        expected_leaf_in.extend_from_slice(&ev0);
+        let expected_leaf: [u8; 32] = Sha256::digest(&expected_leaf_in).into();
+        assert_eq!(merkle_leaf_hash(1, &ev0), expected_leaf);
+
+        let ev1 = [0x99u8; 32];
+        let leaf1 = merkle_leaf_hash(2, &ev1);
+        let mut expected_node_in = vec![0x01u8];
+        expected_node_in.extend_from_slice(&expected_leaf);
+        expected_node_in.extend_from_slice(&leaf1);
+        let expected_node: [u8; 32] = Sha256::digest(&expected_node_in).into();
+        assert_eq!(merkle_node_hash(&expected_leaf, &leaf1), expected_node);
+        assert_eq!(
+            compute_merkle_root_from_leaves(&[expected_leaf, leaf1]),
+            expected_node
+        );
     }
 
     #[test]
@@ -302,7 +383,6 @@ mod tests {
                     "consistency proof failed for first={first} -> second={second}"
                 );
 
-                // Rewritten history at `first` MUST fail consistency verification against `second_root`!
                 if first < second {
                     let mut rewritten_first = first_root;
                     rewritten_first[7] ^= 0x01;

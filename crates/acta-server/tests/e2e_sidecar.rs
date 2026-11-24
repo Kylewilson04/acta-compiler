@@ -167,6 +167,7 @@ async fn test_e2e_ingest_compile_dispute_replay_verify_and_mcp() {
             source_provenance_class: 2,
             source_descriptor: src.to_string(),
             source_commitment_hex: None,
+            source_content: None,
             status: LifecycleStatus::Active,
             contradiction_ids: vec![],
             valid_from: None,
@@ -218,7 +219,7 @@ async fn test_e2e_ingest_compile_dispute_replay_verify_and_mcp() {
     let comp_out: CompileResponse = serde_json::from_slice(&comp_bytes).unwrap();
     let ctx_text = comp_out.context_text.as_deref().unwrap();
     assert!(ctx_text.contains("[DISPUTE: INSUFFICIENT_MARGIN]"));
-    let bundle_hash_hex = hex::encode(comp_out.bundle_hash.unwrap());
+    let bundle_hash_hex = comp_out.bundle_hash.unwrap();
 
     // 5. Counterfactual Replay via POST /v1/replay (override margin to 0.05 -> resolves dispute!)
     let replay_res = app
@@ -309,7 +310,7 @@ async fn test_e2e_ingest_compile_dispute_replay_verify_and_mcp() {
     assert_eq!(ev_res.status(), StatusCode::OK);
     let ev_out: TenantEvidenceResponse =
         serde_json::from_slice(&ev_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(ev_out.entry_count, 1);
+    assert_eq!(ev_out.entry_count, 6);
 
     // Unauthenticated MCP call without X-Acta-Tenant must return 401 + WWW-Authenticate for OAuth 2.1
     let mcp_unauth_res = app

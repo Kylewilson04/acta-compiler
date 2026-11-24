@@ -1,7 +1,11 @@
 use std::collections::BTreeSet;
 
-use acta_store::{claims_repo, evidence_repo, objects_repo, overrides_repo};
-use acta_types::{ExportArchive, PolicyResultTag};
+use acta_store::{
+    claims_repo,
+    evidence_repo::{self, TenantLookupScope},
+    objects_repo, overrides_repo,
+};
+use acta_types::ExportArchive;
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -11,115 +15,69 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::routes::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, BundleTenantFilter};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExportQueryParams {
     pub mode: Option<String>,
+    pub tenant_id: Option<String>,
+    pub anchor_tree_size: Option<i64>,
+    pub anchored_tree_size: Option<i64>,
 }
 
-/// Builds an `ExportArchive` with either:
-/// - `include_full_chain = true` (`mode=full`, default): embeds BOTH `evidence_chain` AND `merkle_proof`
-/// - `include_full_chain = false` (`mode=merkle`): embeds ONLY the `O(log N)` `merkle_proof` (`evidence_chain = []`)
-pub async fn build_export_archive_with_mode(
+impl ExportQueryParams {
+    pub fn resolved_anchor_tree_size(&self) -> Result<Option<i64>, ApiError> {
+        match (self.anchor_tree_size, self.anchored_tree_size) {
+            (Some(a), Some(b)) if a != b => Err(ApiError::bad_request(format!(
+                "conflicting anchor_tree_size ({a}) and anchored_tree_size ({b}); pass one or matching values"
+            ))),
+            (a, b) => Ok(a.or(b)),
+        }
+    }
+}
+
+/// Builds an `ExportArchive` enforcing zero-oracle tenant scoping (`v1.6.7+`) and never mutating
+/// `evidence_history` on malformed hex, wrong-length hex, `not_found`, or selector validation errors.
+pub async fn build_export_archive_scoped(
     state: &AppState,
     bundle_hash_hex: &str,
     headers: Option<&HeaderMap>,
+    explicit_tenant: Option<&str>,
+    is_mcp: bool,
     include_full_chain: bool,
+    anchor_tree_size: Option<i64>,
 ) -> Result<ExportArchive, ApiError> {
-    let raw_hash = match hex::decode(bundle_hash_hex.trim()) {
-        Ok(h) => h,
-        Err(e) => {
-            let mut suffix = String::new();
-            if let Some(hdrs) = headers {
-                if let Some(ev) = state
-                    .append_refusal_audit_with_scope(
-                        hdrs,
-                        None,
-                        PolicyResultTag::Block,
-                        "verify_bundle",
-                        "verify_malformed_bundle_hash",
-                        None,
-                        &format!("invalid bundle_hash hex '{bundle_hash_hex}': {e}"),
-                    )
-                    .await
-                {
-                    suffix = format!(" [logged at evidence seq_num={}]", ev.seq_num);
-                }
-            }
-            return Err(ApiError::bad_request(format!(
-                "invalid bundle_hash hex: {e}{suffix}"
-            )));
-        }
+    let filter = match headers {
+        Some(hdrs) => state
+            .resolve_bundle_lookup_scope(hdrs, explicit_tenant, "export_or_verify_bundle", is_mcp)
+            .await
+            .map_err(ApiError::unauthorized)?,
+        None => BundleTenantFilter::UnrestrictedMaster,
     };
-    let bundle_hash: [u8; 32] = match raw_hash.try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            let mut suffix = String::new();
-            if let Some(hdrs) = headers {
-                if let Some(ev) = state
-                    .append_refusal_audit_with_scope(
-                        hdrs,
-                        None,
-                        PolicyResultTag::Block,
-                        "verify_bundle",
-                        "verify_invalid_bundle_hash_len",
-                        None,
-                        &format!("bundle_hash '{bundle_hash_hex}' is not 32 bytes"),
-                    )
-                    .await
-                {
-                    suffix = format!(" [logged at evidence seq_num={}]", ev.seq_num);
-                }
-            }
-            return Err(ApiError::bad_request(format!(
-                "bundle_hash path parameter must be 32 bytes (64 hex chars){suffix}"
-            )));
-        }
+
+    let raw_hash = hex::decode(bundle_hash_hex.trim())
+        .map_err(|e| ApiError::bad_request(format!("invalid bundle_hash hex: {e}")))?;
+    let bundle_hash: [u8; 32] = raw_hash.try_into().map_err(|_| {
+        ApiError::bad_request("bundle_hash path parameter must be 32 bytes (64 hex chars)")
+    })?;
+
+    let lookup_scope = match &filter {
+        BundleTenantFilter::ExactTenant(tid) => TenantLookupScope::Exact(tid.as_str()),
+        BundleTenantFilter::SandboxPrefix(pfx) => TenantLookupScope::SandboxPrefix(pfx.as_str()),
+        BundleTenantFilter::UnrestrictedMaster => TenantLookupScope::Any,
     };
 
     let (bundle, evidence_chain, merkle_proof) =
-        match evidence_repo::fetch_bundle_with_merkle_or_chain(
+        evidence_repo::fetch_bundle_with_merkle_options_scoped(
             &state.pool,
             &state.host_signing_key,
+            lookup_scope,
             &bundle_hash,
             &[],
             include_full_chain,
+            anchor_tree_size,
         )
-        .await
-        {
-            Ok(triple) => triple,
-            Err(err) => {
-                let mut api_err: ApiError = err.into();
-                if let Some(hdrs) = headers {
-                    if let Some(ev) = state
-                        .append_refusal_audit_with_scope(
-                            hdrs,
-                            None,
-                            PolicyResultTag::Block,
-                            "verify_bundle",
-                            "verify_bundle_not_found",
-                            None,
-                            &api_err.message,
-                        )
-                        .await
-                    {
-                        api_err.message = format!(
-                            "{} [logged at evidence seq_num={}]",
-                            api_err.message, ev.seq_num
-                        );
-                    }
-                }
-                return Err(api_err);
-            }
-        };
-
-    if let Some(hdrs) = headers {
-        state
-            .check_tenant_auth_audited(hdrs, &bundle.tenant_id, "export_or_verify_bundle")
-            .await
-            .map_err(ApiError::unauthorized)?;
-    }
+        .await?;
 
     let object_ids: Vec<Uuid> = bundle
         .selected_objects
@@ -166,6 +124,38 @@ pub async fn build_export_archive_with_mode(
     })
 }
 
+/// Builds an `ExportArchive` with configurable linear-chain mode AND optional forward
+/// cross-checkpoint bridging (`anchor_tree_size`).
+pub async fn build_export_archive_with_options(
+    state: &AppState,
+    bundle_hash_hex: &str,
+    headers: Option<&HeaderMap>,
+    include_full_chain: bool,
+    anchor_tree_size: Option<i64>,
+) -> Result<ExportArchive, ApiError> {
+    build_export_archive_scoped(
+        state,
+        bundle_hash_hex,
+        headers,
+        None,
+        false,
+        include_full_chain,
+        anchor_tree_size,
+    )
+    .await
+}
+
+/// Builds an `ExportArchive` with automatic latest-anchored checkpoint bridging when applicable.
+pub async fn build_export_archive_with_mode(
+    state: &AppState,
+    bundle_hash_hex: &str,
+    headers: Option<&HeaderMap>,
+    include_full_chain: bool,
+) -> Result<ExportArchive, ApiError> {
+    build_export_archive_with_options(state, bundle_hash_hex, headers, include_full_chain, None)
+        .await
+}
+
 /// Default export builder embedding both full `evidence_chain` and `merkle_proof`.
 pub async fn build_export_archive(
     state: &AppState,
@@ -175,7 +165,7 @@ pub async fn build_export_archive(
     build_export_archive_with_mode(state, bundle_hash_hex, headers, true).await
 }
 
-/// `GET /v1/bundles/:bundle_hash/export?mode=full|merkle` -> packages a self-contained `ExportArchive`.
+/// `GET /v1/bundles/:bundle_hash/export?mode=full|merkle&anchor_tree_size=N` -> packages a self-contained `ExportArchive`.
 pub async fn handle_export_bundle(
     State(state): State<AppState>,
     Path(bundle_hash_hex): Path<String>,
@@ -191,8 +181,16 @@ pub async fn handle_export_bundle(
             )))
         }
     };
-    let archive =
-        build_export_archive_with_mode(&state, &bundle_hash_hex, Some(&headers), include_full_chain)
-            .await?;
+    let resolved_anchor = query.resolved_anchor_tree_size()?;
+    let archive = build_export_archive_scoped(
+        &state,
+        &bundle_hash_hex,
+        Some(&headers),
+        query.tenant_id.as_deref(),
+        false,
+        include_full_chain,
+        resolved_anchor,
+    )
+    .await?;
     Ok(Json(archive))
 }

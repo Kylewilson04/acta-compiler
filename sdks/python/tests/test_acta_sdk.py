@@ -1,4 +1,4 @@
-"""Comprehensive cryptographic, RFC 6962 Merkle & live-mock HTTP test suite for `acta_sdk` v1.6.0."""
+"""Comprehensive cryptographic, RFC 6962 Merkle & live-mock HTTP test suite for `acta_sdk` v1.7.1."""
 
 from __future__ import annotations
 
@@ -625,7 +625,7 @@ class _MockActaHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "acta-compiler",
-                    "version": "1.6.0",
+                    "version": "1.7.1",
                     "host_public_key": self.pk_hex,
                     "permission_root": "26" * 32,
                 },
@@ -996,7 +996,7 @@ class TestActaGitMcpBridge(unittest.TestCase):
                     ]
                     self.assertEqual(len(lines), 4)
                     self.assertEqual(
-                        lines[0]["result"]["serverInfo"]["version"], "1.6.0"
+                        lines[0]["result"]["serverInfo"]["version"], "1.7.1"
                     )
                     self.assertEqual(
                         lines[1]["result"]["structuredContent"]["tenant_id"], "sandbox-ardyn"
@@ -1010,5 +1010,409 @@ class TestActaGitMcpBridge(unittest.TestCase):
                 srv.server_close()
 
 
+
+
+class TestV162WitnessRegAndCrossCheckpointBridge(unittest.TestCase):
+    def test_live_seq_58_witness_reg_v1_and_v2_principal_binding(self) -> None:
+        from acta_sdk import (
+            blake3_hash,
+            compute_witness_registration_commitment,
+            compute_witness_registration_v2_commitment,
+            witness_registration_preimage_bytes,
+        )
+
+        pk58 = "e5b050185444bd8e1b0892678934c70ff65f896602e9bf0faa87a4702a7ad9e4"
+        pre_v1 = witness_registration_preimage_bytes(
+            "acta:witness_reg:v1",
+            "kylewilson04",
+            "claude-witness-v161",
+            pk58,
+            "kylewilson04::session",
+        )
+        self.assertEqual(
+            blake3_hash([pre_v1]).hex(),
+            "e28df78841329df7b66aef44558586b81d952d1434a48f6605d0a6431e080fec",
+        )
+        self.assertEqual(
+            compute_witness_registration_commitment("kylewilson04", "claude-witness-v161", pk58).hex(),
+            "e28df78841329df7b66aef44558586b81d952d1434a48f6605d0a6431e080fec",
+        )
+        pre_v2, comm_v2 = compute_witness_registration_v2_commitment(
+            "kylewilson04",
+            "claude-witness-v162",
+            pk58,
+            "kylewilson04::oauth:kylewilson04",
+        )
+        _, comm_v2_session = compute_witness_registration_v2_commitment(
+            "kylewilson04",
+            "claude-witness-v162",
+            pk58,
+            "kylewilson04::session",
+        )
+        self.assertNotEqual(comm_v2, comm_v2_session)
+        self.assertEqual(blake3_hash([pre_v2]), comm_v2)
+
+        from acta_sdk import (
+            compute_witness_registration_v3_commitment,
+            compute_witness_revocation_commitment,
+        )
+
+        pre_v3_a, comm_v3_a = compute_witness_registration_v3_commitment(
+            "kylewilson04",
+            "claude-witness-v163",
+            pk58,
+            "kylewilson04::oauth:kylewilson04",
+            "Claude v1.6.5 Witness",
+        )
+        _, comm_v3_b = compute_witness_registration_v3_commitment(
+            "kylewilson04",
+            "claude-witness-v163",
+            pk58,
+            "kylewilson04::oauth:kylewilson04",
+            "Tampered",
+        )
+        _, comm_v3_none = compute_witness_registration_v3_commitment(
+            "kylewilson04",
+            "claude-witness-v163",
+            pk58,
+            "kylewilson04::oauth:kylewilson04",
+            None,
+        )
+        self.assertNotEqual(comm_v3_a, comm_v3_b)
+        self.assertNotEqual(comm_v3_a, comm_v3_none)
+        self.assertEqual(blake3_hash([pre_v3_a]), comm_v3_a)
+
+        rev_pre, rev_comm = compute_witness_revocation_commitment(
+            "kylewilson04",
+            "claude-revoke-probe-v163",
+            pk58,
+            "kylewilson04::session",
+            "Key rotation",
+        )
+        self.assertEqual(blake3_hash([rev_pre]), rev_comm)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_v164_witness_retirement_v2_vectors():
+    from acta_sdk import compute_witness_revocation_v2_commitment
+    from acta_sdk.crypto import witness_revocation_preimage_bytes
+
+    pk = "aa" * 32
+    pre_ret, comm_ret = compute_witness_revocation_v2_commitment(
+        "kylewilson04",
+        "claude-retire-probe-v164",
+        pk,
+        "kylewilson04::oauth:kylewilson04",
+        "retire",
+        86,
+        "Graceful key rotation after anchoring head 85",
+    )
+    pre_comp, comm_comp = compute_witness_revocation_v2_commitment(
+        "kylewilson04",
+        "claude-retire-probe-v164",
+        pk,
+        "kylewilson04::oauth:kylewilson04",
+        "compromise",
+        None,
+        "Graceful key rotation after anchoring head 85",
+    )
+    assert comm_ret != comm_comp
+    assert pre_ret != pre_comp
+    try:
+        witness_revocation_preimage_bytes(
+            "acta:witness_revoke:v2",
+            "kylewilson04",
+            "claude-retire-probe-v164",
+            pk,
+            "kylewilson04::oauth:kylewilson04",
+            "Bad combination",
+            revocation_mode="retire",
+            effective_from_tree_size=None,
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+
+class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
+    def test_v171_task_dependency_commitment_invalidation_and_offline_rebuild(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from acta_sdk import (
+            SCHEMA_VERSION,
+            STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+            compute_answer_cache_summary_commitment,
+            compute_answer_text_hash,
+            compute_checkpoint_hash,
+            compute_claim_content_hash,
+            compute_evidence_event_hash,
+            compute_logical_claim_group_key,
+            compute_merkle_consistency_proof,
+            compute_merkle_root_from_leaves,
+            compute_object_content_hash,
+            compute_query_text_hash,
+            compute_state_commitment,
+            compute_sub_commitment,
+            compute_task_dependency_commitment,
+            compute_write_summary_commitment,
+            merkle_leaf_hash,
+            sign_checkpoint_head,
+            sign_evidence_entry,
+            sign_witness_anchor,
+            verify_and_rebuild_scope_state_offline,
+            verify_evidence_entry,
+        )
+
+        host_seed = "44" * 32
+        host_sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(host_seed))
+        host_pk_hex = host_sk.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        ).hex()
+        wit_seed = "55" * 32
+        perm_root = "3ff40da50dd7f2aa32ce30409426f6d485bcf376caa4ff862f3aeb071410772a"
+        tenant = "kylewilson04"
+        scope = "acta-test/v171-sdk"
+        ts = "2026-11-24T17:00:00.000000Z"
+
+        # 1. Task dependency commitment invariance under unrelated writes
+        dep_a = compute_task_dependency_commitment(
+            tenant,
+            scope,
+            perm_root,
+            compute_sub_commitment([]),
+            compute_sub_commitment([]),
+            compute_sub_commitment(["aa" * 32]),
+        )
+        dep_b = compute_task_dependency_commitment(
+            tenant,
+            scope,
+            perm_root,
+            compute_sub_commitment([]),
+            compute_sub_commitment([]),
+            compute_sub_commitment(["bb" * 32]),
+        )
+        self.assertEqual(len(dep_a), 32)
+        self.assertNotEqual(dep_a, dep_b)
+
+        # 2. Build chained write + cache invalidation + anchored checkpoint at seq 2 + head at seq 3
+        obj = {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "tenant_id": tenant,
+            "obj_type": "intent",
+            "scope": scope,
+            "lifecycle_status": "active",
+            "priority": 90,
+            "importance": 1.0,
+            "tags": ["v171"],
+            "body": {"directive": "Pool corroborating sources"},
+            "version": 1,
+            "predecessor_id": None,
+            "created_at": ts,
+        }
+        obj["content_hash"] = compute_object_content_hash(obj).hex()
+        ws1 = {
+            "write_domain": "acta:write_event:v1",
+            "operation": "ingest_object",
+            "item_id": obj["id"],
+            "scope": scope,
+            "version": 1,
+            "content_hash": obj["content_hash"],
+            "written_by": f"{tenant}::oauth:{tenant}",
+            "writer_auth_kind": "oauth_github_principal",
+            "record_snapshot": obj,
+        }
+        ws1_comm = compute_write_summary_commitment(ws1).hex()
+        ev1_hash = compute_evidence_event_hash(
+            tenant, 1, "00" * 32, None, ws1_comm, "allow", ts, write_summary=ws1
+        ).hex()
+        entry1 = {
+            "tenant_id": tenant,
+            "seq_num": 1,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": "00" * 32,
+            "event_hash": ev1_hash,
+            "bundle_hash": None,
+            "state_commitment": ws1_comm,
+            "policy_result": "allow",
+            "write_summary": ws1,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 1, "00" * 32, ev1_hash).hex(),
+            "created_at": ts,
+        }
+
+        gkey = compute_logical_claim_group_key(tenant, "supplier:titan", "lead_days", scope).hex()
+        clm = {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "tenant_id": tenant,
+            "claim_group_key": gkey,
+            "scope": scope,
+            "subject": "supplier:titan",
+            "predicate": "lead_days",
+            "object_val": 14,
+            "object_type": "int",
+            "confidence": 0.60,
+            "source_provenance_class": 2,
+            "source_descriptor": "msa-a",
+            "source_commitment": "cc" * 32,
+            "status": "active",
+            "contradiction_ids": [],
+            "valid_from": None,
+            "valid_to": None,
+            "version": 1,
+            "predecessor_id": None,
+            "created_at": ts,
+        }
+        clm["content_hash"] = compute_claim_content_hash(clm).hex()
+        ws2 = {
+            "write_domain": "acta:write_event:v1",
+            "operation": "ingest_claim",
+            "item_id": clm["id"],
+            "scope": scope,
+            "version": 1,
+            "content_hash": clm["content_hash"],
+            "written_by": f"{tenant}::oauth:{tenant}",
+            "writer_auth_kind": "oauth_github_principal",
+            "record_snapshot": clm,
+        }
+        ws2_comm = compute_write_summary_commitment(ws2).hex()
+        ev2_hash = compute_evidence_event_hash(
+            tenant, 2, ev1_hash, None, ws2_comm, "allow", ts, write_summary=ws2
+        ).hex()
+        entry2 = {
+            "tenant_id": tenant,
+            "seq_num": 2,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev1_hash,
+            "event_hash": ev2_hash,
+            "bundle_hash": None,
+            "state_commitment": ws2_comm,
+            "policy_result": "allow",
+            "write_summary": ws2,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 2, ev1_hash, ev2_hash).hex(),
+            "created_at": ts,
+        }
+
+        # Entry 3: Chained AnswerCacheLedgerSummary invalidation receipt
+        acs_inv = {
+            "cache_domain": "acta:answer_cache:v1",
+            "event_kind": "invalidated",
+            "cache_id": "33333333-3333-4333-8333-333333333333",
+            "scope": scope,
+            "task_id": "po-check",
+            "query_hash": compute_query_text_hash("lead_days?").hex(),
+            "source_bundle_hash": "dd" * 32,
+            "state_commitment": "ee" * 32,
+            "validity_mode": "dependency_subset",
+            "task_dependency_commitment": dep_a.hex(),
+            "answer_hash": compute_answer_text_hash("14 days").hex(),
+            "cached_by": f"{tenant}::oauth:{tenant}",
+            "cacher_auth_kind": "oauth_github_principal",
+            "invalidation_reason": "stale_dependency_commitment",
+            "observed_state_commitment": "ff" * 32,
+            "observed_dependency_commitment": dep_b.hex(),
+        }
+        acs_comm = compute_answer_cache_summary_commitment(acs_inv).hex()
+        ev3_hash = compute_evidence_event_hash(
+            tenant, 3, ev2_hash, None, acs_comm, "allow", ts, answer_cache_summary=acs_inv
+        ).hex()
+        entry3 = {
+            "tenant_id": tenant,
+            "seq_num": 3,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev2_hash,
+            "event_hash": ev3_hash,
+            "bundle_hash": None,
+            "state_commitment": acs_comm,
+            "policy_result": "allow",
+            "answer_cache_summary": acs_inv,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 3, ev2_hash, ev3_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(entry3, host_pk_hex)
+
+        # Invalidated event missing observed_state_commitment must fail verification
+        bad_inv = json.loads(json.dumps(entry3))
+        del bad_inv["answer_cache_summary"]["observed_state_commitment"]
+        with self.assertRaises(ValueError):
+            verify_evidence_entry(bad_inv, host_pk_hex)
+
+        leaves_all = [
+            merkle_leaf_hash(1, ev1_hash),
+            merkle_leaf_hash(2, ev2_hash),
+            merkle_leaf_hash(3, ev3_hash),
+        ]
+        mroot_2 = compute_merkle_root_from_leaves(leaves_all[:2]).hex()
+        mroot_3 = compute_merkle_root_from_leaves(leaves_all).hex()
+        cp2_hash = compute_checkpoint_hash(tenant, 2, ev2_hash, mroot_2, ts).hex()
+        cp3_hash = compute_checkpoint_hash(tenant, 3, ev3_hash, mroot_3, ts).hex()
+        wsig2, wpk = sign_witness_anchor(wit_seed, tenant, 2, cp2_hash)
+        cons_2_to_3 = [h.hex() for h in compute_merkle_consistency_proof(leaves_all, 2, 3)]
+
+        rebuild_archive = {
+            "schema_version": STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+            "tenant_id": tenant,
+            "scope": scope,
+            "up_to_seq": 3,
+            "evaluated_at": ts,
+            "host_public_key": host_pk_hex,
+            "permission_root": perm_root,
+            "override_attestations": [],
+            "evidence_chain": [entry1, entry2, entry3],
+            "checkpoint": {
+                "tenant_id": tenant,
+                "tree_size": 3,
+                "head_event_hash": ev3_hash,
+                "merkle_root": mroot_3,
+                "issued_at": ts,
+                "checkpoint_hash": cp3_hash,
+                "host_signature": sign_checkpoint_head(host_seed, tenant, cp3_hash).hex(),
+                "witness_anchors": [],
+            },
+            "latest_anchored_checkpoint": {
+                "tenant_id": tenant,
+                "tree_size": 2,
+                "head_event_hash": ev2_hash,
+                "merkle_root": mroot_2,
+                "issued_at": ts,
+                "checkpoint_hash": cp2_hash,
+                "host_signature": sign_checkpoint_head(host_seed, tenant, cp2_hash).hex(),
+                "witness_anchors": [
+                    {
+                        "id": "44444444-4444-4444-8444-444444444444",
+                        "tenant_id": tenant,
+                        "tree_size": 2,
+                        "checkpoint_hash": cp2_hash,
+                        "witness_id": "claude-witness-v171",
+                        "witness_public_key": wpk,
+                        "witness_signature": wsig2,
+                        "anchored_at": ts,
+                    }
+                ],
+            },
+            "consistency_proof_from_latest_anchor": cons_2_to_3,
+        }
+
+        rebuilt = verify_and_rebuild_scope_state_offline(rebuild_archive, host_pk_hex)
+        expected_sc = compute_state_commitment(
+            SCHEMA_VERSION,
+            tenant,
+            scope,
+            compute_sub_commitment([obj["content_hash"]]),
+            compute_sub_commitment([clm["content_hash"]]),
+            compute_sub_commitment([]),
+            perm_root,
+        ).hex()
+        self.assertEqual(rebuilt.reconstructed_state_commitment_hex, expected_sc)
+        self.assertEqual(rebuilt.reconstructed_active_intents, 1)
+        self.assertEqual(rebuilt.reconstructed_active_claims, 1)
+        self.assertEqual(rebuilt.anchored_tree_size, 2)
+        self.assertEqual(rebuilt.verified_witness_anchors, 1)
+
+        # Tampering snapshot inside write_summary must fail offline state rebuild
+        tampered = json.loads(json.dumps(rebuild_archive))
+        tampered["evidence_chain"][1]["write_summary"]["record_snapshot"]["object_val"] = 999
+        with self.assertRaises(ValueError):
+            verify_and_rebuild_scope_state_offline(tampered, host_pk_hex)
