@@ -135,6 +135,8 @@ pub struct CachedAnswerReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_public_key_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_signature_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -188,6 +190,8 @@ pub struct LookupCachedAnswerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation_newly_recorded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidation_evidence: Option<EvidenceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_evidence_seq_num: Option<i64>,
 }
 
@@ -218,6 +222,8 @@ pub struct ImpactedCachedAnswerRecord {
     pub answer_hash: String,
     pub evidence_seq_num: i64,
     pub invalidated_by_state_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidation_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation_evidence_seq_num: Option<i64>,
     pub created_at: DateTime<Utc>,
@@ -274,6 +280,10 @@ pub struct LedgerStateRebuildResponse {
     pub matches_live_store_bit_for_bit: bool,
     pub evaluated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_header_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merkle_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_anchored_tree_size: Option<i64>,
@@ -282,12 +292,17 @@ pub struct LedgerStateRebuildResponse {
 }
 
 /// Persisted PPA 1 Claim 25 dependency subset specification stored on `cached_answers.dependency_spec`.
+/// In `v1.7.2+`, `pinned_claim_ids` records explicit claim UUIDs when `dependency_ids` narrows
+/// tracking to specific claims within a group (leaving `pinned_claim_ids` empty when `dependency_ids`
+/// was omitted so all `v1.7.1` group-level `dependency_spec` rows remain bit-for-bit identical).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheDependencySpec {
     #[serde(default)]
     pub claim_group_keys_hex: Vec<String>,
     #[serde(default)]
     pub memory_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_claim_ids: Vec<Uuid>,
     #[serde(default)]
     pub empty_knowledge_fallback: bool,
 }

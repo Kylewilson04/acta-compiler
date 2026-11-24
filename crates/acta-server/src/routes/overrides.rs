@@ -279,8 +279,8 @@ pub async fn handle_attest_override(
                 let msg = format!(
                     "invalid Ed25519 client_signature_hex for adjudicator_id '{effective_actor}' over acta:override_client_sig:v1"
                 );
-                let suffix = state
-                    .append_refusal_audit_with_scope(
+                let ev_seq = state
+                    .append_signature_refusal_audit(
                         &headers,
                         Some(&req.tenant_id),
                         PolicyResultTag::Block,
@@ -288,11 +288,19 @@ pub async fn handle_attest_override(
                         "invalid_adjudicator_client_signature",
                         Some(&req.scope),
                         &msg,
+                        "acta:override_client_sig:v1",
+                        intent_digest,
                     )
                     .await
-                    .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                    .unwrap_or_default();
-                return Err(ApiError::forbidden(format!("{msg}{suffix}")));
+                    .map(|e| e.seq_num);
+                return Err(ApiError::signature_refusal(
+                    StatusCode::FORBIDDEN,
+                    msg,
+                    "invalid_adjudicator_client_signature",
+                    "acta:override_client_sig:v1",
+                    intent_digest,
+                    ev_seq,
+                ));
             }
             "ed25519_client_sig".to_string()
         }
@@ -426,10 +434,7 @@ pub async fn handle_attest_override(
             .await
             .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
             .unwrap_or_default();
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("{msg}{suffix}"),
-        });
+        return Err(ApiError::not_found(format!("{msg}{suffix}")));
     };
 
     let logical_group_key = compute_logical_claim_group_key(

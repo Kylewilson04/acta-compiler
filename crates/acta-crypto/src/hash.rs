@@ -1,11 +1,15 @@
+use std::collections::BTreeSet;
+
 use acta_types::{
-    ActaError, ActaResult, AnswerCacheLedgerSummary, ClaimStatus, ContextBundle, KnowledgeClaim,
-    LifecycleStatus, ObjectType, OmittedItem, OverriddenClaimRef, OverrideLedgerSummary,
-    PolicyResultTag, RefusalMetadata, StoredObject, WriteLedgerSummary, OVERRIDE_DOMAIN_V1,
+    ActaError, ActaResult, AnswerCacheLedgerSummary, ClaimCandidate, ClaimStatus, ContextBundle,
+    KnowledgeClaim, LifecycleStatus, ObjectType, OmittedItem, OverriddenClaimRef,
+    OverrideLedgerSummary, PolicyResultTag, RefusalMetadata, StoredObject,
+    WitnessRegistrationSummary, WitnessRevocationSummary, WriteLedgerSummary, OVERRIDE_DOMAIN_V1,
     OVERRIDE_DOMAIN_V2, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V2, WITNESS_REG_DOMAIN_V3,
     WITNESS_REVOKE_DOMAIN_V1, WITNESS_REVOKE_DOMAIN_V2,
 };
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::canonical::to_canonical_bytes;
@@ -34,6 +38,121 @@ pub fn hash_length_delimited(parts: &[&[u8]]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Computes the 7-part length-delimited preimage for `StateRebuildArchive.header_hash` (`b"acta:rebuild_header:v1"`),
+/// binding `(schema_version, tenant_id, scope, up_to_seq, evaluated_at_micros, permission_root)` under host Ed25519 signing.
+pub fn rebuild_archive_header_preimage_bytes(
+    schema_version: &str,
+    tenant_id: &str,
+    scope: &str,
+    up_to_seq: i64,
+    evaluated_at_micros: i64,
+    permission_root: &[u8; 32],
+) -> Vec<u8> {
+    let seq_le = up_to_seq.to_le_bytes();
+    let eval_le = evaluated_at_micros.to_le_bytes();
+    encode_length_delimited(&[
+        b"acta:rebuild_header:v1",
+        schema_version.as_bytes(),
+        tenant_id.as_bytes(),
+        scope.as_bytes(),
+        &seq_le,
+        &eval_le,
+        permission_root,
+    ])
+}
+
+/// Computes the 32-byte `header_hash` (`b"acta:rebuild_header:v1"`) for `StateRebuildArchive`.
+pub fn compute_rebuild_archive_header_hash(
+    schema_version: &str,
+    tenant_id: &str,
+    scope: &str,
+    up_to_seq: i64,
+    evaluated_at_micros: i64,
+    permission_root: &[u8; 32],
+) -> [u8; 32] {
+    let pre = rebuild_archive_header_preimage_bytes(
+        schema_version,
+        tenant_id,
+        scope,
+        up_to_seq,
+        evaluated_at_micros,
+        permission_root,
+    );
+    *blake3::hash(&pre).as_bytes()
+}
+
+fn json_value_family_tag(val: &Value) -> u8 {
+    match val {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        Value::Array(_) => 4,
+        Value::Object(_) => 5,
+    }
+}
+
+/// Returns `true` iff `candidate` belongs to the exact same `ValueBucket` (`(ValueTypeFamily, rfc8785_jcs(object_val))`)
+/// as `winner` in the epistemic resolver (`v1.7.2+`).
+pub fn claims_share_winning_value_bucket(
+    winner: &ClaimCandidate,
+    candidate: &KnowledgeClaim,
+) -> bool {
+    if json_value_family_tag(&winner.object_val) != json_value_family_tag(&candidate.object_val) {
+        return false;
+    }
+    let w_jcs = to_canonical_bytes(&winner.object_val)
+        .unwrap_or_else(|_| winner.object_val.to_string().into_bytes());
+    let c_jcs = to_canonical_bytes(&candidate.object_val)
+        .unwrap_or_else(|_| candidate.object_val.to_string().into_bytes());
+    w_jcs == c_jcs
+}
+
+/// Sorts agreeing `KnowledgeClaim`s in a winning `ValueBucket` using the exact resolver tie-breaker order
+/// and recomputes `(corroborating_count, corroborating_sources, effective_confidence)` via damped noisy-OR.
+pub fn recompute_winning_bucket_corroboration(
+    bucket_claims: &[&KnowledgeClaim],
+    damping: f64,
+) -> Result<(usize, Vec<String>, f64), String> {
+    if bucket_claims.is_empty() {
+        return Err("winning value bucket cannot be empty".to_string());
+    }
+    let mut sorted: Vec<&KnowledgeClaim> = bucket_claims.to_vec();
+    sorted.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| b.source_provenance_class.cmp(&a.source_provenance_class))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.version.cmp(&a.version))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut seen_sources = BTreeSet::new();
+    for c in &sorted {
+        if !seen_sources.insert(c.source_descriptor.as_str()) {
+            return Err(format!(
+                "duplicate source_descriptor '{}' inside corroborating value bucket",
+                c.source_descriptor
+            ));
+        }
+    }
+
+    let lead_conf = sorted[0].confidence;
+    let round_9 = |v: f64| (v * 1_000_000_000.0).round() / 1_000_000_000.0;
+    let effective_confidence = if sorted.len() == 1 {
+        round_9(lead_conf)
+    } else {
+        let mut unconvinced = 1.0_f64;
+        for c in &sorted[1..] {
+            unconvinced *= (1.0 - damping * c.confidence).clamp(0.0, 1.0);
+        }
+        round_9((lead_conf + (1.0 - lead_conf) * (1.0 - unconvinced)).min(0.9999))
+    };
+
+    let sources: Vec<String> = sorted.iter().map(|c| c.source_descriptor.clone()).collect();
+    Ok((sorted.len(), sources, effective_confidence))
+}
+
 /// Computes a content-bound `source_commitment` binding both `source_descriptor` and raw
 /// `source_content` bytes (`b"acta:source_content:v1"`).
 pub fn compute_source_content_commitment(
@@ -59,9 +178,6 @@ pub fn compute_answer_text_hash(answer_text: &str) -> [u8; 32] {
 
 /// Computes the PPA 1 Claim 25 task-scoped dependency commitment (`b"acta:cache_dep_root:v1"`):
 /// `BLAKE3_LD("acta:cache_dep_root:v1", tenant_id, scope, permission_root, intent_root, selected_memory_root, relevant_knowledge_root)`.
-/// Unrelated claims, memories, or overrides outside the referenced dependency subset leave this
-/// commitment invariant while any supersession, retraction, contradiction, override, or policy/intent
-/// mutation touching the referenced subset deterministically alters it.
 pub fn compute_task_dependency_commitment(
     tenant_id: &str,
     scope: &str,
@@ -473,7 +589,7 @@ pub fn object_client_intent_preimage_bytes(
     priority: i32,
     importance: f32,
     tags: &[String],
-    body: &serde_json::Value,
+    body: &Value,
     predecessor_id: Option<Uuid>,
 ) -> ActaResult<Vec<u8>> {
     let canonical_tags = to_canonical_bytes(tags)?;
@@ -504,7 +620,7 @@ pub fn compute_object_client_intent_hash(
     priority: i32,
     importance: f32,
     tags: &[String],
-    body: &serde_json::Value,
+    body: &Value,
     predecessor_id: Option<Uuid>,
 ) -> ActaResult<[u8; 32]> {
     let pre = object_client_intent_preimage_bytes(
@@ -528,7 +644,7 @@ pub fn claim_client_intent_preimage_bytes(
     scope: &str,
     subject: &str,
     predicate: &str,
-    object_val: &serde_json::Value,
+    object_val: &Value,
     object_type: &str,
     confidence: f64,
     source_provenance_class: i32,
@@ -577,7 +693,7 @@ pub fn compute_claim_client_intent_hash(
     scope: &str,
     subject: &str,
     predicate: &str,
-    object_val: &serde_json::Value,
+    object_val: &Value,
     object_type: &str,
     confidence: f64,
     source_provenance_class: i32,
@@ -1000,7 +1116,7 @@ pub fn evidence_event_preimage_bytes(
     refusal_metadata: Option<&RefusalMetadata>,
     override_summary: Option<&OverrideLedgerSummary>,
 ) -> ActaResult<(&'static str, Vec<u8>)> {
-    evidence_event_preimage_bytes_full(
+    evidence_event_preimage_bytes_v172(
         tenant_id,
         seq_num,
         prev_hash,
@@ -1012,10 +1128,13 @@ pub fn evidence_event_preimage_bytes(
         override_summary,
         None,
         None,
+        None,
+        None,
+        false,
     )
 }
 
-/// Returns `(domain, blake3_preimage_bytes)` across all three `evidence_history` domains (`v1`, `v2`, `v3`).
+/// Returns `(domain, blake3_preimage_bytes)` across `v1`, `v2`, and `v3` (`write_summary` / `answer_cache_summary`).
 #[allow(clippy::too_many_arguments)]
 pub fn evidence_event_preimage_bytes_full(
     tenant_id: &str,
@@ -1029,6 +1148,44 @@ pub fn evidence_event_preimage_bytes_full(
     override_summary: Option<&OverrideLedgerSummary>,
     write_summary: Option<&WriteLedgerSummary>,
     answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
+) -> ActaResult<(&'static str, Vec<u8>)> {
+    evidence_event_preimage_bytes_v172(
+        tenant_id,
+        seq_num,
+        prev_hash,
+        bundle_hash,
+        state_commitment,
+        policy_result,
+        created_at_micros,
+        refusal_metadata,
+        override_summary,
+        write_summary,
+        answer_cache_summary,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Returns `(domain, blake3_preimage_bytes)` across `v1`, `v2`, 10-part `v3` (`write_summary` /
+/// `answer_cache_summary`), and 12-part `v3` (`v1.7.2+` `witness_reg_summary` / `witness_revoke_summary`
+/// when `witness_in_v3 == true`, preserving 8-part `v1` on legacy `seq <= 184` witness events).
+#[allow(clippy::too_many_arguments)]
+pub fn evidence_event_preimage_bytes_v172(
+    tenant_id: &str,
+    seq_num: i64,
+    prev_hash: &[u8; 32],
+    bundle_hash: Option<&[u8; 32]>,
+    state_commitment: Option<&[u8; 32]>,
+    policy_result: PolicyResultTag,
+    created_at_micros: i64,
+    refusal_metadata: Option<&RefusalMetadata>,
+    override_summary: Option<&OverrideLedgerSummary>,
+    write_summary: Option<&WriteLedgerSummary>,
+    answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
+    witness_reg_summary: Option<&WitnessRegistrationSummary>,
+    witness_revoke_summary: Option<&WitnessRevocationSummary>,
+    witness_in_v3: bool,
 ) -> ActaResult<(&'static str, Vec<u8>)> {
     let seq_le = seq_num.to_le_bytes();
     let bundle_bytes = encode_opt_hash32(bundle_hash);
@@ -1049,6 +1206,26 @@ pub fn evidence_event_preimage_bytes_full(
             &created_le,
             &write_tagged,
             &cache_tagged,
+        ]);
+        return Ok(("acta:evidence_event:v3", preimage));
+    }
+
+    if witness_in_v3 && (witness_reg_summary.is_some() || witness_revoke_summary.is_some()) {
+        let wreg_tagged = encode_opt_jcs(witness_reg_summary)?;
+        let wrev_tagged = encode_opt_jcs(witness_revoke_summary)?;
+        let preimage = encode_length_delimited(&[
+            b"acta:evidence_event:v3",
+            tenant_id.as_bytes(),
+            &seq_le,
+            prev_hash,
+            &bundle_bytes,
+            &state_bytes,
+            policy_result.as_str().as_bytes(),
+            &created_le,
+            &[0u8],
+            &[0u8],
+            &wreg_tagged,
+            &wrev_tagged,
         ]);
         return Ok(("acta:evidence_event:v3", preimage));
     }
@@ -1122,7 +1299,7 @@ pub fn compute_evidence_event_hash_with_meta(
     refusal_metadata: Option<&RefusalMetadata>,
     override_summary: Option<&OverrideLedgerSummary>,
 ) -> ActaResult<[u8; 32]> {
-    compute_evidence_event_hash_full(
+    compute_evidence_event_hash_v172(
         tenant_id,
         seq_num,
         prev_hash,
@@ -1134,10 +1311,13 @@ pub fn compute_evidence_event_hash_with_meta(
         override_summary,
         None,
         None,
+        None,
+        None,
+        false,
     )
 }
 
-/// Computes the deterministic `event_hash` across `v1`, `v2`, and `v3` (`write_summary` / `answer_cache_summary`).
+/// Computes the deterministic `event_hash` across `v1`, `v2`, and 10-part `v3`.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_evidence_event_hash_full(
     tenant_id: &str,
@@ -1152,7 +1332,7 @@ pub fn compute_evidence_event_hash_full(
     write_summary: Option<&WriteLedgerSummary>,
     answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
 ) -> ActaResult<[u8; 32]> {
-    let (_domain, preimage) = evidence_event_preimage_bytes_full(
+    compute_evidence_event_hash_v172(
         tenant_id,
         seq_num,
         prev_hash,
@@ -1164,6 +1344,45 @@ pub fn compute_evidence_event_hash_full(
         override_summary,
         write_summary,
         answer_cache_summary,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Computes the deterministic `event_hash` across `v1`, `v2`, 10-part `v3`, and `v1.7.2+` 12-part witness `v3`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_evidence_event_hash_v172(
+    tenant_id: &str,
+    seq_num: i64,
+    prev_hash: &[u8; 32],
+    bundle_hash: Option<&[u8; 32]>,
+    state_commitment: Option<&[u8; 32]>,
+    policy_result: PolicyResultTag,
+    created_at_micros: i64,
+    refusal_metadata: Option<&RefusalMetadata>,
+    override_summary: Option<&OverrideLedgerSummary>,
+    write_summary: Option<&WriteLedgerSummary>,
+    answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
+    witness_reg_summary: Option<&WitnessRegistrationSummary>,
+    witness_revoke_summary: Option<&WitnessRevocationSummary>,
+    witness_in_v3: bool,
+) -> ActaResult<[u8; 32]> {
+    let (_domain, preimage) = evidence_event_preimage_bytes_v172(
+        tenant_id,
+        seq_num,
+        prev_hash,
+        bundle_hash,
+        state_commitment,
+        policy_result,
+        created_at_micros,
+        refusal_metadata,
+        override_summary,
+        write_summary,
+        answer_cache_summary,
+        witness_reg_summary,
+        witness_revoke_summary,
+        witness_in_v3,
     )?;
     Ok(*blake3::hash(&preimage).as_bytes())
 }

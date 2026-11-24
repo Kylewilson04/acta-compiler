@@ -20,17 +20,21 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::state::AppState;
 
 /// Hard 512 KiB HTTP request body limit protecting sidecar memory against oversized payloads.
 pub const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub reason_code: Option<String>,
+    pub signing_domain: Option<String>,
+    pub expected_intent_digest_hex: Option<String>,
+    pub refusal_evidence_seq_num: Option<i64>,
 }
 
 impl ApiError {
@@ -38,6 +42,10 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            reason_code: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num: None,
         }
     }
 
@@ -45,6 +53,10 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
+            reason_code: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num: None,
         }
     }
 
@@ -52,7 +64,87 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
+            reason_code: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num: None,
         }
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+            reason_code: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num: None,
+        }
+    }
+
+    pub fn refusal(
+        status: StatusCode,
+        base_msg: impl Into<String>,
+        reason_code: &str,
+        refusal_evidence_seq_num: Option<i64>,
+    ) -> Self {
+        let base = base_msg.into();
+        let seq_suffix = refusal_evidence_seq_num
+            .map(|n| format!(" seq_num={n}"))
+            .unwrap_or_default();
+        Self {
+            status,
+            message: format!("{base} [reason_code={reason_code}{seq_suffix}]"),
+            reason_code: Some(reason_code.to_string()),
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num,
+        }
+    }
+
+    pub fn signature_refusal(
+        status: StatusCode,
+        base_msg: impl Into<String>,
+        reason_code: &str,
+        signing_domain: &str,
+        expected_intent_digest: [u8; 32],
+        refusal_evidence_seq_num: Option<i64>,
+    ) -> Self {
+        let base = base_msg.into();
+        let digest_hex = hex::encode(expected_intent_digest);
+        let seq_suffix = refusal_evidence_seq_num
+            .map(|n| format!(" seq_num={n}"))
+            .unwrap_or_default();
+        let formatted = format!(
+            "{base} [reason_code={reason_code} signing_domain={signing_domain} expected_intent_digest_hex={digest_hex}{seq_suffix}]"
+        );
+        Self {
+            status,
+            message: formatted,
+            reason_code: Some(reason_code.to_string()),
+            signing_domain: Some(signing_domain.to_string()),
+            expected_intent_digest_hex: Some(digest_hex),
+            refusal_evidence_seq_num,
+        }
+    }
+
+    pub fn to_json_body(&self) -> Value {
+        let mut obj = json!({
+            "error": self.message,
+        });
+        if let Some(ref rc) = self.reason_code {
+            obj["reason_code"] = json!(rc);
+        }
+        if let Some(ref dom) = self.signing_domain {
+            obj["signing_domain"] = json!(dom);
+        }
+        if let Some(ref dig) = self.expected_intent_digest_hex {
+            obj["expected_intent_digest_hex"] = json!(dig);
+        }
+        if let Some(seq) = self.refusal_evidence_seq_num {
+            obj["refusal_evidence_seq_num"] = json!(seq);
+        }
+        obj
     }
 }
 
@@ -72,19 +164,18 @@ impl From<ActaError> for ApiError {
         Self {
             status,
             message: err.to_string(),
+            reason_code: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+            refusal_evidence_seq_num: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "error": self.message,
-            })),
-        )
-            .into_response()
+        let body = self.to_json_body();
+        (self.status, Json(body)).into_response()
     }
 }
 

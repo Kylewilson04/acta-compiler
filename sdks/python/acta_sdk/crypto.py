@@ -1,4 +1,4 @@
-"""Acta Compiler v1.7.1 Cryptographic Primitives, RFC 6962 §2.1 SHA-256 Merkle Verifier & Epistemic Notary.
+"""Acta Compiler v1.7.2 Cryptographic Primitives, RFC 6962 §2.1 SHA-256 Merkle Verifier & Epistemic Notary.
 
 Bit-for-bit compatible with Rust `acta-crypto`:
 - RFC 8785 JSON Canonicalization Scheme (JCS) (`serde_jcs`)
@@ -42,6 +42,8 @@ DEFAULT_DECISIVENESS_THRESHOLD = 0.15
 DEFAULT_CORROBORATION_DAMPING = 0.50
 SCHEMA_VERSION = "acta-context-bundle/v1"
 STATE_REBUILD_ARCHIVE_SCHEMA_V1 = "acta-state-rebuild-archive/v1"
+REBUILD_HEADER_DOMAIN_V1 = "acta:rebuild_header:v1"
+REBUILD_SIG_DOMAIN_V1 = "acta:rebuild_sig:v1"
 
 _WEAK_ED25519_PUBKEYS: frozenset[bytes] = frozenset(
     bytes.fromhex(h)
@@ -446,6 +448,10 @@ def _normalize_refusal_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
     if meta.get("attempted_checkpoint_hash") is not None:
         ach = meta["attempted_checkpoint_hash"]
         out["attempted_checkpoint_hash"] = _as_hash32(ach).hex()
+    if meta.get("signing_domain") is not None:
+        out["signing_domain"] = str(meta["signing_domain"])
+    if meta.get("expected_intent_digest_hex") is not None:
+        out["expected_intent_digest_hex"] = _as_hash32(meta["expected_intent_digest_hex"]).hex()
     return out
 
 
@@ -940,6 +946,42 @@ def compute_answer_cache_client_intent_hash(
         ]
     )
 
+def sign_answer_cache_client_intent(
+    private_key_seed_hex: str | bytes,
+    *,
+    tenant_id: str,
+    scope: str,
+    task_id: str,
+    query_text: str,
+    source_bundle_hash: bytes | str,
+    state_commitment: bytes | str,
+    answer_text: str,
+) -> tuple[str, str]:
+    """Computes `b"acta:answer_client_sig:v1"` intent digest and returns `(signature_hex, public_key_hex)`."""
+    seed = bytes.fromhex(private_key_seed_hex) if isinstance(private_key_seed_hex, str) else bytes(private_key_seed_hex)
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    pk_bytes = sk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    q_hash = compute_query_text_hash(query_text)
+    a_hash = compute_answer_text_hash(answer_text)
+    digest = compute_answer_cache_client_intent_hash(
+        tenant_id,
+        scope,
+        task_id,
+        q_hash,
+        source_bundle_hash,
+        state_commitment,
+        a_hash,
+    )
+    sig = sk.sign(digest)
+    return sig.hex(), pk_bytes.hex()
+
+
+sign_answer_client_intent = sign_answer_cache_client_intent
+
+
 
 def _normalize_write_summary(ws: Mapping[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {
@@ -1006,6 +1048,10 @@ def _normalize_answer_cache_summary(acs: Mapping[str, Any]) -> dict[str, Any]:
         out["expires_at"] = str(acs["expires_at"])
     if acs.get("invalidation_reason") is not None:
         out["invalidation_reason"] = str(acs["invalidation_reason"])
+    if acs.get("invalidated_by") is not None:
+        out["invalidated_by"] = str(acs["invalidated_by"])
+    if acs.get("invalidator_auth_kind") is not None:
+        out["invalidator_auth_kind"] = str(acs["invalidator_auth_kind"])
     if acs.get("observed_state_commitment") is not None:
         out["observed_state_commitment"] = _as_hash32(acs["observed_state_commitment"]).hex()
     if acs.get("observed_dependency_commitment") is not None:
@@ -1013,6 +1059,182 @@ def _normalize_answer_cache_summary(acs: Mapping[str, Any]) -> dict[str, Any]:
             acs["observed_dependency_commitment"]
         ).hex()
     return out
+
+
+def _normalize_witness_reg_summary(wreg: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "witness_id": str(wreg["witness_id"]),
+        "public_key": _as_hash32(wreg["public_key"]).hex(),
+        "registered_by": str(wreg["registered_by"]),
+        "registration_domain": str(wreg["registration_domain"]),
+        "registration_blake3_preimage_hex": str(wreg["registration_blake3_preimage_hex"]),
+    }
+    if wreg.get("description") is not None:
+        out["description"] = str(wreg["description"])
+    return out
+
+
+def _normalize_witness_revoke_summary(wrev: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "witness_id": str(wrev["witness_id"]),
+        "public_key": _as_hash32(wrev["public_key"]).hex(),
+        "revoked_by": str(wrev["revoked_by"]),
+        "revocation_mode": str(wrev.get("revocation_mode") or "compromise"),
+        "reason": str(wrev["reason"]),
+        "revocation_domain": str(wrev["revocation_domain"]),
+        "revocation_blake3_preimage_hex": str(wrev["revocation_blake3_preimage_hex"]),
+    }
+    if wrev.get("effective_from_tree_size") is not None:
+        out["effective_from_tree_size"] = int(wrev["effective_from_tree_size"])
+    return out
+
+
+def rebuild_archive_header_preimage_bytes(
+    schema_version: str,
+    tenant_id: str,
+    scope: str,
+    up_to_seq: int,
+    evaluated_at: int | str | datetime.datetime,
+    permission_root: bytes | str,
+) -> bytes:
+    eval_micros = evaluated_at if isinstance(evaluated_at, int) else parse_rfc3339_micros(evaluated_at)
+    return encode_length_delimited(
+        [
+            b"acta:rebuild_header:v1",
+            schema_version.encode("utf-8"),
+            tenant_id.encode("utf-8"),
+            scope.encode("utf-8"),
+            struct.pack("<q", int(up_to_seq)),
+            struct.pack("<q", eval_micros),
+            _as_hash32(permission_root),
+        ]
+    )
+
+
+def compute_rebuild_archive_header_hash(
+    schema_version: str,
+    tenant_id: str,
+    scope: str,
+    up_to_seq: int,
+    evaluated_at: int | str | datetime.datetime,
+    permission_root: bytes | str,
+) -> bytes:
+    return blake3_hash(
+        [
+            rebuild_archive_header_preimage_bytes(
+                schema_version,
+                tenant_id,
+                scope,
+                up_to_seq,
+                evaluated_at,
+                permission_root,
+            )
+        ]
+    )
+
+
+def rebuild_header_signing_preimage(tenant: str, header_hash: bytes | str) -> bytes:
+    return hash_length_delimited(
+        [
+            b"acta:rebuild_sig:v1",
+            tenant.encode("utf-8"),
+            _as_hash32(header_hash),
+        ]
+    )
+
+
+def sign_rebuild_archive_header(
+    private_key_seed: bytes | str,
+    tenant: str,
+    header_hash: bytes | str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(private_key_seed)
+        if isinstance(private_key_seed, str)
+        else bytes(private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    return sk.sign(rebuild_header_signing_preimage(tenant, header_hash))
+
+
+def verify_rebuild_archive_header_signature(
+    pubkey: bytes | str,
+    tenant: str,
+    header_hash: bytes | str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = bytes.fromhex(pubkey) if isinstance(pubkey, str) else bytes(pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    return verify_ed25519_strict(
+        pk_raw,
+        rebuild_header_signing_preimage(tenant, header_hash),
+        sig_raw,
+    )
+
+
+def _json_value_family_tag(val: Any) -> int:
+    if val is None:
+        return 0
+    if isinstance(val, bool):
+        return 1
+    if isinstance(val, (int, float)):
+        return 2
+    if isinstance(val, str):
+        return 3
+    if isinstance(val, list):
+        return 4
+    if isinstance(val, Mapping):
+        return 5
+    return 6
+
+
+def claims_share_winning_value_bucket(
+    winner: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> bool:
+    if _json_value_family_tag(winner["object_val"]) != _json_value_family_tag(candidate["object_val"]):
+        return False
+    return to_canonical_bytes(winner["object_val"]) == to_canonical_bytes(candidate["object_val"])
+
+
+def _round_9_rust(val: float) -> float:
+    scaled = val * 1_000_000_000.0
+    rounded = math.floor(scaled + 0.5) if scaled >= 0.0 else math.ceil(scaled - 0.5)
+    return rounded / 1_000_000_000.0
+
+
+def recompute_winning_bucket_corroboration(
+    bucket_claims: Sequence[Mapping[str, Any]],
+    damping: float,
+) -> tuple[int, list[str], float]:
+    if not bucket_claims:
+        raise ValueError("winning value bucket cannot be empty")
+    sorted_claims = sorted(
+        bucket_claims,
+        key=lambda c: (
+            -float(c["confidence"]),
+            -int(c["source_provenance_class"]),
+            -parse_rfc3339_micros(c["created_at"]),
+            -int(c["version"]),
+            uuid.UUID(str(c["id"])).bytes,
+        ),
+    )
+    seen_sources: set[str] = set()
+    for c in sorted_claims:
+        sd = str(c["source_descriptor"])
+        if sd in seen_sources:
+            raise ValueError(f"duplicate source_descriptor '{sd}' inside corroborating value bucket")
+        seen_sources.add(sd)
+    lead_conf = float(sorted_claims[0]["confidence"])
+    if len(sorted_claims) == 1:
+        eff = _round_9_rust(lead_conf)
+    else:
+        unconvinced = 1.0
+        for c in sorted_claims[1:]:
+            factor = max(0.0, min(1.0, 1.0 - float(damping) * float(c["confidence"])))
+            unconvinced *= factor
+        eff = _round_9_rust(min(lead_conf + (1.0 - lead_conf) * (1.0 - unconvinced), 0.9999))
+    return len(sorted_claims), [str(c["source_descriptor"]) for c in sorted_claims], eff
 
 
 def compute_answer_cache_summary_commitment(acs: Mapping[str, Any]) -> bytes:
@@ -1234,6 +1456,9 @@ def compute_evidence_event_hash(
     override_summary: Mapping[str, Any] | None = None,
     write_summary: Mapping[str, Any] | None = None,
     answer_cache_summary: Mapping[str, Any] | None = None,
+    witness_reg_summary: Mapping[str, Any] | None = None,
+    witness_revoke_summary: Mapping[str, Any] | None = None,
+    witness_in_v3: bool = False,
 ) -> bytes:
     prev_raw = _as_hash32(prev_hash)
     created_micros = (
@@ -1260,6 +1485,33 @@ def compute_evidence_event_hash(
                 struct.pack("<q", created_micros),
                 write_tagged,
                 cache_tagged,
+            ]
+        )
+    if witness_in_v3 and (witness_reg_summary is not None or witness_revoke_summary is not None):
+        wreg_tagged = _encode_opt_jcs(
+            _normalize_witness_reg_summary(witness_reg_summary)
+            if witness_reg_summary is not None
+            else None
+        )
+        wrev_tagged = _encode_opt_jcs(
+            _normalize_witness_revoke_summary(witness_revoke_summary)
+            if witness_revoke_summary is not None
+            else None
+        )
+        return hash_length_delimited(
+            [
+                b"acta:evidence_event:v3",
+                tenant_id.encode("utf-8"),
+                struct.pack("<q", int(seq_num)),
+                prev_raw,
+                _encode_opt_hash32(bundle_hash),
+                _encode_opt_hash32(state_commitment),
+                policy_result.encode("utf-8"),
+                struct.pack("<q", created_micros),
+                b"\x00",
+                b"\x00",
+                wreg_tagged,
+                wrev_tagged,
             ]
         )
     if refusal_metadata is None and override_summary is None:
@@ -1740,7 +1992,11 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
                 f"tampered refusal_metadata at seq_num={entry['seq_num']}: state_commitment mismatch"
             )
 
-    if wmeta is not None or acmeta is not None:
+    witness_in_v3 = (
+        (entry.get("witness_reg_summary") is not None or entry.get("witness_revoke_summary") is not None)
+        and entry.get("event_domain") == "acta:evidence_event:v3"
+    )
+    if wmeta is not None or acmeta is not None or witness_in_v3:
         expected_ev_domain = "acta:evidence_event:v3"
     elif rmeta is not None or ometa is not None:
         expected_ev_domain = "acta:evidence_event:v2"
@@ -1836,6 +2092,8 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
         if ev_kind in (None, "cached"):
             if (
                 acmeta.get("invalidation_reason") is not None
+                or acmeta.get("invalidated_by") is not None
+                or acmeta.get("invalidator_auth_kind") is not None
                 or acmeta.get("observed_state_commitment") is not None
                 or acmeta.get("observed_dependency_commitment") is not None
             ):
@@ -1851,6 +2109,14 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
                 )
             if acmeta.get("observed_state_commitment") is None:
                 raise ValueError(f"{lbl} invalidation event requires observed_state_commitment")
+            inv_kind = acmeta.get("invalidator_auth_kind")
+            if inv_kind is not None and str(inv_kind).strip() not in (
+                "oauth_github_principal",
+                "ed25519_client_sig",
+                "tenant_session",
+                "master_admin",
+            ):
+                raise ValueError(f"{lbl} unsupported invalidator_auth_kind {inv_kind!r}")
         else:
             raise ValueError(f"{lbl} unsupported answer_cache event_kind {ev_kind!r}")
         _verify_auth_kind_and_sig_presence(
@@ -1979,6 +2245,9 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
         override_summary=ometa,
         write_summary=wmeta,
         answer_cache_summary=acmeta,
+        witness_reg_summary=wreg,
+        witness_revoke_summary=wrev,
+        witness_in_v3=witness_in_v3,
     )
     stored_event_hex = (
         entry["event_hash"].lower()
@@ -2101,6 +2370,7 @@ class VerificationSummary:
     verified_objects: int
     verified_claims: int
     verified_evidence_entries: int
+    verified_corroborated_resolutions: int = 0
     verified_overrides: int = 0
     verified_writes: int = 0
     verified_answer_caches: int = 0
@@ -2297,6 +2567,12 @@ def verify_export_archive(
                 f"tampered bundle selected_objects[id={sid}]: reference mismatch against verified object"
             )
 
+    corroboration_damping = (
+        float(rm["corroboration_damping"])
+        if rm is not None
+        else DEFAULT_CORROBORATION_DAMPING
+    )
+    verified_corroborated_resolutions = 0
     for res in bundle.get("resolution_records", []):
         win = res["winning_claim"]
         cid = str(uuid.UUID(str(win["id"]))).lower()
@@ -2340,6 +2616,55 @@ def verify_export_archive(
                 raise ValueError(
                     f"tampered override_attestation reference on resolution_record for claim[id={cid}]"
                 )
+        elif int(win.get("corroborating_count") or 1) > 1 or win.get("effective_confidence") is not None:
+            expected_count = max(int(win.get("corroborating_count") or 1), 2)
+            bucket_claims: list[Mapping[str, Any]] = [stored]
+            for raw_sid in res.get("suppressed_claim_ids", []):
+                sid = str(uuid.UUID(str(raw_sid))).lower()
+                if sid == cid:
+                    continue
+                sup_stored = claims_by_id.get(sid)
+                if sup_stored is not None:
+                    sup_groups = {
+                        str(sup_stored["claim_group_key"]).lower(),
+                        compute_logical_claim_group_key(
+                            str(sup_stored["tenant_id"]),
+                            str(sup_stored["subject"]),
+                            str(sup_stored["predicate"]),
+                            str(sup_stored["scope"]),
+                        ).hex(),
+                    }
+                    if str(res["claim_group_key"]).lower() not in sup_groups:
+                        raise ValueError(
+                            f"corroborating claim[id={sid}] does not match resolution claim_group_key"
+                        )
+                    if claims_share_winning_value_bucket(win, sup_stored):
+                        bucket_claims.append(sup_stored)
+            if len(bucket_claims) != expected_count:
+                raise ValueError(
+                    f"resolution_record for claim[id={cid}] declares corroborating_count={expected_count}, "
+                    f"but archive.claims contains {len(bucket_claims)} winning-bucket claim(s); "
+                    "all corroborating claims must be proven in archive.claims"
+                )
+            rec_cnt, rec_sources, rec_eff = recompute_winning_bucket_corroboration(
+                bucket_claims, corroboration_damping
+            )
+            if rec_cnt != expected_count:
+                raise ValueError(
+                    f"corroborating_count mismatch on claim[id={cid}]: recomputed {rec_cnt} != {expected_count}"
+                )
+            claimed_sources = list(win.get("corroborating_sources") or [])
+            if claimed_sources and rec_sources != claimed_sources:
+                raise ValueError(
+                    f"corroborating_sources mismatch on claim[id={cid}]: recomputed {rec_sources} != {claimed_sources}"
+                )
+            if win.get("effective_confidence") is not None:
+                claimed_eff = float(win["effective_confidence"])
+                if abs(claimed_eff - rec_eff) > 1e-9:
+                    raise ValueError(
+                        f"tampered effective_confidence on claim[id={cid}]: recomputed {rec_eff:.9f} != bundle {claimed_eff:.9f}"
+                    )
+            verified_corroborated_resolutions += 1
 
     for disp in bundle.get("dispute_records", []):
         competing = disp.get("competing_claims", [])
@@ -2624,6 +2949,7 @@ def verify_export_archive(
         verified_objects=len(objects_by_id),
         verified_claims=len(claims_by_id),
         verified_evidence_entries=verified_evidence_entries,
+        verified_corroborated_resolutions=verified_corroborated_resolutions,
         verified_overrides=len(overrides_by_id),
         verified_writes=verified_writes,
         verified_answer_caches=verified_answer_caches,
@@ -2660,6 +2986,8 @@ class OfflineStateRebuildSummary:
     merkle_root_hex: str | None = None
     anchored_tree_size: int | None = None
     verified_witness_anchors: int = 0
+    header_hash_hex: str = ""
+    header_signature_verified: bool = True
 
 
 def verify_and_rebuild_scope_state_offline(
@@ -2696,6 +3024,34 @@ def verify_and_rebuild_scope_state_offline(
     up_to_seq = int(archive["up_to_seq"])
     if up_to_seq < 0:
         raise ValueError(f"invalid up_to_seq={up_to_seq}: must be >= 0")
+
+    if archive.get("header_hash") is None or archive.get("host_header_signature") is None:
+        raise ValueError(
+            "StateRebuildArchive missing required signed header fields (header_hash, host_header_signature)"
+        )
+    recomputed_header = compute_rebuild_archive_header_hash(
+        schema_ver,
+        tenant_id,
+        str(archive["scope"]),
+        up_to_seq,
+        archive["evaluated_at"],
+        archive["permission_root"],
+    )
+    stored_header = _as_hash32(archive["header_hash"])
+    if recomputed_header != stored_header:
+        raise ValueError(
+            f"tampered StateRebuildArchive header (scope / up_to_seq / evaluated_at / permission_root): "
+            f"recomputed header_hash {recomputed_header.hex()} != stored {stored_header.hex()}"
+        )
+    if not verify_rebuild_archive_header_signature(
+        expected_pk,
+        tenant_id,
+        recomputed_header,
+        archive["host_header_signature"],
+    ):
+        raise ValueError(
+            "Ed25519 host_header_signature verification failed on StateRebuildArchive header"
+        )
 
     evidence_chain = list(archive.get("evidence_chain") or [])
     if len(evidence_chain) != up_to_seq:
@@ -2966,6 +3322,8 @@ def verify_and_rebuild_scope_state_offline(
         merkle_root_hex=merkle_root_hex,
         anchored_tree_size=anchored_tree_size,
         verified_witness_anchors=verified_witness_anchors,
+        header_hash_hex=recomputed_header.hex(),
+        header_signature_verified=True,
     )
 
 
@@ -3066,6 +3424,12 @@ def _evidence_event_preimage_bytes(entry: Mapping[str, Any]) -> tuple[str, bytes
     osumm = entry.get("override_summary")
     wsumm = entry.get("write_summary")
     acsumm = entry.get("answer_cache_summary")
+    wreg = entry.get("witness_reg_summary")
+    wrev = entry.get("witness_revoke_summary")
+    witness_in_v3 = (
+        (wreg is not None or wrev is not None)
+        and entry.get("event_domain") == "acta:evidence_event:v3"
+    )
     if wsumm is not None or acsumm is not None:
         write_tagged = _encode_opt_jcs(_normalize_write_summary(wsumm) if wsumm is not None else None)
         cache_tagged = _encode_opt_jcs(
@@ -3085,6 +3449,28 @@ def _evidence_event_preimage_bytes(entry: Mapping[str, Any]) -> tuple[str, bytes
                     struct.pack("<q", created_micros),
                     write_tagged,
                     cache_tagged,
+                ]
+            ),
+        )
+    if witness_in_v3:
+        wreg_tagged = _encode_opt_jcs(_normalize_witness_reg_summary(wreg) if wreg is not None else None)
+        wrev_tagged = _encode_opt_jcs(_normalize_witness_revoke_summary(wrev) if wrev is not None else None)
+        return (
+            "acta:evidence_event:v3",
+            encode_length_delimited(
+                [
+                    b"acta:evidence_event:v3",
+                    str(entry["tenant_id"]).encode("utf-8"),
+                    struct.pack("<q", int(entry["seq_num"])),
+                    prev_raw,
+                    _encode_opt_hash32(entry.get("bundle_hash")),
+                    _encode_opt_hash32(entry.get("state_commitment")),
+                    str(entry["policy_result"]).encode("utf-8"),
+                    struct.pack("<q", created_micros),
+                    b"\x00",
+                    b"\x00",
+                    wreg_tagged,
+                    wrev_tagged,
                 ]
             ),
         )
@@ -3349,6 +3735,16 @@ def dump_archive_preimages(archive: Mapping[str, Any]) -> dict[str, Any]:
                 "answer_cache_summary_canonical_jcs": (
                     to_canonical_json(_normalize_answer_cache_summary(entry["answer_cache_summary"]))
                     if entry.get("answer_cache_summary") is not None
+                    else None
+                ),
+                "witness_reg_summary_canonical_jcs": (
+                    to_canonical_json(_normalize_witness_reg_summary(entry["witness_reg_summary"]))
+                    if entry.get("witness_reg_summary") is not None
+                    else None
+                ),
+                "witness_revoke_summary_canonical_jcs": (
+                    to_canonical_json(_normalize_witness_revoke_summary(entry["witness_revoke_summary"]))
+                    if entry.get("witness_revoke_summary") is not None
                     else None
                 ),
                 "witness_registration": entry.get("witness_reg_summary"),

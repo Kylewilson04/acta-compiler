@@ -129,7 +129,7 @@ impl AppState {
         let user_agent = std::env::var("ACTA_HTTP_USER_AGENT")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Acta-Compiler-OAuth/1.6".to_string());
+            .unwrap_or_else(|| "Acta-Compiler-OAuth/1.7".to_string());
 
         let http_client = reqwest::Client::builder()
             .user_agent(user_agent)
@@ -348,6 +348,48 @@ impl AppState {
             summary: sanitize_refusal_summary(detail),
             scope_state_commitment: None,
             attempted_checkpoint_hash,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+        };
+        evidence_repo::append_refusal_metadata_tx(
+            &self.pool,
+            &self.host_signing_key,
+            &audit_tenant,
+            tag,
+            meta,
+            Utc::now().trunc_subsecs(6),
+        )
+        .await
+        .ok()
+    }
+
+    /// Appends a signed `EvidenceEntry` with `RefusalMetadata` binding `signing_domain` and
+    /// `expected_intent_digest_hex` on client Ed25519 signature refusals (`v1.7.2+`, Should-Fix 1 & 2).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_signature_refusal_audit(
+        &self,
+        headers: &HeaderMap,
+        fallback_tenant: Option<&str>,
+        tag: PolicyResultTag,
+        operation: &str,
+        reason_code: &str,
+        target_scope: Option<&str>,
+        detail: &str,
+        signing_domain: &str,
+        expected_intent_digest: [u8; 32],
+    ) -> Option<EvidenceEntry> {
+        let audit_tenant = self.authenticated_audit_tenant(headers, fallback_tenant)?;
+        let meta = RefusalMetadata {
+            operation: sanitize_refusal_summary(operation),
+            reason_code: sanitize_refusal_summary(reason_code),
+            target_scope: target_scope
+                .map(sanitize_refusal_summary)
+                .filter(|s| !s.is_empty()),
+            summary: sanitize_refusal_summary(detail),
+            scope_state_commitment: None,
+            attempted_checkpoint_hash: None,
+            signing_domain: Some(sanitize_refusal_summary(signing_domain)),
+            expected_intent_digest_hex: Some(expected_intent_digest),
         };
         evidence_repo::append_refusal_metadata_tx(
             &self.pool,
@@ -571,12 +613,7 @@ impl AppState {
         }
     }
 
-    /// Resolves the caller's tenant scope BEFORE touching `context_bundles` (`v1.6.7+`):
-    /// - If `explicit_tenant` is passed and conflicts with the caller's lock, rejects and logs
-    ///   `mcp_tenant_lock_violation` / `tenant_lock_violation` to the caller's own ledger immediately.
-    /// - If `explicit_tenant` is omitted, binds lookup SQL to the caller's locked tenant (or public
-    ///   `sandbox*` prefix for unauthenticated REST callers) so foreign hashes return identical
-    ///   `context_bundle not found` errors with zero cross-tenant oracle.
+    /// Resolves the caller's tenant scope BEFORE touching `context_bundles` (`v1.6.7+`).
     pub async fn resolve_bundle_lookup_scope(
         &self,
         headers: &HeaderMap,

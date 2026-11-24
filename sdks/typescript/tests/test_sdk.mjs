@@ -547,7 +547,7 @@ let forgeSig = false;
 const srv = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "1.7.1", host_public_key: pkHex, permission_root: permRoot }));
+    res.end(JSON.stringify({ status: "ok", version: "1.7.2", host_public_key: pkHex, permission_root: permRoot }));
     return;
   }
   if (req.method === "GET" && req.url.includes("/export")) {
@@ -763,7 +763,7 @@ try {
     ActaAuthError
   );
 
-  console.log("ALL TYPESCRIPT @acta/sdk v1.7.1 TESTS + MERKLE & EPISTEMIC NOTARY VECTORS PASSED!");
+  console.log("ALL TYPESCRIPT @acta/sdk v1.7.2 TESTS + MERKLE & EPISTEMIC NOTARY VECTORS PASSED!");
 } finally {
   srv.close();
 }
@@ -911,7 +911,7 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
 }
 
 
-// 7. v1.7.1 Claim 25 Dependency Commitment, Cache Invalidation & Offline State Rebuild
+// 7. v1.7.2 Claim 25 Dependency Commitment, Cache Invalidation & Offline State Rebuild
 {
   const {
     SCHEMA_VERSION,
@@ -1100,6 +1100,24 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
     created_at: ts,
   };
 
+  const {
+    computeRebuildArchiveHeaderHash,
+    signRebuildArchiveHeader,
+    recomputeWinningBucketCorroboration,
+  } = await import("../dist/index.mjs");
+  assert.equal(
+    computeSubCommitment([]),
+    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+  );
+  const hdrHash = computeRebuildArchiveHeaderHash({
+    schemaVersion: STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    tenantId: tenant,
+    scope,
+    upToSeq: 3,
+    evaluatedAt: ts,
+    permissionRoot: permRoot,
+  });
+  const hdrSig = signRebuildArchiveHeader(seedHex, tenant, hdrHash);
   const rebuildArchive = {
     schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1,
     tenant_id: tenant,
@@ -1108,6 +1126,8 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
     evaluated_at: ts,
     host_public_key: pkHex,
     permission_root: permRoot,
+    header_hash: hdrHash,
+    host_header_signature: hdrSig,
     override_attestations: [],
     evidence_chain: [entry1, entry2, entry3],
   };
@@ -1128,5 +1148,15 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
   const tampered = JSON.parse(JSON.stringify(rebuildArchive));
   tampered.evidence_chain[1].write_summary.record_snapshot.object_val = 999;
   assert.throws(() => verifyAndRebuildScopeStateOffline(tampered, pkHex), ActaVerificationError);
-  console.log("TYPESCRIPT @acta/sdk v1.7.1 OFFLINE STATE REBUILD & CLAIM 25 VECTORS PASSED!");
+
+  const swappedClock = JSON.parse(JSON.stringify(rebuildArchive));
+  swappedClock.evaluated_at = "2027-06-01T00:00:00.000000Z";
+  assert.throws(() => verifyAndRebuildScopeStateOffline(swappedClock, pkHex), ActaVerificationError);
+
+  const clmB = { ...clm, id: "c87ad711-2222-4222-8222-222222222222", source_descriptor: "bol-b" };
+  clmB.content_hash = computeClaimContentHash(clmB);
+  const corrob = recomputeWinningBucketCorroboration([clm, clmB], 0.5);
+  assert.equal(corrob.corroboratingCount, 2);
+  assert.ok(Math.abs(corrob.effectiveConfidence - 0.72) < 1e-9);
+  console.log("TYPESCRIPT @acta/sdk v1.7.2 OFFLINE STATE REBUILD & CLAIM 25 VECTORS PASSED!");
 }

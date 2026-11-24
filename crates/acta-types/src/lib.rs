@@ -100,7 +100,8 @@ pub use bundle::{
     TrustedWitness, WitnessRegistrationSummary, WitnessRevocationSummary, WriteLedgerSummary,
     WriteOperationKind, ANSWER_CACHE_DOMAIN_V1, CACHE_DEPENDENCY_DOMAIN_V1,
     DEFAULT_CORROBORATION_DAMPING, DEFAULT_DECISIVENESS_THRESHOLD, DEFAULT_MIN_CONFIDENCE,
-    SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V2,
+    REBUILD_HEADER_DOMAIN_V1, REBUILD_SIG_DOMAIN_V1, SCHEMA_VERSION,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V1, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V2,
     WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1, WITNESS_REVOKE_DOMAIN_V2,
     WRITE_EVENT_DOMAIN_V1,
 };
@@ -186,6 +187,29 @@ mod tests {
         let encoded_reasons = serde_json::to_string(&reasons).unwrap();
         let decoded_reasons: Vec<OmissionReason> = serde_json::from_str(&encoded_reasons).unwrap();
         assert_eq!(reasons, decoded_reasons);
+    }
+
+    #[test]
+    fn test_state_rebuild_archive_always_emits_override_attestations_array() {
+        let now = Utc::now().trunc_subsecs(6);
+        let reb = StateRebuildArchive {
+            schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1.to_string(),
+            tenant_id: "tenant-1".to_string(),
+            scope: "ops".to_string(),
+            up_to_seq: 0,
+            evaluated_at: now,
+            host_public_key: [0x11; 32],
+            permission_root: [0x22; 32],
+            header_hash: [0x33; 32],
+            host_header_signature: [0x44; 64],
+            override_attestations: vec![],
+            evidence_chain: vec![],
+            checkpoint: None,
+            latest_anchored_checkpoint: None,
+            consistency_proof_from_latest_anchor: vec![],
+        };
+        let raw = serde_json::to_value(&reb).expect("serialize rebuild archive");
+        assert_eq!(raw["override_attestations"], json!([]));
     }
 
     #[test]

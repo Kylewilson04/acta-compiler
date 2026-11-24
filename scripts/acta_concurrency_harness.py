@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acta v1.7.1 True-Parallel Concurrency, Write-Chaining & State-Rebuild Verification Harness.
+"""Acta v1.7.2 True-Parallel Concurrency, Write-Chaining & State-Rebuild Verification Harness.
 
 Opens 50 independent HTTP connections, synchronizes all 50 worker threads on a
 `threading.Barrier(50)` so all writes hit PostgreSQL `pg_advisory_xact_lock` concurrently
@@ -456,7 +456,7 @@ def run_harness(
     assert len(entries) == expected_total, f"expected {expected_total} entries, got {len(entries)}"
 
     report = {
-        "harness_version": "1.7.1",
+        "harness_version": "1.7.2",
         "executed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "target_mcp_url": mcp_url,
         "server_reported_version": server_version,
@@ -517,7 +517,7 @@ def run_harness(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Acta v1.7.1 True-Parallel Concurrency Harness")
+    parser = argparse.ArgumentParser(description="Acta v1.7.2 True-Parallel Concurrency Harness")
     parser.add_argument(
         "--url",
         default=os.environ.get(

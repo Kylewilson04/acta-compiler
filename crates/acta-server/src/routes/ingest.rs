@@ -285,22 +285,28 @@ pub async fn handle_ingest_object(
         if !verify_client_content_signature(&pk_arr, &intent_hash, &sig_arr)
             && !verify_client_content_signature(&pk_arr, &content_hash, &sig_arr)
         {
-            let suffix = state
-                .append_refusal_audit_with_scope(
+            let ev_seq = state
+                .append_signature_refusal_audit(
                     &headers,
                     Some(&req.tenant_id),
                     PolicyResultTag::Block,
                     "ingest_object",
-                    "invalid_client_content_signature",
+                    "invalid_object_client_signature",
                     Some(&req.scope),
                     "client Ed25519 signature verification failed on ingest_object",
+                    "acta:object_client_sig:v1",
+                    intent_hash,
                 )
                 .await
-                .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                .unwrap_or_default();
-            return Err(ApiError::bad_request(format!(
-                "client Ed25519 signature verification failed over object intent digest or content_hash{suffix}"
-            )));
+                .map(|e| e.seq_num);
+            return Err(ApiError::signature_refusal(
+                StatusCode::BAD_REQUEST,
+                "client Ed25519 signature verification failed over object intent digest or content_hash",
+                "invalid_object_client_signature",
+                "acta:object_client_sig:v1",
+                intent_hash,
+                ev_seq,
+            ));
         }
         obj.client_signature = Some(sig_arr.to_vec());
         obj.client_public_key = Some(pk_arr);
@@ -560,22 +566,28 @@ pub async fn handle_ingest_claim(
         if !verify_client_content_signature(&pk_arr, &intent_hash, &sig_arr)
             && !verify_client_content_signature(&pk_arr, &content_hash, &sig_arr)
         {
-            let suffix = state
-                .append_refusal_audit_with_scope(
+            let ev_seq = state
+                .append_signature_refusal_audit(
                     &headers,
                     Some(&req.tenant_id),
                     PolicyResultTag::Block,
                     "ingest_claim",
-                    "invalid_client_content_signature",
+                    "invalid_claim_client_signature",
                     Some(&req.scope),
                     "client Ed25519 signature verification failed on ingest_claim",
+                    "acta:claim_client_sig:v1",
+                    intent_hash,
                 )
                 .await
-                .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                .unwrap_or_default();
-            return Err(ApiError::bad_request(format!(
-                "client Ed25519 signature verification failed over claim intent digest or content_hash{suffix}"
-            )));
+                .map(|e| e.seq_num);
+            return Err(ApiError::signature_refusal(
+                StatusCode::BAD_REQUEST,
+                "client Ed25519 signature verification failed over claim intent digest or content_hash",
+                "invalid_claim_client_signature",
+                "acta:claim_client_sig:v1",
+                intent_hash,
+                ev_seq,
+            ));
         }
         claim.client_signature = Some(sig_arr.to_vec());
         claim.client_public_key = Some(pk_arr);
@@ -644,12 +656,25 @@ pub async fn handle_retract_claim(
         .map_err(ApiError::unauthorized)?;
 
     validate_identifier("tenant_id", &req.tenant_id)?;
+    let explicit_scope = req
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(exp_sc) = explicit_scope {
+        validate_scope(exp_sc)?;
+    }
     validate_justification(&req.reason)?;
 
     let parsed_sig_pair = parse_optional_client_sig_pair(
         req.client_signature_hex.as_deref(),
         req.client_public_key_hex.as_deref(),
     )?;
+
+    if let Some(exp_sc) = explicit_scope {
+        enforce_policy_before_write(&state, &headers, &req.tenant_id, exp_sc, "retract_claim")
+            .await?;
+    }
 
     let target_claim = claims_repo::fetch_claim_by_id(&state.pool, &req.tenant_id, req.claim_id)
         .await?
@@ -660,14 +685,41 @@ pub async fn handle_retract_claim(
             )))
         })?;
 
-    enforce_policy_before_write(
-        &state,
-        &headers,
-        &req.tenant_id,
-        &target_claim.scope,
-        "retract_claim",
-    )
-    .await?;
+    if let Some(exp_sc) = explicit_scope {
+        if target_claim.scope != exp_sc {
+            let msg = format!(
+                "claim {} belongs to scope '{}', not requested scope '{exp_sc}'",
+                req.claim_id, target_claim.scope
+            );
+            let ev_seq = state
+                .append_refusal_audit_with_scope(
+                    &headers,
+                    Some(&req.tenant_id),
+                    PolicyResultTag::Block,
+                    "retract_claim",
+                    "claim_scope_mismatch",
+                    Some(exp_sc),
+                    &msg,
+                )
+                .await
+                .map(|e| e.seq_num);
+            return Err(ApiError::refusal(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "claim_scope_mismatch",
+                ev_seq,
+            ));
+        }
+    } else {
+        enforce_policy_before_write(
+            &state,
+            &headers,
+            &req.tenant_id,
+            &target_claim.scope,
+            "retract_claim",
+        )
+        .await?;
+    }
 
     let mut client_signature = None;
     let mut client_public_key = None;
@@ -675,22 +727,28 @@ pub async fn handle_retract_claim(
         let retract_intent =
             compute_retract_claim_client_intent_hash(&req.tenant_id, req.claim_id, &req.reason);
         if !verify_client_content_signature(&pk_arr, &retract_intent, &sig_arr) {
-            let suffix = state
-                .append_refusal_audit_with_scope(
+            let ev_seq = state
+                .append_signature_refusal_audit(
                     &headers,
                     Some(&req.tenant_id),
                     PolicyResultTag::Block,
                     "retract_claim",
-                    "invalid_client_content_signature",
+                    "invalid_retract_client_signature",
                     Some(&target_claim.scope),
                     "client Ed25519 signature verification failed on retract_claim",
+                    "acta:retract_client_sig:v1",
+                    retract_intent,
                 )
                 .await
-                .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                .unwrap_or_default();
-            return Err(ApiError::bad_request(format!(
-                "client Ed25519 signature verification failed over retract_claim intent digest{suffix}"
-            )));
+                .map(|e| e.seq_num);
+            return Err(ApiError::signature_refusal(
+                StatusCode::BAD_REQUEST,
+                "client Ed25519 signature verification failed over retract_claim intent digest",
+                "invalid_retract_client_signature",
+                "acta:retract_client_sig:v1",
+                retract_intent,
+                ev_seq,
+            ));
         }
         client_signature = Some(sig_arr.to_vec());
         client_public_key = Some(pk_arr);
@@ -702,7 +760,7 @@ pub async fn handle_retract_claim(
     let tombstone_id = req.id.unwrap_or_else(Uuid::new_v4);
     let created_at = Utc::now().trunc_subsecs(6);
 
-    let (tombstone, ev, was_idempotent_noop) = claims_repo::retract_claim_with_evidence_tx(
+    let (tombstone, ev, was_idempotent_noop) = match claims_repo::retract_claim_with_evidence_tx(
         &state.pool,
         &state.host_signing_key,
         &req.tenant_id,
@@ -715,7 +773,33 @@ pub async fn handle_retract_claim(
         client_public_key,
         created_at,
     )
-    .await?;
+    .await
+    {
+        Ok(res) => res,
+        Err(acta_types::ActaError::Validation(msg))
+            if msg.contains("already superseded or retracted") || msg.contains("is not active") =>
+        {
+            let ev_seq = state
+                .append_refusal_audit_with_scope(
+                    &headers,
+                    Some(&req.tenant_id),
+                    PolicyResultTag::Block,
+                    "retract_claim",
+                    "claim_already_retracted",
+                    Some(&target_claim.scope),
+                    &msg,
+                )
+                .await
+                .map(|e| e.seq_num);
+            return Err(ApiError::refusal(
+                StatusCode::CONFLICT,
+                msg,
+                "claim_already_retracted",
+                ev_seq,
+            ));
+        }
+        Err(other) => return Err(ApiError::from(other)),
+    };
 
     let status_code = if was_idempotent_noop {
         StatusCode::OK

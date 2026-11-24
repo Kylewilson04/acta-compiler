@@ -44,8 +44,6 @@ pub struct RebuildStateQueryParams {
 
 /// `POST /v1/answers/cache` -> Persists a state- or dependency-conditioned cached answer bound to a
 /// verified `ContextBundle` and notarizes `AnswerCacheLedgerSummary` on `evidence_history` (PPA 1 Claims 19–27).
-/// In `v1.7.1+`, `validity_mode` defaults to `"dependency_subset"` (PPA 1 Claim 25) so unrelated writes
-/// in the same scope do not invalidate cached answers; callers may also select `"scope_root"`.
 pub async fn handle_cache_answer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -63,15 +61,21 @@ pub async fn handle_cache_answer(
         .map_err(ApiError::unauthorized)?;
 
     validate_identifier("tenant_id", &req.tenant_id)?;
-    if let Some(ref sc) = req.scope {
-        if !sc.trim().is_empty() {
-            validate_scope(sc)?;
-        }
+    let explicit_scope = req
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(sc) = explicit_scope {
+        validate_scope(sc)?;
     }
-    if let Some(ref tid) = req.task_id {
-        if !tid.trim().is_empty() {
-            validate_identifier("task_id", tid)?;
-        }
+    let explicit_task = req
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(tid) = explicit_task {
+        validate_identifier("task_id", tid)?;
     }
     let query_text = req.query_text.as_deref().unwrap_or("");
     validate_query_text(query_text)?;
@@ -142,6 +146,59 @@ pub async fn handle_cache_answer(
     )
     .await?;
 
+    if let Some(exp_sc) = explicit_scope {
+        if exp_sc != source_bundle.scope {
+            let msg = format!(
+                "explicit scope '{exp_sc}' does not match source_bundle_hash scope '{}'",
+                source_bundle.scope
+            );
+            let ev_seq = state
+                .append_refusal_audit_with_scope(
+                    &headers,
+                    Some(&req.tenant_id),
+                    PolicyResultTag::Block,
+                    "cache_answer",
+                    "bundle_scope_mismatch",
+                    Some(exp_sc),
+                    &msg,
+                )
+                .await
+                .map(|e| e.seq_num);
+            return Err(ApiError::refusal(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "bundle_scope_mismatch",
+                ev_seq,
+            ));
+        }
+    }
+    if let Some(exp_tid) = explicit_task {
+        if exp_tid != source_bundle.task_id {
+            let msg = format!(
+                "explicit task_id '{exp_tid}' does not match source_bundle_hash task_id '{}'",
+                source_bundle.task_id
+            );
+            let ev_seq = state
+                .append_refusal_audit_with_scope(
+                    &headers,
+                    Some(&req.tenant_id),
+                    PolicyResultTag::Block,
+                    "cache_answer",
+                    "bundle_task_mismatch",
+                    Some(&source_bundle.scope),
+                    &msg,
+                )
+                .await
+                .map(|e| e.seq_num);
+            return Err(ApiError::refusal(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "bundle_task_mismatch",
+                ev_seq,
+            ));
+        }
+    }
+
     enforce_policy_before_write(
         &state,
         &headers,
@@ -169,22 +226,28 @@ pub async fn handle_cache_answer(
         if !verify_client_content_signature(&pk_arr, &intent_hash, &sig_arr)
             && !verify_client_content_signature(&pk_arr, &answer_hash, &sig_arr)
         {
-            let suffix = state
-                .append_refusal_audit_with_scope(
+            let ev_seq = state
+                .append_signature_refusal_audit(
                     &headers,
                     Some(&req.tenant_id),
                     PolicyResultTag::Block,
                     "cache_answer",
-                    "invalid_client_content_signature",
+                    "invalid_answer_client_signature",
                     Some(&source_bundle.scope),
                     "client Ed25519 signature verification failed on cache_answer",
+                    "acta:answer_client_sig:v1",
+                    intent_hash,
                 )
                 .await
-                .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
-                .unwrap_or_default();
-            return Err(ApiError::bad_request(format!(
-                "client Ed25519 signature verification failed over answer cache intent digest or answer_hash{suffix}"
-            )));
+                .map(|e| e.seq_num);
+            return Err(ApiError::signature_refusal(
+                StatusCode::BAD_REQUEST,
+                "client Ed25519 signature verification failed over answer cache intent digest or answer_hash",
+                "invalid_answer_client_signature",
+                "acta:answer_client_sig:v1",
+                intent_hash,
+                ev_seq,
+            ));
         }
         client_signature = Some(sig_arr.to_vec());
         client_public_key = Some(pk_arr);
@@ -202,8 +265,8 @@ pub async fn handle_cache_answer(
         NewCachedAnswerInput {
             id: req.id.unwrap_or_else(Uuid::new_v4),
             tenant_id: &req.tenant_id,
-            explicit_scope: req.scope.as_deref(),
-            explicit_task_id: req.task_id.as_deref(),
+            explicit_scope,
+            explicit_task_id: explicit_task,
             query_text,
             source_bundle_hash: &source_bundle_hash,
             validity_mode,
@@ -233,7 +296,8 @@ pub async fn handle_cache_answer(
 /// `POST /v1/answers/lookup` -> Enforces Policy-Before-Read, evaluates Claim 25 `dependency_subset`
 /// or `scope_root` validity without scanning historical bundles, re-verifies `answer_hash` and
 /// `host_signature`, and atomically chains a one-time invalidation receipt (`event_kind = "invalidated"`)
-/// on `evidence_history` when a cached answer becomes stale or TTL-expired (`v1.7.1+`).
+/// on `evidence_history` (preserving the original cacher's `cacher_auth_kind`, `client_public_key`, and
+/// `client_signature`, and returning inline `invalidation_evidence`, `v1.7.2+`).
 pub async fn handle_lookup_cached_answer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -336,6 +400,7 @@ pub async fn handle_lookup_cached_answer(
                     receipt: None,
                     invalidation_evidence_seq_num: None,
                     invalidation_newly_recorded: None,
+                    invalidation_evidence: None,
                     refusal_evidence_seq_num: ev_seq,
                 }),
             ));
@@ -375,6 +440,7 @@ pub async fn handle_lookup_cached_answer(
                     receipt: None,
                     invalidation_evidence_seq_num: None,
                     invalidation_newly_recorded: None,
+                    invalidation_evidence: None,
                     refusal_evidence_seq_num: ev_seq,
                 }),
             ));
@@ -421,6 +487,7 @@ pub async fn handle_lookup_cached_answer(
                 receipt: None,
                 invalidation_evidence_seq_num: None,
                 invalidation_newly_recorded: None,
+                invalidation_evidence: None,
                 refusal_evidence_seq_num: None,
             }),
         ));
@@ -478,6 +545,7 @@ pub async fn handle_lookup_cached_answer(
                 receipt: None,
                 invalidation_evidence_seq_num: None,
                 invalidation_newly_recorded: None,
+                invalidation_evidence: None,
                 refusal_evidence_seq_num: ev_seq,
             }),
         ));
@@ -513,7 +581,7 @@ pub async fn handle_lookup_cached_answer(
     let stored_sc_hex = stored.receipt.state_commitment.clone();
 
     if mode == "dependency_subset" && tdc_matches_opt == Some(false) {
-        let (inv_seq, inv_new) = answer_cache_repo::record_cache_invalidation_once_tx(
+        let (inv_seq, inv_new, inv_ev) = answer_cache_repo::record_cache_invalidation_once_tx(
             &state.pool,
             &state.host_signing_key,
             &stored,
@@ -544,13 +612,14 @@ pub async fn handle_lookup_cached_answer(
                 receipt: None,
                 invalidation_evidence_seq_num: Some(inv_seq),
                 invalidation_newly_recorded: Some(inv_new),
+                invalidation_evidence: inv_ev,
                 refusal_evidence_seq_num: None,
             }),
         ));
     }
 
     if mode != "dependency_subset" && !sc_matches {
-        let (inv_seq, inv_new) = answer_cache_repo::record_cache_invalidation_once_tx(
+        let (inv_seq, inv_new, inv_ev) = answer_cache_repo::record_cache_invalidation_once_tx(
             &state.pool,
             &state.host_signing_key,
             &stored,
@@ -581,13 +650,14 @@ pub async fn handle_lookup_cached_answer(
                 receipt: None,
                 invalidation_evidence_seq_num: Some(inv_seq),
                 invalidation_newly_recorded: Some(inv_new),
+                invalidation_evidence: inv_ev,
                 refusal_evidence_seq_num: None,
             }),
         ));
     }
 
     if stored.receipt.expires_at.is_some_and(|exp| now > exp) {
-        let (inv_seq, inv_new) = answer_cache_repo::record_cache_invalidation_once_tx(
+        let (inv_seq, inv_new, inv_ev) = answer_cache_repo::record_cache_invalidation_once_tx(
             &state.pool,
             &state.host_signing_key,
             &stored,
@@ -618,6 +688,7 @@ pub async fn handle_lookup_cached_answer(
                 receipt: None,
                 invalidation_evidence_seq_num: Some(inv_seq),
                 invalidation_newly_recorded: Some(inv_new),
+                invalidation_evidence: inv_ev,
                 refusal_evidence_seq_num: None,
             }),
         ));
@@ -642,6 +713,7 @@ pub async fn handle_lookup_cached_answer(
             receipt: Some(stored.receipt),
             invalidation_evidence_seq_num: None,
             invalidation_newly_recorded: None,
+            invalidation_evidence: None,
             refusal_evidence_seq_num: None,
         }),
     ))
@@ -678,7 +750,7 @@ pub async fn handle_trace_item_impact(
 
 /// `GET /v1/tenants/:tenant_id/state-rebuild?scope=...&up_to_seq=...&include_proof_archive=...` ->
 /// Cryptographically verifies `evidence_history` and rebuilds `scope` state + `state_commitment`
-/// from chain events alone, optionally returning a portable `StateRebuildArchive` (`v1.7.1+`).
+/// from chain events alone, optionally returning a portable host-header-signed `StateRebuildArchive` (`v1.7.2+`).
 pub async fn handle_rebuild_scope_state(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,

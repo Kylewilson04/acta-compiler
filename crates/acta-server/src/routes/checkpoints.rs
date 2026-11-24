@@ -425,10 +425,7 @@ pub async fn handle_revoke_witness(
                 .await
                 .map(|e| format!(" [logged at evidence seq_num={}]", e.seq_num))
                 .unwrap_or_default();
-            Err(ApiError {
-                status: StatusCode::NOT_FOUND,
-                message: format!("{msg}{suffix}"),
-            })
+            Err(ApiError::not_found(format!("{msg}{suffix}")))
         }
         WitnessRevocationOutcome::AlreadyRevokedConflict {
             revoked_by,
@@ -531,12 +528,9 @@ pub async fn handle_get_checkpoint(
 
     let Some((sth, leaves)) = head_opt else {
         if query.tree_size.is_some() || query.since_size.is_some() {
-            return Err(ApiError {
-                status: StatusCode::NOT_FOUND,
-                message: format!(
-                    "tenant '{clean_tenant}' has an empty evidence ledger (tree_size=0)"
-                ),
-            });
+            return Err(ApiError::not_found(format!(
+                "tenant '{clean_tenant}' has an empty evidence ledger (tree_size=0)"
+            )));
         }
         return Ok(Json(CheckpointResponse {
             tenant_id: clean_tenant.to_string(),
@@ -767,12 +761,11 @@ pub async fn handle_anchor_checkpoint(
         Some(req.tree_size),
     )
     .await?
-    .ok_or_else(|| ApiError {
-        status: StatusCode::NOT_FOUND,
-        message: format!(
+    .ok_or_else(|| {
+        ApiError::not_found(format!(
             "no checkpoint exists at tree_size={} for tenant '{}'",
             req.tree_size, req.tenant_id
-        ),
+        ))
     })?;
 
     if sth.checkpoint_hash != checkpoint_hash {

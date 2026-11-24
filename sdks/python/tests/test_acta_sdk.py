@@ -1,4 +1,4 @@
-"""Comprehensive cryptographic, RFC 6962 Merkle & live-mock HTTP test suite for `acta_sdk` v1.7.1."""
+"""Comprehensive cryptographic, RFC 6962 Merkle & live-mock HTTP test suite for `acta_sdk` v1.7.2."""
 
 from __future__ import annotations
 
@@ -625,7 +625,7 @@ class _MockActaHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "acta-compiler",
-                    "version": "1.7.1",
+                    "version": "1.7.2",
                     "host_public_key": self.pk_hex,
                     "permission_root": "26" * 32,
                 },
@@ -996,7 +996,7 @@ class TestActaGitMcpBridge(unittest.TestCase):
                     ]
                     self.assertEqual(len(lines), 4)
                     self.assertEqual(
-                        lines[0]["result"]["serverInfo"]["version"], "1.7.1"
+                        lines[0]["result"]["serverInfo"]["version"], "1.7.2"
                     )
                     self.assertEqual(
                         lines[1]["result"]["structuredContent"]["tenant_id"], "sandbox-ardyn"
@@ -1351,6 +1351,14 @@ class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
         wsig2, wpk = sign_witness_anchor(wit_seed, tenant, 2, cp2_hash)
         cons_2_to_3 = [h.hex() for h in compute_merkle_consistency_proof(leaves_all, 2, 3)]
 
+        from acta_sdk import (
+            compute_rebuild_archive_header_hash,
+            sign_rebuild_archive_header,
+        )
+        hdr_hash = compute_rebuild_archive_header_hash(
+            STATE_REBUILD_ARCHIVE_SCHEMA_V1, tenant, scope, 3, ts, perm_root
+        ).hex()
+        hdr_sig = sign_rebuild_archive_header(host_seed, tenant, hdr_hash).hex()
         rebuild_archive = {
             "schema_version": STATE_REBUILD_ARCHIVE_SCHEMA_V1,
             "tenant_id": tenant,
@@ -1359,6 +1367,8 @@ class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
             "evaluated_at": ts,
             "host_public_key": host_pk_hex,
             "permission_root": perm_root,
+            "header_hash": hdr_hash,
+            "host_header_signature": hdr_sig,
             "override_attestations": [],
             "evidence_chain": [entry1, entry2, entry3],
             "checkpoint": {
@@ -1416,3 +1426,313 @@ class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
         tampered["evidence_chain"][1]["write_summary"]["record_snapshot"]["object_val"] = 999
         with self.assertRaises(ValueError):
             verify_and_rebuild_scope_state_offline(tampered, host_pk_hex)
+
+
+
+class TestV172SpecFidelityCorroborationAndSignedRebuildHeader(unittest.TestCase):
+    def test_v172_empty_sub_commitment_corroboration_witness_v3_and_tampered_evaluated_at(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from acta_sdk import (
+            SCHEMA_VERSION,
+            STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+            compute_answer_cache_client_intent_hash,
+            compute_answer_cache_summary_commitment,
+            compute_answer_text_hash,
+            compute_bundle_hash,
+            compute_claim_content_hash,
+            compute_evidence_event_hash,
+            compute_logical_claim_group_key,
+            compute_omission_list_hash,
+            compute_query_text_hash,
+            compute_rebuild_archive_header_hash,
+            compute_refusal_metadata_commitment,
+            compute_sub_commitment,
+            compute_witness_registration_v3_commitment,
+            recompute_winning_bucket_corroboration,
+            sign_client_content_hash,
+            sign_evidence_entry,
+            sign_rebuild_archive_header,
+            verify_and_rebuild_scope_state_offline,
+            verify_evidence_entry,
+            verify_export_archive,
+        )
+
+        # Must-Fix 1: SPEC.md §2.5 empty compute_sub_commitment == BLAKE3(b"")
+        self.assertEqual(
+            compute_sub_commitment([]).hex(),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        )
+
+        host_seed = "66" * 32
+        host_sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(host_seed))
+        host_pk_hex = host_sk.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        ).hex()
+        author_seed = "77" * 32
+        tenant = "kylewilson04"
+        scope = "acta-test/v172-py"
+        ts = "2026-11-24T20:00:00.000000Z"
+        perm_root = "3ff40da50dd7f2aa32ce30409426f6d485bcf376caa4ff862f3aeb071410772a"
+
+        # Must-Fix 2: Corroborating claims in bundle proof (0.60 + 0.60 -> 0.72)
+        gkey = compute_logical_claim_group_key(tenant, "supplier:titan", "lead_days", scope).hex()
+        c1 = {
+            "id": "12b0b821-0000-4000-8000-000000000001",
+            "tenant_id": tenant,
+            "claim_group_key": gkey,
+            "scope": scope,
+            "subject": "supplier:titan",
+            "predicate": "lead_days",
+            "object_val": 14,
+            "object_type": "int",
+            "confidence": 0.60,
+            "source_provenance_class": 2,
+            "source_descriptor": "erp-feed-a",
+            "source_commitment": "aa" * 32,
+            "status": "active",
+            "contradiction_ids": [],
+            "valid_from": None,
+            "valid_to": "2026-12-31T00:00:00.000000Z",
+            "version": 1,
+            "predecessor_id": None,
+            "created_at": ts,
+        }
+        c1["content_hash"] = compute_claim_content_hash(c1).hex()
+        c2 = dict(c1)
+        c2["id"] = "c87ad711-0000-4000-8000-000000000002"
+        c2["source_descriptor"] = "carrier-bol-b"
+        c2["source_commitment"] = "bb" * 32
+        c2["content_hash"] = compute_claim_content_hash(c2).hex()
+
+        cnt, srcs, eff = recompute_winning_bucket_corroboration([c1, c2], 0.5)
+        self.assertEqual(cnt, 2)
+        self.assertEqual(srcs, ["erp-feed-a", "carrier-bol-b"])
+        self.assertAlmostEqual(eff, 0.72, places=9)
+
+        bundle = {
+            "schema_version": SCHEMA_VERSION,
+            "tenant_id": tenant,
+            "task_id": "task-b3",
+            "scope": scope,
+            "policy_result": "allow",
+            "embedding_model_version": "text-embedding-3-small-1536",
+            "resolver_manifest": {
+                "min_confidence": 0.70,
+                "decisiveness_threshold": 0.15,
+                "corroboration_damping": 0.50,
+                "non_default_thresholds": False,
+                "budget": {"kind": "tokens", "limit": 2048},
+                "permission_root": perm_root,
+            },
+            "selected_objects": [],
+            "resolution_records": [
+                {
+                    "claim_group_key": gkey,
+                    "winning_claim": {
+                        "id": c1["id"],
+                        "subject": "supplier:titan",
+                        "predicate": "lead_days",
+                        "object_val": 14,
+                        "object_type": "int",
+                        "confidence": 0.60,
+                        "effective_confidence": 0.72,
+                        "corroborating_count": 2,
+                        "corroborating_sources": ["erp-feed-a", "carrier-bol-b"],
+                        "source_provenance_class": 2,
+                        "source_descriptor": "erp-feed-a",
+                        "source_commitment": "aa" * 32,
+                        "content_hash": c1["content_hash"],
+                        "version": 1,
+                        "created_at": ts,
+                    },
+                    "margin": None,
+                    "suppressed_claim_ids": [c2["id"]],
+                }
+            ],
+            "dispute_records": [],
+            "omission_record": {
+                "inline_items": [],
+                "total_omitted_count": 0,
+                "full_excluded_hash": compute_omission_list_hash([]).hex(),
+                "has_unresolved_claims": False,
+            },
+            "resolved_facts_omitted": 0,
+            "state_commitment": "cc" * 32,
+            "dependency_commitment": "dd" * 32,
+            "issued_at": ts,
+        }
+        b_hash, _ = compute_bundle_hash(bundle)
+        ev_b_hash = compute_evidence_event_hash(
+            tenant, 1, "00" * 32, b_hash, "cc" * 32, "allow", ts
+        ).hex()
+        ev_b = {
+            "tenant_id": tenant,
+            "seq_num": 1,
+            "event_domain": "acta:evidence_event:v1",
+            "prev_hash": "00" * 32,
+            "event_hash": ev_b_hash,
+            "bundle_hash": b_hash.hex(),
+            "state_commitment": "cc" * 32,
+            "policy_result": "allow",
+            "host_signature": sign_evidence_entry(host_seed, tenant, 1, "00" * 32, ev_b_hash).hex(),
+            "created_at": ts,
+        }
+        full_archive = {
+            "bundle_hash": b_hash.hex(),
+            "bundle": bundle,
+            "objects": [],
+            "claims": [c1, c2],
+            "override_attestations": [],
+            "evidence_chain": [ev_b],
+            "host_public_key": host_pk_hex,
+        }
+        vsum = verify_export_archive(full_archive, host_pk_hex)
+        self.assertEqual(vsum.verified_claims, 2)
+        self.assertEqual(vsum.verified_corroborated_resolutions, 1)
+
+        # Stripping corroborating claim c2 from archive.claims MUST fail verification!
+        stripped_corrob = json.loads(json.dumps(full_archive))
+        stripped_corrob["claims"] = [c1]
+        with self.assertRaisesRegex(ValueError, "corroborating_count=2"):
+            verify_export_archive(stripped_corrob, host_pk_hex)
+
+        # Must-Fix 3: Preserved ed25519_client_sig on invalidation receipt + invalidated_by
+        q_hash = compute_query_text_hash("lead_days?").hex()
+        ans_hash = compute_answer_text_hash("14 days").hex()
+        intent_ans = compute_answer_cache_client_intent_hash(
+            tenant, scope, "task-b3", q_hash, b_hash.hex(), "cc" * 32, ans_hash
+        )
+        csig_hex, cpk_hex = sign_client_content_hash(author_seed, intent_ans)
+        acs_inv_v172 = {
+            "cache_domain": "acta:answer_cache:v1",
+            "event_kind": "invalidated",
+            "cache_id": "afb18d4e-0000-4000-8000-000000000003",
+            "scope": scope,
+            "task_id": "task-b3",
+            "query_hash": q_hash,
+            "source_bundle_hash": b_hash.hex(),
+            "state_commitment": "cc" * 32,
+            "validity_mode": "dependency_subset",
+            "task_dependency_commitment": "dd" * 32,
+            "answer_hash": ans_hash,
+            "cached_by": f"{tenant}::ed25519:{cpk_hex[:16]}",
+            "cacher_auth_kind": "ed25519_client_sig",
+            "client_public_key": cpk_hex,
+            "client_signature": csig_hex,
+            "invalidation_reason": "stale_dependency_commitment",
+            "invalidated_by": f"{tenant}::oauth:{tenant}",
+            "invalidator_auth_kind": "oauth_github_principal",
+            "observed_state_commitment": "ee" * 32,
+            "observed_dependency_commitment": "ff" * 32,
+        }
+        acs_comm2 = compute_answer_cache_summary_commitment(acs_inv_v172).hex()
+        ev2_hash = compute_evidence_event_hash(
+            tenant, 2, ev_b_hash, None, acs_comm2, "allow", ts, answer_cache_summary=acs_inv_v172
+        ).hex()
+        ev2 = {
+            "tenant_id": tenant,
+            "seq_num": 2,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev_b_hash,
+            "event_hash": ev2_hash,
+            "bundle_hash": None,
+            "state_commitment": acs_comm2,
+            "policy_result": "allow",
+            "answer_cache_summary": acs_inv_v172,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 2, ev_b_hash, ev2_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev2, host_pk_hex)
+
+        # Should-Fix 1 & 2: RefusalMetadata with signing_domain & expected_intent_digest_hex
+        rmeta_sig = {
+            "operation": "ingest_object",
+            "reason_code": "invalid_object_client_signature",
+            "target_scope": scope,
+            "summary": "Client Ed25519 signature verification failed",
+            "signing_domain": "acta:object_client_sig:v1",
+            "expected_intent_digest_hex": "ab" * 32,
+        }
+        rcomm_sig = compute_refusal_metadata_commitment(rmeta_sig).hex()
+        ev3_hash = compute_evidence_event_hash(
+            tenant, 3, ev2_hash, None, rcomm_sig, "block", ts, refusal_metadata=rmeta_sig
+        ).hex()
+        ev3 = {
+            "tenant_id": tenant,
+            "seq_num": 3,
+            "event_domain": "acta:evidence_event:v2",
+            "prev_hash": ev2_hash,
+            "event_hash": ev3_hash,
+            "bundle_hash": None,
+            "state_commitment": rcomm_sig,
+            "policy_result": "block",
+            "refusal_metadata": rmeta_sig,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 3, ev2_hash, ev3_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev3, host_pk_hex)
+
+        # Should-Fix 6: Witness registration in 12-part event v3
+        wpre, wcomm = compute_witness_registration_v3_commitment(
+            tenant, "wit-v172", cpk_hex, f"{tenant}::oauth:{tenant}", "v1.7.2 witness"
+        )
+        wreg_sum = {
+            "witness_id": "wit-v172",
+            "public_key": cpk_hex,
+            "registered_by": f"{tenant}::oauth:{tenant}",
+            "description": "v1.7.2 witness",
+            "registration_domain": "acta:witness_reg:v3",
+            "registration_blake3_preimage_hex": wpre.hex(),
+        }
+        ev4_hash = compute_evidence_event_hash(
+            tenant,
+            4,
+            ev3_hash,
+            None,
+            wcomm.hex(),
+            "allow",
+            ts,
+            witness_reg_summary=wreg_sum,
+            witness_in_v3=True,
+        ).hex()
+        ev4 = {
+            "tenant_id": tenant,
+            "seq_num": 4,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev3_hash,
+            "event_hash": ev4_hash,
+            "bundle_hash": None,
+            "state_commitment": wcomm.hex(),
+            "policy_result": "allow",
+            "witness_reg_summary": wreg_sum,
+            "host_signature": sign_evidence_entry(host_seed, tenant, 4, ev3_hash, ev4_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev4, host_pk_hex)
+
+        # Should-Fix 4 & Probe 5: Swapping evaluated_at past valid_to fails signed rebuild header!
+        hdr4 = compute_rebuild_archive_header_hash(
+            STATE_REBUILD_ARCHIVE_SCHEMA_V1, tenant, scope, 4, ts, perm_root
+        ).hex()
+        reb4 = {
+            "schema_version": STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+            "tenant_id": tenant,
+            "scope": scope,
+            "up_to_seq": 4,
+            "evaluated_at": ts,
+            "host_public_key": host_pk_hex,
+            "permission_root": perm_root,
+            "header_hash": hdr4,
+            "host_header_signature": sign_rebuild_archive_header(host_seed, tenant, hdr4).hex(),
+            "override_attestations": [],
+            "evidence_chain": [ev_b, ev2, ev3, ev4],
+        }
+        ok_reb = verify_and_rebuild_scope_state_offline(reb4, host_pk_hex)
+        self.assertTrue(ok_reb.header_signature_verified)
+        self.assertEqual(ok_reb.header_hash_hex, hdr4)
+
+        swapped_clock = json.loads(json.dumps(reb4))
+        swapped_clock["evaluated_at"] = "2027-06-01T00:00:00.000000Z"
+        with self.assertRaisesRegex(ValueError, "tampered StateRebuildArchive header"):
+            verify_and_rebuild_scope_state_offline(swapped_clock, host_pk_hex)

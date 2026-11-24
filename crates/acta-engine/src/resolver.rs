@@ -308,7 +308,7 @@ pub fn resolve_claims_with_overrides(
     now: DateTime<Utc>,
     config: &ResolverConfig,
 ) -> ResolverOutput {
-    resolve_claims_with_overrides_v171_compat(claims, overrides, now, config, false, false)
+    resolve_claims_with_overrides_v172_compat(claims, overrides, now, config, false, false, false)
 }
 
 /// Same as `resolve_claims_with_overrides`, with `legacy_pre_v166_disputes` compatibility mode.
@@ -319,20 +319,18 @@ pub fn resolve_claims_with_overrides_compat(
     config: &ResolverConfig,
     legacy_pre_v166_disputes: bool,
 ) -> ResolverOutput {
-    resolve_claims_with_overrides_v171_compat(
+    resolve_claims_with_overrides_v172_compat(
         claims,
         overrides,
         now,
         config,
         legacy_pre_v166_disputes,
         false,
+        false,
     )
 }
 
-/// Full resolver entry point supporting historical `source_bundle_hash` replay compatibility:
-/// - `legacy_pre_v166_disputes`: omits `DisputeRecord.margin` and encodes reopened overrides as `INSUFFICIENT_MARGIN`.
-/// - `legacy_pre_v171_resolver`: reproduces pre-`v1.7.1` pre-bucket `min_confidence` filtering and
-///   `LifecycleExpired` on `status == Revoked` tombstones for historical bundles (`seq 1..head`).
+/// Backwards-compatible resolver entry point for `v1.7.1` callers.
 pub fn resolve_claims_with_overrides_v171_compat(
     claims: Vec<KnowledgeClaim>,
     overrides: &[OverrideAttestation],
@@ -340,6 +338,33 @@ pub fn resolve_claims_with_overrides_v171_compat(
     config: &ResolverConfig,
     legacy_pre_v166_disputes: bool,
     legacy_pre_v171_resolver: bool,
+) -> ResolverOutput {
+    resolve_claims_with_overrides_v172_compat(
+        claims,
+        overrides,
+        now,
+        config,
+        legacy_pre_v166_disputes,
+        legacy_pre_v171_resolver,
+        legacy_pre_v171_resolver,
+    )
+}
+
+/// Full resolver entry point supporting historical `source_bundle_hash` replay compatibility (`v1.7.2+`):
+/// - `legacy_pre_v166_disputes`: omits `DisputeRecord.margin` and encodes reopened overrides as `INSUFFICIENT_MARGIN`.
+/// - `legacy_pre_v171_resolver`: reproduces pre-`v1.7.1` pre-bucket `min_confidence` filtering and
+///   `LifecycleExpired` on `status == Revoked` tombstones for historical bundles (`seq 1..163`).
+/// - `legacy_v171_bidirectional_contradiction`: reproduces `v1.7.1` bidirectional contradiction marking
+///   (e.g., `B2` at `seq 171`), whereas `v1.7.2+` (`false`) marks only `*target_id` so cross-group
+///   challenger claims resolve cleanly as `[FACT]` instead of disputing themselves.
+pub fn resolve_claims_with_overrides_v172_compat(
+    claims: Vec<KnowledgeClaim>,
+    overrides: &[OverrideAttestation],
+    now: DateTime<Utc>,
+    config: &ResolverConfig,
+    legacy_pre_v166_disputes: bool,
+    legacy_pre_v171_resolver: bool,
+    legacy_v171_bidirectional_contradiction: bool,
 ) -> ResolverOutput {
     let mut active_claims = Vec::with_capacity(claims.len());
     let mut excluded_claims = Vec::new();
@@ -385,7 +410,9 @@ pub fn resolve_claims_with_overrides_v171_compat(
     for c in &active_claims {
         for target_id in &c.contradiction_ids {
             if active_id_set.contains(target_id) {
-                contradicted_active_ids.insert(c.id);
+                if legacy_v171_bidirectional_contradiction || legacy_pre_v171_resolver {
+                    contradicted_active_ids.insert(c.id);
+                }
                 contradicted_active_ids.insert(*target_id);
             }
         }
@@ -726,7 +753,13 @@ mod tests {
         contradictions: Vec<Uuid>,
     ) -> KnowledgeClaim {
         let ts = Utc.with_ymd_and_hms(2026, 11, 19, 12, 0, 0).unwrap();
-        let obj_type = if val.is_number() { "integer" } else { "string" };
+        let obj_type = if val.is_number() {
+            "integer"
+        } else if val.is_boolean() {
+            "boolean"
+        } else {
+            "string"
+        };
         let group_key = compute_logical_claim_group_key("tenant-1", subject, "status", "ops");
         let mut id_bytes = [0u8; 16];
         id_bytes[15] = id_byte;
@@ -1107,5 +1140,68 @@ mod tests {
             out_legacy.excluded_claims,
             vec![(tombstone.id, OmissionReason::LifecycleExpired)]
         );
+    }
+
+    #[test]
+    fn test_v172_cross_group_contradiction_resolves_challenger_and_blocks_target_while_legacy_v171_reproduces_b2() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 24, 18, 0, 0).unwrap();
+        let cfg = ResolverConfig::default();
+
+        let mut a1 = make_claim(51, "supplier:titan", json!(14), 0.60, 2, ClaimStatus::Active, vec![]);
+        a1.predicate = "lead_days".to_string();
+        a1.claim_group_key =
+            compute_logical_claim_group_key("tenant-1", "supplier:titan", "lead_days", "ops");
+        a1.content_hash = compute_claim_content_hash(&a1).unwrap();
+
+        let mut a2 = make_claim(52, "supplier:titan", json!(14), 0.60, 2, ClaimStatus::Active, vec![]);
+        a2.predicate = "lead_days".to_string();
+        a2.claim_group_key =
+            compute_logical_claim_group_key("tenant-1", "supplier:titan", "lead_days", "ops");
+        a2.content_hash = compute_claim_content_hash(&a2).unwrap();
+
+        let mut dock_strike = make_claim(
+            53,
+            "supplier:titan",
+            json!(true),
+            0.85,
+            3,
+            ClaimStatus::Active,
+            vec![a1.id],
+        );
+        dock_strike.predicate = "dock_strike".to_string();
+        dock_strike.claim_group_key =
+            compute_logical_claim_group_key("tenant-1", "supplier:titan", "dock_strike", "ops");
+        dock_strike.content_hash = compute_claim_content_hash(&dock_strike).unwrap();
+
+        // v1.7.2 default: dock_strike resolves as [FACT] while lead_days halts with BLOCKING_CONTRADICTION!
+        let out_v172 = resolve_claims(
+            vec![a1.clone(), a2.clone(), dock_strike.clone()],
+            now,
+            &cfg,
+        );
+        assert_eq!(out_v172.resolutions.len(), 1);
+        assert_eq!(out_v172.resolutions[0].winning_claim.id, dock_strike.id);
+        assert_eq!(out_v172.disputes.len(), 1);
+        assert_eq!(
+            out_v172.disputes[0].claim_group_key,
+            a1.claim_group_key
+        );
+        assert_eq!(
+            out_v172.disputes[0].reason_code,
+            DisputeReasonCode::BlockingContradiction
+        );
+
+        // legacy_v171_bidirectional_contradiction = true reproduces B2 (seq 171) where both groups disputed:
+        let out_v171 = resolve_claims_with_overrides_v172_compat(
+            vec![a1, a2, dock_strike],
+            &[],
+            now,
+            &cfg,
+            false,
+            false,
+            true,
+        );
+        assert!(out_v171.resolutions.is_empty());
+        assert_eq!(out_v171.disputes.len(), 2);
     }
 }

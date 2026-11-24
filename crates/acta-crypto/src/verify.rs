@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use acta_types::{
     ClaimStatus, EntryInclusionProof, EvidenceEntry, ExportArchive, KnowledgeClaim,
     LifecycleStatus, ObjectType, ResolverManifest, SignedTreeHead, StateRebuildArchive,
-    StoredObject, WriteLedgerSummary, WriteOperationKind, ANSWER_CACHE_DOMAIN_V1, SCHEMA_VERSION,
-    STATE_REBUILD_ARCHIVE_SCHEMA_V1, WRITE_EVENT_DOMAIN_V1,
+    StoredObject, WriteLedgerSummary, WriteOperationKind, ANSWER_CACHE_DOMAIN_V1,
+    DEFAULT_CORROBORATION_DAMPING, SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    WRITE_EVENT_DOMAIN_V1,
 };
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -16,24 +15,25 @@ use uuid::Uuid;
 use crate::{
     bundle_hash_preimage_bytes, checkpoint_hash_preimage_bytes, checkpoint_signing_preimage,
     checkpoint_signing_preimage_bytes, claim_content_preimage_bytes, claim_group_preimage_bytes,
-    compute_answer_cache_client_intent_hash, compute_answer_cache_summary_commitment,
-    compute_bundle_hash, compute_checkpoint_hash, compute_claim_client_intent_hash,
-    compute_claim_content_hash, compute_claim_group_key, compute_evidence_event_hash_full,
-    compute_logical_claim_group_key, compute_merkle_root_from_leaves,
-    compute_object_client_intent_hash, compute_object_content_hash,
-    compute_override_attestation_hash, compute_override_client_intent_hash,
+    claims_share_winning_value_bucket, compute_answer_cache_client_intent_hash,
+    compute_answer_cache_summary_commitment, compute_bundle_hash, compute_checkpoint_hash,
+    compute_claim_client_intent_hash, compute_claim_content_hash, compute_claim_group_key,
+    compute_evidence_event_hash_v172, compute_logical_claim_group_key,
+    compute_merkle_root_from_leaves, compute_object_client_intent_hash,
+    compute_object_content_hash, compute_override_attestation_hash,
+    compute_override_client_intent_hash, compute_rebuild_archive_header_hash,
     compute_refusal_metadata_commitment, compute_retract_claim_client_intent_hash,
     compute_state_commitment, compute_sub_commitment, compute_write_summary_commitment,
-    evidence_event_preimage_bytes_full,
-    evidence_signing_preimage, evidence_signing_preimage_bytes, legacy_blake3_merkle_empty_root,
-    merkle_empty_root, merkle_leaf_hash, merkle_leaf_preimage_bytes, object_content_preimage_bytes,
-    override_attestation_preimage_bytes, override_client_intent_preimage_bytes,
-    override_signing_preimage, override_signing_preimage_bytes, to_canonical_bytes,
+    evidence_event_preimage_bytes_v172, evidence_signing_preimage, evidence_signing_preimage_bytes,
+    legacy_blake3_merkle_empty_root, merkle_empty_root, merkle_leaf_hash,
+    merkle_leaf_preimage_bytes, object_content_preimage_bytes, override_attestation_preimage_bytes,
+    override_client_intent_preimage_bytes, override_signing_preimage,
+    override_signing_preimage_bytes, recompute_winning_bucket_corroboration, to_canonical_bytes,
     verify_checkpoint_signature, verify_client_content_signature, verify_evidence_signature,
     verify_merkle_consistency_proof, verify_merkle_inclusion_proof, verify_override_signature,
-    verify_witness_anchor_signature, witness_anchor_signing_preimage,
-    witness_anchor_signing_preimage_bytes, witness_registration_preimage_bytes,
-    witness_revocation_preimage_bytes, OverrideHashInput,
+    verify_rebuild_archive_header_signature, verify_witness_anchor_signature,
+    witness_anchor_signing_preimage, witness_anchor_signing_preimage_bytes,
+    witness_registration_preimage_bytes, witness_revocation_preimage_bytes, OverrideHashInput,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +43,8 @@ pub struct VerificationSummary {
     pub state_commitment_hex: String,
     pub verified_objects: usize,
     pub verified_claims: usize,
+    #[serde(default)]
+    pub verified_corroborated_resolutions: usize,
     #[serde(default)]
     pub verified_overrides: usize,
     #[serde(default)]
@@ -375,9 +377,11 @@ fn verify_single_evidence_entry(
         if entry.bundle_hash.is_some()
             || entry.write_summary.is_some()
             || entry.answer_cache_summary.is_some()
+            || entry.witness_reg_summary.is_some()
+            || entry.witness_revoke_summary.is_some()
         {
             return Err(format!(
-                "invalid evidence entry at seq_num={}: refusal_metadata cannot coexist with bundle_hash, write_summary, or answer_cache_summary",
+                "invalid evidence entry at seq_num={}: refusal_metadata cannot coexist with bundle_hash, write_summary, answer_cache_summary, or witness summaries",
                 entry.seq_num
             ));
         }
@@ -435,6 +439,8 @@ fn verify_single_evidence_entry(
         match acs.event_kind.as_deref() {
             None | Some("cached") => {
                 if acs.invalidation_reason.is_some()
+                    || acs.invalidated_by.is_some()
+                    || acs.invalidator_auth_kind.is_some()
                     || acs.observed_state_commitment.is_some()
                     || acs.observed_dependency_commitment.is_some()
                 {
@@ -459,6 +465,19 @@ fn verify_single_evidence_entry(
                     return Err(format!(
                         "{label} invalidation event requires observed_state_commitment"
                     ));
+                }
+                if let Some(ref inv_kind) = acs.invalidator_auth_kind {
+                    match inv_kind.trim() {
+                        "oauth_github_principal"
+                        | "ed25519_client_sig"
+                        | "tenant_session"
+                        | "master_admin" => {}
+                        other => {
+                            return Err(format!(
+                                "{label} unsupported invalidator_auth_kind '{other}'"
+                            ));
+                        }
+                    }
                 }
             }
             Some(other) => {
@@ -599,7 +618,8 @@ fn verify_single_evidence_entry(
         }
     }
 
-    let recomputed_event_hash = compute_evidence_event_hash_full(
+    let witness_in_v3 = entry.uses_witness_v3_event_domain();
+    let recomputed_event_hash = compute_evidence_event_hash_v172(
         &entry.tenant_id,
         entry.seq_num,
         &entry.prev_hash,
@@ -611,6 +631,9 @@ fn verify_single_evidence_entry(
         entry.override_summary.as_ref(),
         entry.write_summary.as_ref(),
         entry.answer_cache_summary.as_ref(),
+        entry.witness_reg_summary.as_ref(),
+        entry.witness_revoke_summary.as_ref(),
+        witness_in_v3,
     )
     .map_err(|e| format!("evidence event_hash computation failed at seq_num={}: {e}", entry.seq_num))?;
 
@@ -748,7 +771,8 @@ fn verify_entry_inclusion(
     Ok(counts)
 }
 
-/// Cryptographically verifies an `ExportArchive` against `expected_pubkey` without database access.
+/// Cryptographically verifies an `ExportArchive` against `expected_pubkey` without database access,
+/// including full winning-bucket corroborating claim proofs and damped noisy-OR `effective_confidence` re-derivation (`v1.7.2+`).
 pub fn verify_export_archive(
     archive: &ExportArchive,
     expected_pubkey: &[u8; 32],
@@ -766,7 +790,7 @@ pub fn verify_export_archive(
         return Err("rejected weak low-order Ed25519 public key".to_string());
     }
 
-    if let Some(ref rm) = archive.bundle.resolver_manifest {
+    let corroboration_damping = if let Some(ref rm) = archive.bundle.resolver_manifest {
         if !rm.min_confidence.is_finite()
             || !(0.0..=1.0).contains(&rm.min_confidence)
             || !rm.decisiveness_threshold.is_finite()
@@ -782,7 +806,10 @@ pub fn verify_export_archive(
                 rm.non_default_thresholds, rm.min_confidence, rm.decisiveness_threshold
             ));
         }
-    }
+        rm.corroboration_damping
+    } else {
+        DEFAULT_CORROBORATION_DAMPING
+    };
 
     if let Some(omitted_facts) = archive.bundle.resolved_facts_omitted {
         if omitted_facts > archive.bundle.omission_record.total_omitted_count {
@@ -951,6 +978,7 @@ pub fn verify_export_archive(
         }
     }
 
+    let mut verified_corroborated_resolutions = 0usize;
     for res in &archive.bundle.resolution_records {
         let c = &res.winning_claim;
         let stored = claims_by_id.get(&c.id).ok_or_else(|| {
@@ -988,6 +1016,54 @@ pub fn verify_export_archive(
                     c.id
                 ));
             }
+        } else if c.corroborating_count > 1 || c.effective_confidence.is_some() {
+            let expected_count = c.corroborating_count.max(2);
+            let mut bucket_claims: Vec<&KnowledgeClaim> = vec![stored];
+            for sid in &res.suppressed_claim_ids {
+                if *sid == c.id {
+                    continue;
+                }
+                if let Some(sup_stored) = claims_by_id.get(sid) {
+                    if !claim_matches_record_group(&res.claim_group_key, sup_stored) {
+                        return Err(format!(
+                            "corroborating claim[id={sid}] does not match resolution claim_group_key"
+                        ));
+                    }
+                    if claims_share_winning_value_bucket(c, sup_stored) {
+                        bucket_claims.push(sup_stored);
+                    }
+                }
+            }
+            if bucket_claims.len() != expected_count {
+                return Err(format!(
+                    "resolution_record for claim[id={}] declares corroborating_count={expected_count}, but archive.claims contains {} winning-bucket claim(s); all corroborating claims must be proven in archive.claims",
+                    c.id,
+                    bucket_claims.len()
+                ));
+            }
+            let (recomputed_cnt, recomputed_sources, recomputed_eff) =
+                recompute_winning_bucket_corroboration(&bucket_claims, corroboration_damping)?;
+            if recomputed_cnt != expected_count {
+                return Err(format!(
+                    "corroborating_count mismatch on claim[id={}]: recomputed {recomputed_cnt} != {expected_count}",
+                    c.id
+                ));
+            }
+            if !c.corroborating_sources.is_empty() && recomputed_sources != c.corroborating_sources {
+                return Err(format!(
+                    "corroborating_sources mismatch on claim[id={}]: recomputed {:?} != {:?}",
+                    c.id, recomputed_sources, c.corroborating_sources
+                ));
+            }
+            if let Some(claimed_eff) = c.effective_confidence {
+                if (claimed_eff - recomputed_eff).abs() > 1e-9 {
+                    return Err(format!(
+                        "tampered effective_confidence on claim[id={}]: recomputed {recomputed_eff:.9} != bundle {claimed_eff:.9}",
+                        c.id
+                    ));
+                }
+            }
+            verified_corroborated_resolutions += 1;
         }
     }
 
@@ -1313,6 +1389,7 @@ pub fn verify_export_archive(
         state_commitment_hex: hex::encode(archive.bundle.state_commitment),
         verified_objects: objects_by_id.len(),
         verified_claims: claims_by_id.len(),
+        verified_corroborated_resolutions,
         verified_overrides: overrides_by_id.len(),
         verified_writes,
         verified_answer_caches,
@@ -1535,7 +1612,7 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
 
     let mut evidence_dump = Vec::with_capacity(entries_source.len());
     for entry in entries_source {
-        let (event_domain, ev_preimage) = evidence_event_preimage_bytes_full(
+        let (event_domain, ev_preimage) = evidence_event_preimage_bytes_v172(
             &entry.tenant_id,
             entry.seq_num,
             &entry.prev_hash,
@@ -1547,6 +1624,9 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
             entry.override_summary.as_ref(),
             entry.write_summary.as_ref(),
             entry.answer_cache_summary.as_ref(),
+            entry.witness_reg_summary.as_ref(),
+            entry.witness_revoke_summary.as_ref(),
+            entry.uses_witness_v3_event_domain(),
         )
         .map_err(|e| format!("evidence preimage error at seq {}: {e}", entry.seq_num))?;
 
@@ -1584,6 +1664,16 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
             .as_ref()
             .and_then(|m| to_canonical_bytes(m).ok())
             .and_then(|b| String::from_utf8(b).ok());
+        let witness_reg_jcs = entry
+            .witness_reg_summary
+            .as_ref()
+            .and_then(|m| to_canonical_bytes(m).ok())
+            .and_then(|b| String::from_utf8(b).ok());
+        let witness_revoke_jcs = entry
+            .witness_revoke_summary
+            .as_ref()
+            .and_then(|m| to_canonical_bytes(m).ok())
+            .and_then(|b| String::from_utf8(b).ok());
         evidence_dump.push(json!({
             "seq_num": entry.seq_num,
             "event_domain": event_domain,
@@ -1599,6 +1689,8 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
             "override_summary_canonical_jcs": override_jcs,
             "write_summary_canonical_jcs": write_jcs,
             "answer_cache_summary_canonical_jcs": answer_cache_jcs,
+            "witness_reg_summary_canonical_jcs": witness_reg_jcs,
+            "witness_revoke_summary_canonical_jcs": witness_revoke_jcs,
             "witness_registration": entry.witness_reg_summary,
             "witness_revocation": entry.witness_revoke_summary,
         }));
@@ -1657,6 +1749,8 @@ pub struct OfflineStateRebuildSummary {
     pub scope: String,
     pub verified_up_to_seq: i64,
     pub evaluated_at: chrono::DateTime<chrono::Utc>,
+    pub header_hash_hex: String,
+    pub header_signature_verified: bool,
     pub verified_evidence_entries: usize,
     pub write_events_replayed: usize,
     pub reconstructed_active_intents: usize,
@@ -1677,12 +1771,13 @@ pub struct OfflineStateRebuildSummary {
     pub verified_witness_anchors: usize,
 }
 
-/// Standalone offline verifier & state reconstructor (`v1.7.1+`, PPA 1 Claim 1 & §11):
+/// Standalone offline verifier & state reconstructor (`v1.7.2+`, PPA 1 Claim 1 & §11):
 /// Verifies `StateRebuildArchive` against `expected_pubkey` with zero database or server trust,
-/// checking every `prev_hash` link, `v1`/`v2`/`v3` `event_hash`, host & client Ed25519 signature,
-/// RFC 6962 `SignedTreeHead` Merkle root, witness cosignature consistency proof, and strip-proof
-/// `override_attestations` bijective match against `evidence_chain`, then reconstructs active
-/// `(intents, memories, claims, overrides)` and `state_commitment` at `archive.evaluated_at`.
+/// checking the host-signed archive header (`b"acta:rebuild_header:v1"` -> `b"acta:rebuild_sig:v1"`
+/// binding `scope`, `up_to_seq`, `evaluated_at`, and `permission_root`), every `prev_hash` link,
+/// `v1`/`v2`/`v3` `event_hash`, host & client Ed25519 signature, RFC 6962 `SignedTreeHead` Merkle root,
+/// witness cosignature consistency proof, and strip-proof `override_attestations`, then reconstructs
+/// active `(intents, memories, claims, overrides)` and `state_commitment` at `archive.evaluated_at`.
 pub fn verify_and_rebuild_scope_state_offline(
     archive: &StateRebuildArchive,
     expected_pubkey: &[u8; 32],
@@ -1707,17 +1802,42 @@ pub fn verify_and_rebuild_scope_state_offline(
         return Err("rejected weak low-order Ed25519 public key".to_string());
     }
 
+    if archive.up_to_seq < 0 {
+        return Err(format!("invalid up_to_seq={}: must be >= 0", archive.up_to_seq));
+    }
+
+    let recomputed_header_hash = compute_rebuild_archive_header_hash(
+        &archive.schema_version,
+        &archive.tenant_id,
+        &archive.scope,
+        archive.up_to_seq,
+        archive.evaluated_at.timestamp_micros(),
+        &archive.permission_root,
+    );
+    if recomputed_header_hash != archive.header_hash {
+        return Err(format!(
+            "tampered StateRebuildArchive header (scope / up_to_seq / evaluated_at / permission_root): recomputed header_hash {} != stored {}",
+            hex::encode(recomputed_header_hash),
+            hex::encode(archive.header_hash)
+        ));
+    }
+    if !verify_rebuild_archive_header_signature(
+        &verifying_key,
+        &archive.tenant_id,
+        &recomputed_header_hash,
+        &archive.host_header_signature,
+    ) {
+        return Err(
+            "Ed25519 host_header_signature verification failed on StateRebuildArchive header"
+                .to_string(),
+        );
+    }
+
     let target_scope = scope_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(archive.scope.as_str());
-    if target_scope != archive.scope && !archive.override_attestations.is_empty() {
-        // When overriding target_scope on a multi-scope chain export, filter override_attestations by target_scope.
-    }
 
-    if archive.up_to_seq < 0 {
-        return Err(format!("invalid up_to_seq={}: must be >= 0", archive.up_to_seq));
-    }
     if (archive.evidence_chain.len() as i64) != archive.up_to_seq {
         return Err(format!(
             "evidence_chain length ({}) != archive.up_to_seq ({})",
@@ -2053,6 +2173,8 @@ pub fn verify_and_rebuild_scope_state_offline(
         scope: target_scope.to_string(),
         verified_up_to_seq: archive.up_to_seq,
         evaluated_at: eval_ts,
+        header_hash_hex: hex::encode(recomputed_header_hash),
+        header_signature_verified: true,
         verified_evidence_entries: archive.evidence_chain.len(),
         write_events_replayed,
         reconstructed_active_intents: intent_hashes.len(),

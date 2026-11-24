@@ -470,9 +470,84 @@ class ActaGitMcpBridge:
                 },
             },
             {
+                "name": "acta_retract_claim",
+                "description": f"Retracts an active structured claim by appending a revoked tombstone on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["claim_id", "reason"],
+                    "properties": {
+                        "scope": {"type": "string"},
+                        "claim_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "client_signature_hex": {"type": "string"},
+                        "client_public_key_hex": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "acta_cache_answer",
+                "description": f"Caches a verified answer bound to a compiled ContextBundle and dependency commitment on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["source_bundle_hash", "answer_text"],
+                    "properties": {
+                        "scope": {"type": "string", "default": s},
+                        "task_id": {"type": "string"},
+                        "query_text": {"type": "string", "default": ""},
+                        "source_bundle_hash": {"type": "string"},
+                        "answer_text": {"type": "string"},
+                        "ttl_seconds": {"type": "integer"},
+                        "validity_mode": {"type": "string", "enum": ["dependency_subset", "scope_root"]},
+                        "dependency_ids": {"type": "array", "items": {"type": "string"}},
+                        "client_signature_hex": {"type": "string"},
+                        "client_public_key_hex": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "acta_lookup_cached_answer",
+                "description": f"Looks up a state-conditioned cached answer on Git tenant '{t}' and returns inline invalidation_evidence on stale misses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "default": s},
+                        "task_id": {"type": "string", "default": "mcp-task"},
+                        "query_text": {"type": "string", "default": ""},
+                        "actor_id": {"type": "string", "default": "mcp-agent"},
+                    },
+                },
+            },
+            {
+                "name": "acta_trace_claim_impact",
+                "description": f"Traces reverse decision recall across compiled ContextBundles and cached answers (with invalidation_reason) on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["item_id"],
+                    "properties": {"item_id": {"type": "string"}},
+                },
+            },
+            {
+                "name": "acta_verify_state_rebuild",
+                "description": f"Rebuilds scope state from evidence_history and optionally returns a host-header-signed StateRebuildArchive on Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "default": s},
+                        "up_to_seq": {"type": "integer"},
+                        "include_proof_archive": {"type": "boolean", "default": False},
+                    },
+                },
+            },
+            {
                 "name": "acta_list_evidence",
-                "description": f"Lists Ed25519-verified evidence ledger entries (including readable refusal_metadata and override_summary) for Git tenant '{t}'.",
-                "inputSchema": {"type": "object", "properties": {}},
+                "description": f"Lists Ed25519-verified evidence ledger entries for Git tenant '{t}'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "from_seq": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                },
             },
         ]
 
@@ -644,6 +719,7 @@ class ActaGitMcpBridge:
                 "state_commitment_hex": summary.state_commitment_hex,
                 "verified_objects": summary.verified_objects,
                 "verified_claims": summary.verified_claims,
+                "verified_corroborated_resolutions": summary.verified_corroborated_resolutions,
                 "verified_overrides": summary.verified_overrides,
                 "verified_writes": summary.verified_writes,
                 "verified_answer_caches": summary.verified_answer_caches,
@@ -663,6 +739,7 @@ class ActaGitMcpBridge:
             return self.client.retract_claim(
                 claim_id=str(args["claim_id"]),
                 reason=str(args["reason"]),
+                scope=str(args["scope"]) if args.get("scope") is not None else None,
                 client_signature_hex=(
                     str(args["client_signature_hex"])
                     if args.get("client_signature_hex") is not None
@@ -742,10 +819,10 @@ class ActaGitMcpBridge:
                 "id": req_id,
                 "result": {
                     "protocolVersion": client_proto,
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {
                         "name": "acta-mcp-git-bridge",
-                        "version": "1.7.1",
+                        "version": "1.7.2",
                     },
                 },
             }

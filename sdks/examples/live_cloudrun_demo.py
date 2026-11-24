@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live end-to-end verification of `acta-sdk` v1.7.1 (Python) against Cloud Run."""
+"""Live end-to-end verification of `acta-sdk` v1.7.2 (Python) against Cloud Run."""
 
 from __future__ import annotations
 

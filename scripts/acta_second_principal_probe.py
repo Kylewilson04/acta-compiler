@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acta v1.7.1 Second-Principal Cross-Tenant Zero-Oracle Verification Probe.
+"""Acta v1.7.2 Second-Principal Cross-Tenant Zero-Oracle Verification Probe.
 
 Verifies cross-tenant isolation across two distinct authenticated principals (`Principal A` vs `Principal B`):
   1. Explicit `tenant_id: <Principal A>` passed by `Principal B` across all 11 target MCP tools
@@ -241,7 +241,7 @@ def run_probe(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Acta v1.7.1 Second-Principal Zero-Oracle Probe")
+    p = argparse.ArgumentParser(description="Acta v1.7.2 Second-Principal Zero-Oracle Probe")
     p.add_argument("--url", default=os.environ.get("ACTA_BASE_URL", "https://acta-server-998422936041.us-west1.run.app"))
     p.add_argument("--victim-tenant", default="kylewilson04")
     p.add_argument("--victim-bundle-hash", required=True)

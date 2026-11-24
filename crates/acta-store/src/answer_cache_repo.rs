@@ -24,7 +24,6 @@ use crate::{
     objects_repo, overrides_repo,
 };
 
-
 pub struct NewCachedAnswerInput<'a> {
     pub id: Uuid,
     pub tenant_id: &'a str,
@@ -56,6 +55,8 @@ pub struct StoredCachedAnswer {
     pub answer_hash_bytes: [u8; 32],
     pub cache_commitment_bytes: [u8; 32],
     pub host_signature_bytes: [u8; 64],
+    pub client_public_key_bytes: Option<[u8; 32]>,
+    pub client_signature: Option<Vec<u8>>,
     pub answer_text: String,
     pub answer_metadata: Option<Value>,
 }
@@ -78,6 +79,7 @@ struct CachedAnswerRow {
     cached_by: String,
     cacher_auth_kind: String,
     client_public_key: Option<Vec<u8>>,
+    client_signature: Option<Vec<u8>>,
     cache_domain: String,
     cache_commitment: Vec<u8>,
     evidence_seq_num: i64,
@@ -126,15 +128,16 @@ impl CachedAnswerRow {
         let hsig: [u8; 64] = self.host_signature.try_into().map_err(|_| {
             ActaError::Storage("cached_answers.host_signature not 64 bytes".to_string())
         })?;
-        let cpk_hex = match self.client_public_key {
+        let cpk_arr = match self.client_public_key {
             Some(raw) => {
                 let arr: [u8; 32] = raw.try_into().map_err(|_| {
                     ActaError::Storage("cached_answers.client_public_key not 32 bytes".to_string())
                 })?;
-                Some(hex::encode(arr))
+                Some(arr)
             }
             None => None,
         };
+        let csig_hex = self.client_signature.as_ref().map(hex::encode);
 
         Ok(StoredCachedAnswer {
             receipt: CachedAnswerReceipt {
@@ -154,7 +157,8 @@ impl CachedAnswerRow {
                 host_signature: hex::encode(hsig),
                 cached_by: self.cached_by,
                 cacher_auth_kind: self.cacher_auth_kind,
-                client_public_key_hex: cpk_hex,
+                client_public_key_hex: cpk_arr.map(hex::encode),
+                client_signature_hex: csig_hex,
                 expires_at: self.expires_at,
                 created_at: self.created_at,
             },
@@ -166,6 +170,8 @@ impl CachedAnswerRow {
             answer_hash_bytes: ah,
             cache_commitment_bytes: cc,
             host_signature_bytes: hsig,
+            client_public_key_bytes: cpk_arr,
+            client_signature: self.client_signature,
             answer_text: self.answer_text,
             answer_metadata: self.answer_metadata,
         })
@@ -182,21 +188,26 @@ pub fn build_dependency_spec_from_bundle(
         .map(|ids| ids.iter().copied().collect());
 
     let mut bundle_item_ids = BTreeSet::new();
+    let mut bundle_claim_ids = BTreeSet::new();
     for sel in &source_bundle.selected_objects {
         bundle_item_ids.insert(sel.id);
     }
     for res in &source_bundle.resolution_records {
         bundle_item_ids.insert(res.winning_claim.id);
+        bundle_claim_ids.insert(res.winning_claim.id);
         for &sid in &res.suppressed_claim_ids {
             bundle_item_ids.insert(sid);
+            bundle_claim_ids.insert(sid);
         }
     }
     for disp in &source_bundle.dispute_records {
         for cand in &disp.competing_claims {
             bundle_item_ids.insert(cand.id);
+            bundle_claim_ids.insert(cand.id);
         }
     }
 
+    let mut pinned_claim_ids = Vec::new();
     if let Some(ref fset) = explicit_filter {
         for id in fset {
             if !bundle_item_ids.contains(id) {
@@ -204,8 +215,13 @@ pub fn build_dependency_spec_from_bundle(
                     "dependency_ids item {id} was not referenced in source_bundle_hash"
                 )));
             }
+            if bundle_claim_ids.contains(id) {
+                pinned_claim_ids.push(*id);
+            }
         }
     }
+    pinned_claim_ids.sort_unstable();
+    pinned_claim_ids.dedup();
 
     let mut group_keys = BTreeSet::new();
     for res in &source_bundle.resolution_records {
@@ -259,6 +275,7 @@ pub fn build_dependency_spec_from_bundle(
     Ok(CacheDependencySpec {
         claim_group_keys_hex: group_keys.into_iter().map(hex::encode).collect(),
         memory_ids,
+        pinned_claim_ids,
         empty_knowledge_fallback,
     })
 }
@@ -278,6 +295,7 @@ pub async fn compute_scoped_task_dependency_commitment_as_of(
     let as_of = as_of.map(|t| t.trunc_subsecs(6));
     let group_set = spec.parsed_group_keys()?;
     let mem_id_set: BTreeSet<Uuid> = spec.memory_ids.iter().copied().collect();
+    let pinned_claim_set: BTreeSet<Uuid> = spec.pinned_claim_ids.iter().copied().collect();
 
     let (intents, obj_scan, (scoped_claims, _sup), active_overrides) = tokio::try_join!(
         objects_repo::fetch_scoped_intents_as_of(pool, tenant_id, scope, as_of),
@@ -315,6 +333,32 @@ pub async fn compute_scoped_task_dependency_commitment_as_of(
         for ovr in &active_overrides {
             if ovr.created_at <= eval_ts {
                 relevant_hashes.push(ovr.attestation_hash);
+            }
+        }
+    } else if !pinned_claim_set.is_empty() {
+        // Explicit `dependency_ids` claim narrowing (v1.7.2+ Probe 3): track only the pinned claim IDs
+        // plus any active claim in `scope` whose `contradiction_ids` target a pinned active claim!
+        let mut active_pinned_ids = BTreeSet::new();
+        for c in &scoped_claims {
+            if pinned_claim_set.contains(&c.id)
+                && c.status == ClaimStatus::Active
+                && c.valid_from.map_or(true, |vf| vf <= eval_ts)
+                && c.valid_to.map_or(true, |vt| vt >= eval_ts)
+            {
+                active_pinned_ids.insert(c.id);
+                relevant_hashes.push(c.content_hash);
+            }
+        }
+        for c in &scoped_claims {
+            if !active_pinned_ids.contains(&c.id)
+                && c.status == ClaimStatus::Active
+                && c.valid_from.map_or(true, |vf| vf <= eval_ts)
+                && c.valid_to.map_or(true, |vt| vt >= eval_ts)
+                && c.contradiction_ids
+                    .iter()
+                    .any(|tid| active_pinned_ids.contains(tid))
+            {
+                relevant_hashes.push(c.content_hash);
             }
         }
     } else if !group_set.is_empty() {
@@ -511,7 +555,7 @@ pub async fn cache_answer_tx(
         SELECT id, tenant_id, scope, task_id, query_hash, source_bundle_hash,
                state_commitment, validity_mode, task_dependency_commitment, dependency_spec,
                answer_hash, answer_text, answer_metadata,
-               cached_by, cacher_auth_kind, client_public_key,
+               cached_by, cacher_auth_kind, client_public_key, client_signature,
                cache_domain, cache_commitment, evidence_seq_num, host_signature,
                expires_at, created_at
         FROM cached_answers
@@ -572,6 +616,8 @@ pub async fn cache_answer_tx(
         client_signature: inp.client_signature.clone(),
         expires_at,
         invalidation_reason: None,
+        invalidated_by: None,
+        invalidator_auth_kind: None,
         observed_state_commitment: None,
         observed_dependency_commitment: None,
     };
@@ -692,6 +738,7 @@ pub async fn cache_answer_tx(
         cached_by: inp.cached_by.to_string(),
         cacher_auth_kind: inp.cacher_auth_kind.to_string(),
         client_public_key_hex: inp.client_public_key.map(hex::encode),
+        client_signature_hex: inp.client_signature.as_ref().map(hex::encode),
         expires_at,
         created_at,
     };
@@ -719,9 +766,10 @@ pub async fn cache_answer_tx(
 }
 
 /// Atomically records at most ONE chained invalidation receipt (`event_kind = "invalidated"`)
-/// in `cached_answer_invalidations` + `evidence_history` (`acta:evidence_event:v3`) for `stored.receipt.cache_id`.
-/// Repeat lookups of an already-invalidated `cache_id` return `(existing_seq_num, false)` without
-/// acquiring locks or mutating `evidence_history`.
+/// in `cached_answer_invalidations` + `evidence_history` (`acta:evidence_event:v3`) for `stored.receipt.cache_id`,
+/// preserving the original cacher's `cached_by`, `cacher_auth_kind`, `client_public_key`, and `client_signature`
+/// unchanged while recording the lookup caller separately in `invalidated_by` / `invalidator_auth_kind` (`v1.7.2+`).
+/// Repeat lookups of an already-invalidated `cache_id` return `(existing_seq_num, false, existing_evidence)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_cache_invalidation_once_tx(
     pool: &PgPool,
@@ -733,7 +781,7 @@ pub async fn record_cache_invalidation_once_tx(
     invalidated_by: &str,
     invalidator_auth_kind: &str,
     now: DateTime<Utc>,
-) -> ActaResult<(i64, bool)> {
+) -> ActaResult<(i64, bool, Option<EvidenceEntry>)> {
     let fast_existing: Option<(i64,)> = sqlx::query_as(
         "SELECT evidence_seq_num FROM cached_answer_invalidations WHERE tenant_id = $1 AND cache_id = $2",
     )
@@ -744,7 +792,8 @@ pub async fn record_cache_invalidation_once_tx(
     .map_err(|e| ActaError::Storage(format!("check cached_answer_invalidations failed: {e}")))?;
 
     if let Some((seq,)) = fast_existing {
-        return Ok((seq, false));
+        let ev_opt = fetch_evidence_by_seq(pool, &stored.receipt.tenant_id, seq).await?;
+        return Ok((seq, false, ev_opt));
     }
 
     let created_at = now.trunc_subsecs(6);
@@ -770,7 +819,8 @@ pub async fn record_cache_invalidation_once_tx(
 
     if let Some((seq,)) = locked_existing {
         tx.rollback().await.ok();
-        return Ok((seq, false));
+        let ev_opt = fetch_evidence_by_seq(pool, &stored.receipt.tenant_id, seq).await?;
+        return Ok((seq, false, ev_opt));
     }
 
     let seq_num = prev_seq + 1;
@@ -786,12 +836,14 @@ pub async fn record_cache_invalidation_once_tx(
         validity_mode: Some(stored.receipt.validity_mode.clone()),
         task_dependency_commitment: stored.task_dependency_commitment_bytes,
         answer_hash: stored.answer_hash_bytes,
-        cached_by: invalidated_by.to_string(),
-        cacher_auth_kind: invalidator_auth_kind.to_string(),
-        client_public_key: None,
-        client_signature: None,
+        cached_by: stored.receipt.cached_by.clone(),
+        cacher_auth_kind: stored.receipt.cacher_auth_kind.clone(),
+        client_public_key: stored.client_public_key_bytes,
+        client_signature: stored.client_signature.clone(),
         expires_at: stored.receipt.expires_at,
         invalidation_reason: Some(invalidation_reason.to_string()),
+        invalidated_by: Some(invalidated_by.to_string()),
+        invalidator_auth_kind: Some(invalidator_auth_kind.to_string()),
         observed_state_commitment: Some(*observed_state_commitment),
         observed_dependency_commitment: observed_dependency_commitment.copied(),
     };
@@ -879,7 +931,26 @@ pub async fn record_cache_invalidation_once_tx(
         ActaError::Storage(format!("commit cached_answer_invalidations tx failed: {e}"))
     })?;
 
-    Ok((seq_num, true))
+    let ev = EvidenceEntry {
+        tenant_id: stored.receipt.tenant_id.clone(),
+        seq_num,
+        event_domain: Some("acta:evidence_event:v3".to_string()),
+        prev_hash,
+        event_hash,
+        bundle_hash: None,
+        state_commitment: Some(cache_comm),
+        policy_result: PolicyResultTag::Allow,
+        refusal_metadata: None,
+        override_summary: None,
+        write_summary: None,
+        answer_cache_summary: Some(acs),
+        witness_reg_summary: None,
+        witness_revoke_summary: None,
+        host_signature: ev_host_sig,
+        created_at,
+    };
+
+    Ok((seq_num, true, Some(ev)))
 }
 
 /// Fetches the latest cached answer for `(tenant_id, scope, task_id, query_hash)` via `idx_cached_answers_lookup`.
@@ -896,7 +967,7 @@ pub async fn lookup_latest_cached_answer(
         SELECT id, tenant_id, scope, task_id, query_hash, source_bundle_hash,
                state_commitment, validity_mode, task_dependency_commitment, dependency_spec,
                answer_hash, answer_text, answer_metadata,
-               cached_by, cacher_auth_kind, client_public_key,
+               cached_by, cacher_auth_kind, client_public_key, client_signature,
                cache_domain, cache_commitment, evidence_seq_num, host_signature,
                expires_at, created_at
         FROM cached_answers

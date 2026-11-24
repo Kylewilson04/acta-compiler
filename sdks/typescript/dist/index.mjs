@@ -1,5 +1,5 @@
 /**
- * @acta/sdk v1.7.1 — Zero-Dependency ESM Runtime for Acta Compiler v1.7.1
+ * @acta/sdk v1.7.2 — Zero-Dependency ESM Runtime for Acta Compiler v1.7.2
  *
  * Bit-for-bit compatible with Rust `acta-crypto`:
  * - Spec-exact pure-JS BLAKE3 (256-bit unkeyed + Keyed BLAKE3 MAC)
@@ -25,6 +25,8 @@ export const DEFAULT_DECISIVENESS_THRESHOLD = 0.15;
 export const DEFAULT_CORROBORATION_DAMPING = 0.5;
 export const SCHEMA_VERSION = "acta-context-bundle/v1";
 export const STATE_REBUILD_ARCHIVE_SCHEMA_V1 = "acta-state-rebuild-archive/v1";
+export const REBUILD_HEADER_DOMAIN_V1 = "acta:rebuild_header:v1";
+export const REBUILD_SIG_DOMAIN_V1 = "acta:rebuild_sig:v1";
 
 const BLOCK_LEN = 64;
 const CHUNK_LEN = 1024;
@@ -756,6 +758,12 @@ function normalizeRefusalMetadata(meta) {
   if (meta.attempted_checkpoint_hash != null) {
     out.attempted_checkpoint_hash = bytesToHex(asHash32(meta.attempted_checkpoint_hash)).toLowerCase();
   }
+  if (meta.signing_domain != null) {
+    out.signing_domain = String(meta.signing_domain);
+  }
+  if (meta.expected_intent_digest_hex != null) {
+    out.expected_intent_digest_hex = bytesToHex(asHash32(meta.expected_intent_digest_hex)).toLowerCase();
+  }
   return out;
 }
 
@@ -1118,6 +1126,8 @@ function normalizeAnswerCacheSummary(acs) {
   }
   if (acs.expires_at != null) out.expires_at = String(acs.expires_at);
   if (acs.invalidation_reason != null) out.invalidation_reason = String(acs.invalidation_reason);
+  if (acs.invalidated_by != null) out.invalidated_by = String(acs.invalidated_by);
+  if (acs.invalidator_auth_kind != null) out.invalidator_auth_kind = String(acs.invalidator_auth_kind);
   if (acs.observed_state_commitment != null) {
     out.observed_state_commitment = bytesToHex(asHash32(acs.observed_state_commitment)).toLowerCase();
   }
@@ -1127,6 +1137,144 @@ function normalizeAnswerCacheSummary(acs) {
     ).toLowerCase();
   }
   return out;
+}
+
+function normalizeWitnessRegSummary(wreg) {
+  const out = {
+    witness_id: String(wreg.witness_id),
+    public_key: bytesToHex(asHash32(wreg.public_key)).toLowerCase(),
+    registered_by: String(wreg.registered_by),
+    registration_domain: String(wreg.registration_domain),
+    registration_blake3_preimage_hex: String(wreg.registration_blake3_preimage_hex),
+  };
+  if (wreg.description != null) out.description = String(wreg.description);
+  return out;
+}
+
+function normalizeWitnessRevokeSummary(wrev) {
+  const out = {
+    witness_id: String(wrev.witness_id),
+    public_key: bytesToHex(asHash32(wrev.public_key)).toLowerCase(),
+    revoked_by: String(wrev.revoked_by),
+    revocation_mode: String(wrev.revocation_mode || "compromise"),
+    reason: String(wrev.reason),
+    revocation_domain: String(wrev.revocation_domain),
+    revocation_blake3_preimage_hex: String(wrev.revocation_blake3_preimage_hex),
+  };
+  if (wrev.effective_from_tree_size != null) {
+    out.effective_from_tree_size = Number(wrev.effective_from_tree_size);
+  }
+  return out;
+}
+
+export function rebuildArchiveHeaderPreimageBytes({
+  schemaVersion = STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+  tenantId,
+  scope,
+  upToSeq,
+  evaluatedAt,
+  permissionRoot,
+}) {
+  const evalMicros = typeof evaluatedAt === "bigint" ? evaluatedAt : parseRfc3339Micros(evaluatedAt);
+  return encodeLengthDelimited([
+    "acta:rebuild_header:v1",
+    String(schemaVersion),
+    String(tenantId),
+    String(scope),
+    i64LeBytes(BigInt(upToSeq)),
+    i64LeBytes(evalMicros),
+    asHash32(permissionRoot),
+  ]);
+}
+
+export function computeRebuildArchiveHeaderHash(params) {
+  return new Blake3Hasher().update(rebuildArchiveHeaderPreimageBytes(params)).hexdigest();
+}
+
+export function rebuildHeaderSigningPreimage(tenantId, headerHash) {
+  return hashLengthDelimited(["acta:rebuild_sig:v1", String(tenantId), asHash32(headerHash)]);
+}
+
+export function signRebuildArchiveHeader(seedHexOrBytes, tenantId, headerHash) {
+  const seed = hexToBytes(seedHexOrBytes);
+  if (seed.length !== 32) throw new Error("Ed25519 private seed must be 32 bytes");
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digest = rebuildHeaderSigningPreimage(tenantId, headerHash);
+  return bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
+}
+
+export function verifyRebuildArchiveHeaderSignature(pubkeyHexOrBytes, tenantId, headerHash, sigHexOrBytes) {
+  const digest = rebuildHeaderSigningPreimage(tenantId, headerHash);
+  return verifyEd25519Strict(pubkeyHexOrBytes, digest, sigHexOrBytes);
+}
+
+function jsonValueFamilyTag(val) {
+  if (val === null) return 0;
+  if (typeof val === "boolean") return 1;
+  if (typeof val === "number") return 2;
+  if (typeof val === "string") return 3;
+  if (Array.isArray(val)) return 4;
+  if (typeof val === "object") return 5;
+  return 6;
+}
+
+export function claimsShareWinningValueBucket(winner, candidate) {
+  if (jsonValueFamilyTag(winner.object_val) !== jsonValueFamilyTag(candidate.object_val)) {
+    return false;
+  }
+  return Buffer.compare(
+    Buffer.from(toCanonicalBytes(winner.object_val)),
+    Buffer.from(toCanonicalBytes(candidate.object_val))
+  ) === 0;
+}
+
+function round9Rust(val) {
+  const scaled = val * 1_000_000_000.0;
+  const rounded = scaled >= 0 ? Math.floor(scaled + 0.5) : Math.ceil(scaled - 0.5);
+  return rounded / 1_000_000_000.0;
+}
+
+export function recomputeWinningBucketCorroboration(bucketClaims, damping = DEFAULT_CORROBORATION_DAMPING) {
+  if (!bucketClaims || bucketClaims.length === 0) {
+    throw new Error("winning value bucket cannot be empty");
+  }
+  const sorted = [...bucketClaims].sort((a, b) => {
+    const cDiff = Number(b.confidence) - Number(a.confidence);
+    if (cDiff !== 0) return cDiff > 0 ? 1 : -1;
+    const pDiff = Number(b.source_provenance_class) - Number(a.source_provenance_class);
+    if (pDiff !== 0) return pDiff;
+    const tDiff = parseRfc3339Micros(b.created_at) - parseRfc3339Micros(a.created_at);
+    if (tDiff !== 0n) return tDiff > 0n ? 1 : -1;
+    const vDiff = Number(b.version) - Number(a.version);
+    if (vDiff !== 0) return vDiff;
+    return Buffer.compare(Buffer.from(uuidToBytes(a.id)), Buffer.from(uuidToBytes(b.id)));
+  });
+  const seen = new Set();
+  for (const c of sorted) {
+    const sd = String(c.source_descriptor);
+    if (seen.has(sd)) {
+      throw new Error(`duplicate source_descriptor '${sd}' inside corroborating value bucket`);
+    }
+    seen.add(sd);
+  }
+  const leadConf = Number(sorted[0].confidence);
+  let effectiveConfidence;
+  if (sorted.length === 1) {
+    effectiveConfidence = round9Rust(leadConf);
+  } else {
+    let unconvinced = 1.0;
+    for (let i = 1; i < sorted.length; i++) {
+      const factor = Math.max(0.0, Math.min(1.0, 1.0 - Number(damping) * Number(sorted[i].confidence)));
+      unconvinced *= factor;
+    }
+    effectiveConfidence = round9Rust(Math.min(leadConf + (1.0 - leadConf) * (1.0 - unconvinced), 0.9999));
+  }
+  return {
+    corroboratingCount: sorted.length,
+    corroboratingSources: sorted.map((c) => String(c.source_descriptor)),
+    effectiveConfidence,
+  };
 }
 
 export function computeAnswerCacheSummaryCommitment(acs) {
@@ -1399,6 +1547,9 @@ export function computeEvidenceEventHash({
   overrideSummary = null,
   writeSummary = null,
   answerCacheSummary = null,
+  witnessRegSummary = null,
+  witnessRevokeSummary = null,
+  witnessInV3 = false,
 }) {
   const micros = typeof createdAt === "bigint" ? createdAt : parseRfc3339Micros(createdAt);
   if (writeSummary != null || answerCacheSummary != null) {
@@ -1418,6 +1569,30 @@ export function computeEvidenceEventHash({
         i64LeBytes(micros),
         writeTagged,
         cacheTagged,
+      ])
+    );
+  }
+  if (witnessInV3 && (witnessRegSummary != null || witnessRevokeSummary != null)) {
+    const wregTagged = encodeOptJcs(
+      witnessRegSummary != null ? normalizeWitnessRegSummary(witnessRegSummary) : null
+    );
+    const wrevTagged = encodeOptJcs(
+      witnessRevokeSummary != null ? normalizeWitnessRevokeSummary(witnessRevokeSummary) : null
+    );
+    return bytesToHex(
+      hashLengthDelimited([
+        "acta:evidence_event:v3",
+        String(tenantId),
+        i64LeBytes(BigInt(seqNum)),
+        asHash32(prevHash),
+        encodeOptHash32(bundleHash),
+        encodeOptHash32(stateCommitment),
+        String(policyResult),
+        i64LeBytes(micros),
+        new Uint8Array([0]),
+        new Uint8Array([0]),
+        wregTagged,
+        wrevTagged,
       ])
     );
   }
@@ -1836,8 +2011,11 @@ export function deriveEd25519PublicKeyHex(seedHexOrBytes) {
 }
 
 export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
+  const witnessInV3 =
+    (entry.witness_reg_summary != null || entry.witness_revoke_summary != null) &&
+    entry.event_domain === "acta:evidence_event:v3";
   const expectedEvDomain =
-    entry.write_summary != null || entry.answer_cache_summary != null
+    entry.write_summary != null || entry.answer_cache_summary != null || witnessInV3
       ? "acta:evidence_event:v3"
       : entry.refusal_metadata == null && entry.override_summary == null
       ? "acta:evidence_event:v1"
@@ -1951,6 +2129,8 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     if (evKind === null || evKind === "cached") {
       if (
         acs.invalidation_reason != null ||
+        acs.invalidated_by != null ||
+        acs.invalidator_auth_kind != null ||
         acs.observed_state_commitment != null ||
         acs.observed_dependency_commitment != null
       ) {
@@ -1972,6 +2152,19 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
         throw new ActaSignatureVerificationError(
           `${lbl} invalidation event requires observed_state_commitment`
         );
+      }
+      if (acs.invalidator_auth_kind != null) {
+        const ik = String(acs.invalidator_auth_kind).trim();
+        if (
+          ik !== "oauth_github_principal" &&
+          ik !== "ed25519_client_sig" &&
+          ik !== "tenant_session" &&
+          ik !== "master_admin"
+        ) {
+          throw new ActaSignatureVerificationError(
+            `${lbl} unsupported invalidator_auth_kind '${ik}'`
+          );
+        }
       }
     } else {
       throw new ActaSignatureVerificationError(
@@ -2106,6 +2299,9 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     overrideSummary: entry.override_summary ?? null,
     writeSummary: entry.write_summary ?? null,
     answerCacheSummary: entry.answer_cache_summary ?? null,
+    witnessRegSummary: entry.witness_reg_summary ?? null,
+    witnessRevokeSummary: entry.witness_revoke_summary ?? null,
+    witnessInV3,
   });
   const storedHex = String(entry.event_hash).toLowerCase();
   if (recomputed !== storedHex) {
@@ -2337,6 +2533,8 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     }
   }
 
+  const corroborationDamping = rm != null ? Number(rm.corroboration_damping) : DEFAULT_CORROBORATION_DAMPING;
+  let verifiedCorroboratedResolutions = 0;
   for (const res of bundle.resolution_records || []) {
     const c = res.winning_claim;
     const cid = normalizeUuidString(c.id);
@@ -2363,6 +2561,59 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
           `tampered override_attestation reference on resolution_record for claim[id=${cid}]`
         );
       }
+    } else if (Number(c.corroborating_count || 1) > 1 || c.effective_confidence != null) {
+      const expectedCount = Math.max(Number(c.corroborating_count || 1), 2);
+      const bucketClaims = [stored];
+      for (const rawSid of res.suppressed_claim_ids || []) {
+        const sid = normalizeUuidString(rawSid);
+        if (sid === cid) continue;
+        const supStored = claimsById.get(sid);
+        if (supStored) {
+          const validSupGroups = new Set([
+            String(supStored.claim_group_key).toLowerCase(),
+            computeLogicalClaimGroupKey(
+              supStored.tenant_id,
+              supStored.subject,
+              supStored.predicate,
+              supStored.scope
+            ),
+          ]);
+          if (!validSupGroups.has(String(res.claim_group_key).toLowerCase())) {
+            throw new ActaVerificationError(
+              `corroborating claim[id=${sid}] does not match resolution claim_group_key`
+            );
+          }
+          if (claimsShareWinningValueBucket(c, supStored)) {
+            bucketClaims.push(supStored);
+          }
+        }
+      }
+      if (bucketClaims.length !== expectedCount) {
+        throw new ActaVerificationError(
+          `resolution_record for claim[id=${cid}] declares corroborating_count=${expectedCount}, but archive.claims contains ${bucketClaims.length} winning-bucket claim(s)`
+        );
+      }
+      let rec;
+      try {
+        rec = recomputeWinningBucketCorroboration(bucketClaims, corroborationDamping);
+      } catch (err) {
+        throw new ActaVerificationError(err.message);
+      }
+      const claimedSources = c.corroborating_sources || [];
+      if (
+        claimedSources.length > 0 &&
+        JSON.stringify(rec.corroboratingSources) !== JSON.stringify(claimedSources)
+      ) {
+        throw new ActaVerificationError(`corroborating_sources mismatch on claim[id=${cid}]`);
+      }
+      if (c.effective_confidence != null) {
+        if (Math.abs(Number(c.effective_confidence) - rec.effectiveConfidence) > 1e-9) {
+          throw new ActaVerificationError(
+            `tampered effective_confidence on claim[id=${cid}]: recomputed ${rec.effectiveConfidence} != bundle ${c.effective_confidence}`
+          );
+        }
+      }
+      verifiedCorroboratedResolutions += 1;
     }
   }
 
@@ -2629,6 +2880,7 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     state_commitment_hex: String(bundle.state_commitment).toLowerCase(),
     verified_objects: objectsById.size,
     verified_claims: claimsById.size,
+    verified_corroborated_resolutions: verifiedCorroboratedResolutions,
     verified_overrides: overridesById.size,
     verified_writes: verifiedWrites,
     verified_answer_caches: verifiedAnswerCaches,
@@ -2677,6 +2929,37 @@ export function verifyAndRebuildScopeStateOffline(
   const upToSeq = Number(archive.up_to_seq);
   if (!Number.isInteger(upToSeq) || upToSeq < 0) {
     throw new ActaVerificationError(`invalid up_to_seq=${archive.up_to_seq}: must be >= 0`);
+  }
+  if (!archive.header_hash || !archive.host_header_signature) {
+    throw new ActaVerificationError(
+      "StateRebuildArchive missing required signed header fields (header_hash, host_header_signature)"
+    );
+  }
+  const recomputedHeaderHex = computeRebuildArchiveHeaderHash({
+    schemaVersion: schemaVer,
+    tenantId,
+    scope: archive.scope,
+    upToSeq,
+    evaluatedAt: archive.evaluated_at,
+    permissionRoot: archive.permission_root,
+  });
+  const storedHeaderHex = bytesToHex(asHash32(archive.header_hash)).toLowerCase();
+  if (recomputedHeaderHex !== storedHeaderHex) {
+    throw new ActaVerificationError(
+      `tampered StateRebuildArchive header (scope / up_to_seq / evaluated_at / permission_root): recomputed ${recomputedHeaderHex} != stored ${storedHeaderHex}`
+    );
+  }
+  if (
+    !verifyRebuildArchiveHeaderSignature(
+      expectedClean,
+      tenantId,
+      recomputedHeaderHex,
+      archive.host_header_signature
+    )
+  ) {
+    throw new ActaVerificationError(
+      "Ed25519 host_header_signature verification failed on StateRebuildArchive header"
+    );
   }
   const chain = archive.evidence_chain || [];
   if (chain.length !== upToSeq) {
@@ -2946,6 +3229,8 @@ export function verifyAndRebuildScopeStateOffline(
     scope: targetScope,
     verified_up_to_seq: upToSeq,
     evaluated_at: String(archive.evaluated_at),
+    header_hash_hex: recomputedHeaderHex,
+    header_signature_verified: true,
     verified_evidence_entries: chain.length,
     write_events_replayed: writeEventsReplayed,
     reconstructed_active_intents: intentHashes.length,
@@ -3086,14 +3371,19 @@ export function dumpArchivePreimages(archive) {
 
   const evidenceDump = entriesSrc.map((entry) => {
     const micros = parseRfc3339Micros(entry.created_at);
-    const isV3 = entry.write_summary != null || entry.answer_cache_summary != null;
+    const isWriteOrCacheV3 = entry.write_summary != null || entry.answer_cache_summary != null;
+    const isWitnessV3 =
+      !isWriteOrCacheV3 &&
+      (entry.witness_reg_summary != null || entry.witness_revoke_summary != null) &&
+      entry.event_domain === "acta:evidence_event:v3";
+    const isV3 = isWriteOrCacheV3 || isWitnessV3;
     const isV1 = !isV3 && entry.refusal_metadata == null && entry.override_summary == null;
     const evDomain = isV3
       ? "acta:evidence_event:v3"
       : isV1
       ? "acta:evidence_event:v1"
       : "acta:evidence_event:v2";
-    const evPreimage = isV3
+    const evPreimage = isWriteOrCacheV3
       ? encodeLengthDelimited([
           "acta:evidence_event:v3",
           String(entry.tenant_id),
@@ -3106,6 +3396,23 @@ export function dumpArchivePreimages(archive) {
           encodeOptJcs(entry.write_summary != null ? normalizeWriteSummary(entry.write_summary) : null),
           encodeOptJcs(
             entry.answer_cache_summary != null ? normalizeAnswerCacheSummary(entry.answer_cache_summary) : null
+          ),
+        ])
+      : isWitnessV3
+      ? encodeLengthDelimited([
+          "acta:evidence_event:v3",
+          String(entry.tenant_id),
+          i64LeBytes(BigInt(entry.seq_num)),
+          asHash32(entry.prev_hash),
+          encodeOptHash32(entry.bundle_hash ?? null),
+          encodeOptHash32(entry.state_commitment ?? null),
+          String(entry.policy_result),
+          i64LeBytes(micros),
+          new Uint8Array([0]),
+          new Uint8Array([0]),
+          encodeOptJcs(entry.witness_reg_summary != null ? normalizeWitnessRegSummary(entry.witness_reg_summary) : null),
+          encodeOptJcs(
+            entry.witness_revoke_summary != null ? normalizeWitnessRevokeSummary(entry.witness_revoke_summary) : null
           ),
         ])
       : isV1
@@ -3160,6 +3467,14 @@ export function dumpArchivePreimages(archive) {
         entry.write_summary != null ? toCanonicalJson(normalizeWriteSummary(entry.write_summary)) : null,
       answer_cache_summary_canonical_jcs:
         entry.answer_cache_summary != null ? toCanonicalJson(normalizeAnswerCacheSummary(entry.answer_cache_summary)) : null,
+      witness_reg_summary_canonical_jcs:
+        entry.witness_reg_summary != null
+          ? toCanonicalJson(normalizeWitnessRegSummary(entry.witness_reg_summary))
+          : null,
+      witness_revoke_summary_canonical_jcs:
+        entry.witness_revoke_summary != null
+          ? toCanonicalJson(normalizeWitnessRevokeSummary(entry.witness_revoke_summary))
+          : null,
       witness_registration: entry.witness_reg_summary ?? null,
       witness_revocation: entry.witness_revoke_summary ?? null,
     };
@@ -3484,6 +3799,7 @@ export class ActaClient {
       claim_id: req.claimId,
       reason: req.reason,
     };
+    if (req.scope) body.scope = req.scope;
     if (req.id) body.id = req.id;
     if (req.clientSignatureHex) body.client_signature_hex = req.clientSignatureHex;
     if (req.clientPublicKeyHex) body.client_public_key_hex = req.clientPublicKeyHex;

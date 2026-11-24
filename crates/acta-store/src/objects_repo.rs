@@ -112,7 +112,9 @@ struct AggregatedScopeScanRow {
     active_intent_hashes: Option<Vec<u8>>,
     active_memory_hashes: Option<Vec<u8>>,
     active_memory_ids: Option<Vec<Uuid>>,
+    retracted_ids: Option<Vec<Uuid>>,
     superseded_ids: Option<Vec<Uuid>>,
+    retraction_tombstone_ids: Option<Vec<Uuid>>,
     expired_ids: Option<Vec<Uuid>>,
 }
 
@@ -532,16 +534,16 @@ pub async fn fetch_scoped_memories_ranked_as_of(
                    ) AS hybrid_score
             FROM objects o
             WHERE o.tenant_id = $1
-              AND o.scope = $2
-              AND o.obj_type = 'memory'
-              AND o.lifecycle_status = 'active'
-              AND ($5::timestamptz IS NULL OR o.created_at <= $5)
-              AND NOT EXISTS (
-                  SELECT 1 FROM objects succ
-                  WHERE succ.tenant_id = o.tenant_id
-                    AND succ.predecessor_id = o.id
-                    AND ($5::timestamptz IS NULL OR succ.created_at <= $5)
-              )
+               AND o.scope = $2
+               AND o.obj_type = 'memory'
+               AND o.lifecycle_status = 'active'
+               AND ($5::timestamptz IS NULL OR o.created_at <= $5)
+               AND NOT EXISTS (
+                   SELECT 1 FROM objects succ
+                   WHERE succ.tenant_id = o.tenant_id
+                     AND succ.predecessor_id = o.id
+                     AND ($5::timestamptz IS NULL OR succ.created_at <= $5)
+               )
             ORDER BY hybrid_score DESC, o.importance DESC, o.created_at DESC, o.version DESC, o.id ASC
             LIMIT $4
             "#,
@@ -644,8 +646,16 @@ pub async fn fetch_all_active_hashes_in_scope_as_of(
                        SELECT 1 FROM objects succ
                        WHERE succ.tenant_id = o.tenant_id
                          AND succ.predecessor_id = o.id
+                         AND succ.lifecycle_status <> 'revoked'
                          AND ($3::timestamptz IS NULL OR succ.created_at <= $3)
-                   ) AS is_superseded
+                   ) AS is_superseded,
+                   EXISTS (
+                       SELECT 1 FROM objects succ
+                       WHERE succ.tenant_id = o.tenant_id
+                         AND succ.predecessor_id = o.id
+                         AND succ.lifecycle_status = 'revoked'
+                         AND ($3::timestamptz IS NULL OR succ.created_at <= $3)
+                   ) AS is_retracted
             FROM objects o
             WHERE o.tenant_id = $1
               AND o.scope = $2
@@ -653,19 +663,25 @@ pub async fn fetch_all_active_hashes_in_scope_as_of(
         )
         SELECT
             string_agg(content_hash, ''::bytea ORDER BY content_hash ASC)
-                FILTER (WHERE NOT is_superseded AND lifecycle_status = 'active' AND obj_type = 'intent')
+                FILTER (WHERE NOT is_superseded AND NOT is_retracted AND lifecycle_status = 'active' AND obj_type = 'intent')
                 AS active_intent_hashes,
             string_agg(content_hash, ''::bytea ORDER BY content_hash ASC)
-                FILTER (WHERE NOT is_superseded AND lifecycle_status = 'active' AND obj_type = 'memory')
+                FILTER (WHERE NOT is_superseded AND NOT is_retracted AND lifecycle_status = 'active' AND obj_type = 'memory')
                 AS active_memory_hashes,
             array_agg(id ORDER BY id ASC)
-                FILTER (WHERE NOT is_superseded AND lifecycle_status = 'active' AND obj_type = 'memory')
+                FILTER (WHERE NOT is_superseded AND NOT is_retracted AND lifecycle_status = 'active' AND obj_type = 'memory')
                 AS active_memory_ids,
             array_agg(id ORDER BY id ASC)
-                FILTER (WHERE is_superseded OR lifecycle_status = 'superseded')
+                FILTER (WHERE is_retracted)
+                AS retracted_ids,
+            array_agg(id ORDER BY id ASC)
+                FILTER (WHERE NOT is_retracted AND (is_superseded OR lifecycle_status = 'superseded'))
                 AS superseded_ids,
             array_agg(id ORDER BY id ASC)
-                FILTER (WHERE NOT is_superseded AND lifecycle_status NOT IN ('active', 'superseded'))
+                FILTER (WHERE NOT is_retracted AND NOT is_superseded AND lifecycle_status = 'revoked')
+                AS retraction_tombstone_ids,
+            array_agg(id ORDER BY id ASC)
+                FILTER (WHERE NOT is_retracted AND NOT is_superseded AND lifecycle_status NOT IN ('active', 'superseded', 'revoked'))
                 AS expired_ids
         FROM scoped
         "#,
@@ -681,11 +697,20 @@ pub async fn fetch_all_active_hashes_in_scope_as_of(
     let active_memory_hashes = unpack_hash32_concat(agg.active_memory_hashes)?;
     let active_memory_ids = agg.active_memory_ids.unwrap_or_default();
 
+    let ret_ids = agg.retracted_ids.unwrap_or_default();
     let sup_ids = agg.superseded_ids.unwrap_or_default();
+    let tomb_ids = agg.retraction_tombstone_ids.unwrap_or_default();
     let exp_ids = agg.expired_ids.unwrap_or_default();
-    let mut excluded_objects = Vec::with_capacity(sup_ids.len() + exp_ids.len());
+    let mut excluded_objects =
+        Vec::with_capacity(ret_ids.len() + sup_ids.len() + tomb_ids.len() + exp_ids.len());
+    for id in ret_ids {
+        excluded_objects.push((id, OmissionReason::Retracted));
+    }
     for id in sup_ids {
         excluded_objects.push((id, OmissionReason::Superseded));
+    }
+    for id in tomb_ids {
+        excluded_objects.push((id, OmissionReason::RetractionTombstone));
     }
     for id in exp_ids {
         excluded_objects.push((id, OmissionReason::LifecycleExpired));

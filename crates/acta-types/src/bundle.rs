@@ -21,6 +21,8 @@ pub const WRITE_EVENT_DOMAIN_V1: &str = "acta:write_event:v1";
 pub const ANSWER_CACHE_DOMAIN_V1: &str = "acta:answer_cache:v1";
 pub const CACHE_DEPENDENCY_DOMAIN_V1: &str = "acta:cache_dep_root:v1";
 pub const STATE_REBUILD_ARCHIVE_SCHEMA_V1: &str = "acta-state-rebuild-archive/v1";
+pub const REBUILD_HEADER_DOMAIN_V1: &str = "acta:rebuild_header:v1";
+pub const REBUILD_SIG_DOMAIN_V1: &str = "acta:rebuild_sig:v1";
 
 fn default_witness_reg_domain() -> String {
     WITNESS_REG_DOMAIN_V1.to_string()
@@ -161,6 +163,10 @@ pub struct RefusalMetadata {
     pub scope_state_commitment: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
     pub attempted_checkpoint_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
+    pub expected_intent_digest_hex: Option<[u8; 32]>,
 }
 
 /// Auditor-readable summary bound into `EvidenceEntry.event_hash` when an entry notarizes
@@ -223,6 +229,9 @@ pub struct WriteLedgerSummary {
 
 /// Strip-proof state-conditioned answer-cache event summary bound into `EvidenceEntry.event_hash`
 /// (`acta:evidence_event:v3`, `v1.7.0+`, PPA 1 Independent Claim 19 / Claim 21).
+/// In `v1.7.2+`, invalidation receipts (`event_kind = "invalidated"`) preserve the original cacher's
+/// `cached_by`, `cacher_auth_kind`, `client_public_key`, and `client_signature` unchanged while
+/// recording the lookup caller separately in `invalidated_by` and `invalidator_auth_kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerCacheLedgerSummary {
     #[serde(default = "default_answer_cache_domain")]
@@ -254,6 +263,10 @@ pub struct AnswerCacheLedgerSummary {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidator_auth_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
     pub observed_state_commitment: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
@@ -360,7 +373,23 @@ impl EvidenceEntry {
         has_write_summary: bool,
         has_answer_cache_summary: bool,
     ) -> &'static str {
-        if has_write_summary || has_answer_cache_summary {
+        Self::inferred_event_domain_v172(
+            has_refusal_metadata,
+            has_override_summary,
+            has_write_summary,
+            has_answer_cache_summary,
+            false,
+        )
+    }
+
+    pub fn inferred_event_domain_v172(
+        has_refusal_metadata: bool,
+        has_override_summary: bool,
+        has_write_summary: bool,
+        has_answer_cache_summary: bool,
+        witness_in_v3: bool,
+    ) -> &'static str {
+        if has_write_summary || has_answer_cache_summary || witness_in_v3 {
             "acta:evidence_event:v3"
         } else if has_refusal_metadata || has_override_summary {
             "acta:evidence_event:v2"
@@ -369,12 +398,20 @@ impl EvidenceEntry {
         }
     }
 
+    /// Returns whether this entry's witness registration/revocation summary is bound directly
+    /// into `acta:evidence_event:v3` (`v1.7.2+`) rather than legacy `v1` (`seq <= 184`).
+    pub fn uses_witness_v3_event_domain(&self) -> bool {
+        (self.witness_reg_summary.is_some() || self.witness_revoke_summary.is_some())
+            && self.event_domain.as_deref() == Some("acta:evidence_event:v3")
+    }
+
     pub fn expected_event_domain_str(&self) -> &'static str {
-        Self::inferred_event_domain_v17(
+        Self::inferred_event_domain_v172(
             self.refusal_metadata.is_some(),
             self.override_summary.is_some(),
             self.write_summary.is_some(),
             self.answer_cache_summary.is_some(),
+            self.uses_witness_v3_event_domain(),
         )
     }
 }
@@ -580,10 +617,11 @@ fn default_state_rebuild_archive_schema() -> String {
     STATE_REBUILD_ARCHIVE_SCHEMA_V1.to_string()
 }
 
-/// Portable, self-contained cryptographic state-rebuild proof archive (`v1.7.1+`, PPA 1 Claim 1 & §11)
+/// Portable, host-header-signed cryptographic state-rebuild proof archive (`v1.7.2+`, PPA 1 Claim 1 & §11)
 /// enabling an independent third party (`acta-verify`, Python `acta_sdk`, or TypeScript `@acta/sdk`)
-/// to verify `evidence_chain[1..=up_to_seq]`, `SignedTreeHead`, witness cosignatures, and strip-proof
-/// `override_attestations` and reconstruct active scope state + `state_commitment` completely offline.
+/// to verify `(scope, up_to_seq, evaluated_at, permission_root)`, `evidence_chain[1..=up_to_seq]`,
+/// `SignedTreeHead`, witness cosignatures, and strip-proof `override_attestations` (always serialized
+/// even when empty) and reconstruct active scope state + `state_commitment` completely offline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateRebuildArchive {
     #[serde(default = "default_state_rebuild_archive_schema")]
@@ -596,7 +634,11 @@ pub struct StateRebuildArchive {
     pub host_public_key: [u8; 32],
     #[serde(with = "hex_32")]
     pub permission_root: [u8; 32],
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "hex_32")]
+    pub header_hash: [u8; 32],
+    #[serde(with = "hex_64")]
+    pub host_header_signature: [u8; 64],
+    #[serde(default)]
     pub override_attestations: Vec<OverrideAttestation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_chain: Vec<EvidenceEntry>,

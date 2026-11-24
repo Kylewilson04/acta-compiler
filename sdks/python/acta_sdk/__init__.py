@@ -1,4 +1,4 @@
-"""Acta Compiler v1.7.1 Official Python SDK (`acta_sdk`)."""
+"""Acta Compiler v1.7.2 Official Python SDK (`acta_sdk`)."""
 
 from .blake3_pure import PureBlake3Hasher, blake3_hash, blake3_keyed_hash
 from .client import DEFAULT_CLOUDRUN_URL, ActaClient, AsyncActaClient
@@ -7,7 +7,16 @@ from .crypto import (
     DEFAULT_DECISIVENESS_THRESHOLD,
     DEFAULT_MIN_CONFIDENCE,
     SCHEMA_VERSION,
+    REBUILD_HEADER_DOMAIN_V1,
+    REBUILD_SIG_DOMAIN_V1,
     STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    claims_share_winning_value_bucket,
+    compute_rebuild_archive_header_hash,
+    rebuild_archive_header_preimage_bytes,
+    rebuild_header_signing_preimage,
+    recompute_winning_bucket_corroboration,
+    sign_rebuild_archive_header,
+    verify_rebuild_archive_header_signature,
     TENANT_TOKEN_PREFIX,
     OfflineStateRebuildSummary,
     VerificationSummary,
@@ -39,6 +48,8 @@ from .crypto import (
     object_client_intent_preimage_bytes,
     sign_claim_client_intent,
     sign_object_client_intent,
+    sign_answer_cache_client_intent,
+    sign_answer_client_intent,
     sign_retract_claim_client_intent,
     verify_answer_cache_signature,
     compute_omission_list_hash,
@@ -108,7 +119,7 @@ from .errors import (
 from .gemini import ActaGeminiGuard, build_guarded_prompt
 from .models import CompileResult, ContextBudget, GuardedGenerationResult
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 __all__ = [
     "DEFAULT_CLOUDRUN_URL",
@@ -134,7 +145,16 @@ __all__ = [
     "PureBlake3Hasher",
     "OfflineStateRebuildSummary",
     "SCHEMA_VERSION",
+    "REBUILD_HEADER_DOMAIN_V1",
+    "REBUILD_SIG_DOMAIN_V1",
     "STATE_REBUILD_ARCHIVE_SCHEMA_V1",
+    "claims_share_winning_value_bucket",
+    "compute_rebuild_archive_header_hash",
+    "rebuild_archive_header_preimage_bytes",
+    "rebuild_header_signing_preimage",
+    "recompute_winning_bucket_corroboration",
+    "sign_rebuild_archive_header",
+    "verify_rebuild_archive_header_signature",
     "VerificationSummary",
     "compute_state_commitment",
     "compute_sub_commitment",
@@ -179,6 +199,8 @@ __all__ = [
     "sign_client_content_hash",
     "sign_evidence_entry",
     "sign_override_attestation",
+    "sign_answer_cache_client_intent",
+    "sign_answer_client_intent",
     "sign_override_client_intent",
     "sign_witness_anchor",
     "to_canonical_bytes",

@@ -1496,7 +1496,7 @@ fn render_authorize_signin_html(
 </head>
 <body>
   <div class="card">
-    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256 · v1.7.1</span>
+    <span class="badge">ACTA MCP OAUTH 2.1 · PKCE S256 · v1.7.2</span>
     <h1>Connect {client_esc}</h1>
     <p class="sub">Sign in with GitHub to cryptographically bind <strong>{client_esc}</strong> to your GitHub Organization vault and OAuth principal.</p>
     {github_section}

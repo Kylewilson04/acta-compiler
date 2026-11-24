@@ -1,4 +1,4 @@
-"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.7.1.
+"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.7.2.
 
 Features:
 - Stateless Keyed-BLAKE3 Tenant & OAuth Principal Tokens (`acta_tk_v1:<tenant>[:<login>]:<mac>`) + `X-Acta-Tenant` locking
@@ -119,7 +119,7 @@ def _enforce_guarded_compile(
 
 
 class ActaClient:
-    """Synchronous Zero-Trust client for Acta Compiler v1.7.1."""
+    """Synchronous Zero-Trust client for Acta Compiler v1.7.2."""
 
     def __init__(
         self,
@@ -347,6 +347,7 @@ class ActaClient:
         *,
         claim_id: str,
         reason: str,
+        scope: str | None = None,
         tenant_id: str | None = None,
         tombstone_id: str | None = None,
         client_signature_hex: str | None = None,
@@ -358,6 +359,8 @@ class ActaClient:
             "claim_id": str(claim_id),
             "reason": reason,
         }
+        if scope is not None:
+            req["scope"] = scope
         if tombstone_id is not None:
             req["id"] = tombstone_id
         if client_signature_hex is not None:
@@ -987,7 +990,7 @@ class ActaClient:
 
 
 class AsyncActaClient:
-    """Asynchronous Zero-Trust client for Acta Compiler v1.7.1 (requires `httpx`)."""
+    """Asynchronous Zero-Trust client for Acta Compiler v1.7.2 (requires `httpx`)."""
 
     def __init__(
         self,

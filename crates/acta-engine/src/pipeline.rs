@@ -18,8 +18,13 @@ use chrono::{DateTime, SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
 use uuid::Uuid;
 
-use crate::budget::{apply_budget_and_omissions, apply_budget_and_omissions_with_mode, count_tokens, encode_token_spans};
-use crate::resolver::{resolve_claims_with_overrides, resolve_claims_with_overrides_v171_compat, ResolverConfig};
+use crate::budget::{
+    apply_budget_and_omissions, apply_budget_and_omissions_with_mode, count_tokens,
+    encode_token_spans,
+};
+use crate::resolver::{
+    resolve_claims_with_overrides, resolve_claims_with_overrides_v172_compat, ResolverConfig,
+};
 
 /// Computes the deterministic state watermark timestamp across all evaluated objects, claims,
 /// and signed dispute overrides in `(tenant_id, scope)` so repeated compiles over unchanged vault
@@ -98,13 +103,14 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Compatibility flags for reproducing historical pre-`v1.6.7` `source_bundle_hash` baselines bit-for-bit.
+/// Compatibility flags for reproducing historical `source_bundle_hash` baselines bit-for-bit (`seq 1..head`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimulationCompat {
     pub include_resolver_manifest: bool,
     pub legacy_pre_v166_disputes: bool,
     pub include_resolved_facts_omitted: bool,
     pub legacy_pre_v171_resolver: bool,
+    pub legacy_v171_bidirectional_contradiction: bool,
 }
 
 impl Default for SimulationCompat {
@@ -114,6 +120,19 @@ impl Default for SimulationCompat {
             legacy_pre_v166_disputes: false,
             include_resolved_facts_omitted: true,
             legacy_pre_v171_resolver: false,
+            legacy_v171_bidirectional_contradiction: false,
+        }
+    }
+}
+
+impl SimulationCompat {
+    pub fn resolver_compat_label(&self) -> &'static str {
+        if self.legacy_pre_v171_resolver {
+            "legacy_pre_v171"
+        } else if self.legacy_v171_bidirectional_contradiction {
+            "legacy_v171"
+        } else {
+            "v172_current"
         }
     }
 }
@@ -268,6 +287,7 @@ impl<S: CompileStore> CompilePipeline<S> {
                 legacy_pre_v166_disputes: false,
                 include_resolved_facts_omitted: true,
                 legacy_pre_v171_resolver: false,
+                legacy_v171_bidirectional_contradiction: false,
             },
         )
         .await
@@ -397,26 +417,30 @@ impl<S: CompileStore> CompilePipeline<S> {
             .collect();
 
         let resolver_cfg = resolver_override.unwrap_or_else(|| self.config.resolver.clone());
-        let resolver_out = resolve_claims_with_overrides_v171_compat(
+        let resolver_out = resolve_claims_with_overrides_v172_compat(
             scoped_claims,
             &active_overrides,
             eval_wall_clock,
             &resolver_cfg,
             compat.legacy_pre_v166_disputes,
             compat.legacy_pre_v171_resolver,
+            compat.legacy_v171_bidirectional_contradiction,
         );
 
-        let mut pre_excluded = object_scan.excluded_objects;
+        let mut pre_excluded = Vec::new();
         if compat.legacy_pre_v171_resolver {
-            pre_excluded.extend(superseded_claims.into_iter().map(|(id, r)| {
+            let map_legacy_reason = |(id, r): (Uuid, OmissionReason)| {
                 let mapped = match r {
                     OmissionReason::Retracted => OmissionReason::Superseded,
                     OmissionReason::RetractionTombstone => OmissionReason::LifecycleExpired,
                     other => other,
                 };
                 (id, mapped)
-            }));
+            };
+            pre_excluded.extend(object_scan.excluded_objects.into_iter().map(map_legacy_reason));
+            pre_excluded.extend(superseded_claims.into_iter().map(map_legacy_reason));
         } else {
+            pre_excluded.extend(object_scan.excluded_objects);
             pre_excluded.extend(superseded_claims);
         }
         pre_excluded.extend(resolver_out.excluded_claims);
@@ -522,6 +546,8 @@ impl<S: CompileStore> CompilePipeline<S> {
                     ),
                     scope_state_commitment: None,
                     attempted_checkpoint_hash: None,
+                    signing_domain: None,
+                    expected_intent_digest_hex: None,
                 };
                 let evidence = self
                     .store
@@ -556,6 +582,8 @@ impl<S: CompileStore> CompilePipeline<S> {
                     ),
                     scope_state_commitment: None,
                     attempted_checkpoint_hash: None,
+                    signing_domain: None,
+                    expected_intent_digest_hex: None,
                 };
                 let evidence = self
                     .store
@@ -731,6 +759,8 @@ impl<S: CompileStore> CompilePipeline<S> {
                     summary: msg.clone(),
                     scope_state_commitment: Some(state_commitment),
                     attempted_checkpoint_hash: None,
+                    signing_domain: None,
+                    expected_intent_digest_hex: None,
                 };
                 let ev = self
                     .store

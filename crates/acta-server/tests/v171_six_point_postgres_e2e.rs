@@ -78,7 +78,7 @@ async fn test_v171_all_six_open_items_and_offline_rebuild_e2e() {
 
     // 0. Check acta_whoami -> version 1.7.1
     let who0 = mcp_rpc(&app, &token, "acta_whoami", json!({})).await;
-    assert_eq!(who0["result"]["structuredContent"]["version"], json!("1.7.1"));
+    assert_eq!(who0["result"]["structuredContent"]["version"], json!("1.7.2"));
     assert_eq!(who0["result"]["structuredContent"]["head_witnessed"], json!(false));
 
     // =========================================================================

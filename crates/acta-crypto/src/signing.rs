@@ -87,6 +87,19 @@ pub fn checkpoint_signing_preimage(tenant: &str, checkpoint_hash: &[u8; 32]) -> 
     *blake3::hash(&preimage).as_bytes()
 }
 
+pub fn rebuild_header_signing_preimage_bytes(tenant: &str, header_hash: &[u8; 32]) -> Vec<u8> {
+    encode_length_delimited(&[
+        b"acta:rebuild_sig:v1",
+        tenant.as_bytes(),
+        header_hash.as_slice(),
+    ])
+}
+
+pub fn rebuild_header_signing_preimage(tenant: &str, header_hash: &[u8; 32]) -> [u8; 32] {
+    let preimage = rebuild_header_signing_preimage_bytes(tenant, header_hash);
+    *blake3::hash(&preimage).as_bytes()
+}
+
 pub fn witness_anchor_signing_preimage_bytes(
     tenant: &str,
     tree_size: i64,
@@ -214,6 +227,31 @@ pub fn verify_checkpoint_signature(
         return false;
     }
     let digest = checkpoint_signing_preimage(tenant, checkpoint_hash);
+    let sig = Signature::from_bytes(signature_bytes);
+    verifying_key.verify_strict(&digest, &sig).is_ok()
+}
+
+/// Signs a `StateRebuildArchive` header (`b"acta:rebuild_sig:v1"`, `v1.7.2+`).
+pub fn sign_rebuild_archive_header(
+    host_key: &SigningKey,
+    tenant: &str,
+    header_hash: &[u8; 32],
+) -> [u8; 64] {
+    let digest = rebuild_header_signing_preimage(tenant, header_hash);
+    host_key.sign(&digest).to_bytes()
+}
+
+/// Strictly verifies a host Ed25519 signature over `(tenant, header_hash)` (`b"acta:rebuild_sig:v1"`).
+pub fn verify_rebuild_archive_header_signature(
+    verifying_key: &VerifyingKey,
+    tenant: &str,
+    header_hash: &[u8; 32],
+    signature_bytes: &[u8; 64],
+) -> bool {
+    if verifying_key.is_weak() {
+        return false;
+    }
+    let digest = rebuild_header_signing_preimage(tenant, header_hash);
     let sig = Signature::from_bytes(signature_bytes);
     verifying_key.verify_strict(&digest, &sig).is_ok()
 }

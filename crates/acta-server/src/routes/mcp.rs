@@ -90,7 +90,7 @@ fn mcp_tools_schema() -> Value {
                     "scope": { "type": "string" },
                     "lifecycle_status": {
                         "type": "string",
-                        "enum": ["active", "archived", "revoked"],
+                        "enum": ["active", "revoked", "expired", "superseded"],
                         "default": "active"
                     },
                     "priority": { "type": "integer", "minimum": -1000, "maximum": 1000, "default": 50 },
@@ -146,7 +146,7 @@ fn mcp_tools_schema() -> Value {
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["active", "superseded", "revoked", "archived"],
+                        "enum": ["active", "revoked", "expired", "superseded"],
                         "default": "active"
                     },
                     "predecessor_id": {
@@ -185,6 +185,10 @@ fn mcp_tools_schema() -> Value {
                 "required": ["claim_id", "reason"],
                 "properties": {
                     "tenant_id": { "type": "string" },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional scope assertion; when provided, verified against target claim scope before retraction."
+                    },
                     "claim_id": {
                         "type": "string",
                         "description": "UUID of the claim to retract."
@@ -663,7 +667,20 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
                 return build_mcp_oauth_401(&state, &headers, &err);
             }
             Ok(false) => {
-                return apply_oauth_cors(StatusCode::METHOD_NOT_ALLOWED.into_response());
+                let sse_payload = concat!(
+                    "event: message\n",
+                    "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n\n"
+                );
+                let mut resp = (StatusCode::OK, sse_payload).into_response();
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
+                );
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+                );
+                return apply_oauth_cors(resp);
             }
         }
     }
@@ -697,7 +714,7 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
         },
         "serverInfo": {
             "name": "acta-compiler-mcp",
-            "version": "1.7.1",
+            "version": "1.7.2",
             "merkle_checkpoint_scheme": "rfc6962-sha256-v1",
             "host_public_key": hex::encode(state.host_public_key),
             "permission_root": hex::encode(state.policy_gate.permission_root()),
@@ -706,21 +723,29 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
         },
         "tools": mcp_tools_schema()
     });
-    apply_oauth_cors((StatusCode::OK, Json(body)).into_response())
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    apply_oauth_cors(resp)
 }
 
 fn jsonrpc_ok(id: Value, result: Value) -> Response {
-    apply_oauth_cors(
-        (
-            StatusCode::OK,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result
-            })),
-        )
-            .into_response(),
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })),
     )
+        .into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    apply_oauth_cors(resp)
 }
 
 fn jsonrpc_err(id: Value, code: i64, msg: impl Into<String>) -> Response {
@@ -787,7 +812,7 @@ pub async fn handle_mcp_rpc(
                     },
                     "serverInfo": {
                         "name": "acta-compiler-mcp",
-                        "version": "1.7.1"
+                        "version": "1.7.2"
                     }
                 }),
             )
@@ -820,19 +845,35 @@ pub async fn handle_mcp_rpc(
                         "isError": false
                     }),
                 ),
-                Err(err_msg) => jsonrpc_ok(
-                    id,
-                    json!({
-                        "content": [{
-                            "type": "text",
-                            "text": format!("ERROR: {err_msg}")
-                        }],
-                        "isError": true
-                    }),
-                ),
+                Err(err_obj) => {
+                    let err_json = err_obj.to_json_body();
+                    jsonrpc_ok(
+                        id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": format!("ERROR: {}", err_obj.message)
+                            }],
+                            "structuredContent": err_json,
+                            "isError": true
+                        }),
+                    )
+                }
             }
         }
         other => jsonrpc_err(id, -32601, format!("unsupported MCP method: {other}")),
+    }
+}
+
+impl From<String> for crate::routes::ApiError {
+    fn from(s: String) -> Self {
+        crate::routes::ApiError::bad_request(s)
+    }
+}
+
+impl From<&str> for crate::routes::ApiError {
+    fn from(s: &str) -> Self {
+        crate::routes::ApiError::bad_request(s)
     }
 }
 
@@ -841,7 +882,7 @@ async fn dispatch_mcp_tool(
     headers: HeaderMap,
     tool_name: &str,
     args: Value,
-) -> Result<Value, String> {
+) -> Result<Value, crate::routes::ApiError> {
     match tool_name {
         "acta_whoami" => {
             let info = state.inspect_caller_auth(&headers)?;
@@ -1025,7 +1066,7 @@ async fn dispatch_mcp_tool(
             let cfg = state.pipeline.config();
             Ok(json!({
                 "connected": true,
-                "version": "1.7.1",
+                "version": "1.7.2",
                 "merkle_checkpoint_scheme": "rfc6962-sha256-v1",
                 "key_kind": key_kind,
                 "locked_tenant": locked_tenant,
@@ -1115,7 +1156,7 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_compile(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
+                ?;
             let mut val = serde_json::to_value(&resp).map_err(|e| e.to_string())?;
             if include_token_spans && resp.context_token_ids.is_none() {
                 if let Some(ref txt) = resp.context_text {
@@ -1150,9 +1191,9 @@ async fn dispatch_mcp_tool(
                 Some(Value::String(s)) if s.trim().is_empty() => LifecycleStatus::Active,
                 Some(Value::String(s)) => LifecycleStatus::from_db_str(s.trim())?,
                 Some(other) => {
-                    return Err(format!(
-                        "lifecycle_status must be a string ('active', 'archived', 'revoked'), got {other}"
-                    ))
+                    return Err(crate::routes::ApiError::bad_request(format!(
+                        "lifecycle_status must be a string ('active', 'revoked', 'expired', 'superseded'), got {other}"
+                    )))
                 }
             };
             let raw_priority = match args.get("priority") {
@@ -1178,7 +1219,7 @@ async fn dispatch_mcp_tool(
                     out
                 }
                 Some(Value::Null) | None => Vec::new(),
-                _ => return Err("tags must be an array of strings".to_string()),
+                _ => return Err(crate::routes::ApiError::bad_request("tags must be an array of strings")),
             };
             let body = args.get("body").cloned().unwrap_or_else(|| json!({}));
             let predecessor_id =
@@ -1210,8 +1251,8 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_ingest_object(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_ingest_claim" => {
             let tenant_id = state
@@ -1272,9 +1313,9 @@ async fn dispatch_mcp_tool(
                 Some(Value::String(s)) if s.trim().is_empty() => LifecycleStatus::Active,
                 Some(Value::String(s)) => LifecycleStatus::from_db_str(s.trim())?,
                 Some(other) => {
-                    return Err(format!(
-                        "status must be a string ('active', 'superseded', 'revoked', 'archived'), got {other}"
-                    ))
+                    return Err(crate::routes::ApiError::bad_request(format!(
+                        "status must be a string ('active', 'revoked', 'expired', 'superseded'), got {other}"
+                    )))
                 }
             };
             let predecessor_id =
@@ -1295,9 +1336,9 @@ async fn dispatch_mcp_tool(
                     out
                 }
                 Some(other) => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "contradiction_ids must be an array of UUID strings, got {other}"
-                    ))
+                    )))
                 }
             };
             let valid_from = parse_optional_rfc3339_field(
@@ -1341,8 +1382,8 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_ingest_claim(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_retract_claim" => {
             let tenant_id = state
@@ -1372,9 +1413,14 @@ async fn dispatch_mcp_tool(
                 .and_then(Value::as_str)
                 .map(str::to_string);
 
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let req = RetractClaimRequest {
                 id: None,
                 tenant_id,
+                scope,
                 claim_id,
                 reason,
                 client_signature_hex,
@@ -1383,8 +1429,8 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_retract_claim(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_attest_override" => {
             let tenant_id = state
@@ -1441,8 +1487,8 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_attest_override(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_cache_answer" => {
             let tenant_id = state
@@ -1478,9 +1524,9 @@ async fn dispatch_mcp_tool(
                 None | Some(Value::Null) => None,
                 Some(v @ Value::Object(_)) => Some(v.clone()),
                 Some(other) => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "answer_metadata must be a JSON object when provided, got {other}"
-                    ))
+                    )))
                 }
             };
             let ttl_seconds = match args.get("ttl_seconds") {
@@ -1490,7 +1536,7 @@ async fn dispatch_mcp_tool(
                         format!("ttl_seconds must be a positive integer, got {v}")
                     })?;
                     if n <= 0 {
-                        return Err(format!("ttl_seconds must be >= 1 (got {n})"));
+                        return Err(crate::routes::ApiError::bad_request(format!("ttl_seconds must be >= 1 (got {n})")));
                     }
                     Some(u64::try_from(n).map_err(|_| "ttl_seconds overflow")?)
                 }
@@ -1524,9 +1570,9 @@ async fn dispatch_mcp_tool(
                     Some(ids)
                 }
                 Some(other) => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "dependency_ids must be an array of UUID strings, got {other}"
-                    ))
+                    )))
                 }
             };
 
@@ -1548,8 +1594,8 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(resp)) = handle_cache_answer(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_lookup_cached_answer" => {
             let tenant_id = state
@@ -1593,8 +1639,8 @@ async fn dispatch_mcp_tool(
             let (_status, Json(resp)) =
                 handle_lookup_cached_answer(State(state), headers, Json(req))
                     .await
-                    .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                    ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_trace_claim_impact" => {
             let tenant_id = state
@@ -1615,8 +1661,8 @@ async fn dispatch_mcp_tool(
             let Json(resp) =
                 handle_trace_item_impact(State(state), Path((tenant_id, raw_item_id)), headers)
                     .await
-                    .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                    ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_verify_state_rebuild" => {
             let tenant_id = state
@@ -1638,7 +1684,7 @@ async fn dispatch_mcp_tool(
                         format!("up_to_seq must be a positive integer, got {v}")
                     })?;
                     if s < 1 {
-                        return Err(format!("up_to_seq must be >= 1 (got {s})"));
+                        return Err(crate::routes::ApiError::bad_request(format!("up_to_seq must be >= 1 (got {s})")));
                     }
                     Some(s)
                 }
@@ -1659,8 +1705,8 @@ async fn dispatch_mcp_tool(
                 headers,
             )
             .await
-            .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+            ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_replay_counterfactual" => {
             let source_hash_opt = args
@@ -1723,6 +1769,7 @@ async fn dispatch_mcp_tool(
                         && orig_bundle.dispute_records.iter().all(|d| d.margin.is_none()),
                     include_resolved_facts_omitted: orig_bundle.resolved_facts_omitted.is_some(),
                     legacy_pre_v171_resolver: !has_v171_retraction_reasons,
+                    legacy_v171_bidirectional_contradiction: false,
                 };
                 (
                     orig_bundle.tenant_id,
@@ -1805,14 +1852,14 @@ async fn dispatch_mcp_tool(
                 .and_then(Value::as_f64);
             if let Some(m) = override_min {
                 if !m.is_finite() || !(0.0..=1.0).contains(&m) {
-                    return Err("override_min_confidence must be in [0.0, 1.0]".to_string());
+                    return Err(crate::routes::ApiError::bad_request("override_min_confidence must be in [0.0, 1.0]"));
                 }
             }
             if let Some(d) = override_dec {
                 if !d.is_finite() || !(0.0..=1.0).contains(&d) {
-                    return Err(
-                        "override_decisiveness_threshold must be in [0.0, 1.0]".to_string()
-                    );
+                    return Err(crate::routes::ApiError::bad_request(
+                        "override_decisiveness_threshold must be in [0.0, 1.0]",
+                    ));
                 }
             }
 
@@ -1842,38 +1889,55 @@ async fn dispatch_mcp_tool(
                 evaluation_time: pinned_time_opt,
             };
 
-            // Auto-detect whether `source_bundle_hash` was compiled under v1.7.1+ or pre-v1.7.1 resolver rules:
-            let mut modern_base_compat = base_compat;
-            modern_base_compat.legacy_pre_v171_resolver = false;
+            // Auto-detect whether `source_bundle_hash` was compiled under v1.7.2, v1.7.1 (bidirectional contradiction), or pre-v1.7.1:
+            let mut active_base_compat = base_compat;
+            active_base_compat.legacy_pre_v171_resolver = false;
+            active_base_compat.legacy_v171_bidirectional_contradiction = false;
             let mut base_sim = state
                 .pipeline
                 .simulate_compile_with_compat(
                     base_req.clone(),
                     None,
                     Some(base_res),
-                    modern_base_compat,
+                    active_base_compat,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let mut resolved_legacy_v171 = false;
             if let Some(src_hex) = source_hash_opt {
-                if base_sim.bundle_hash.map(hex::encode).as_deref() != Some(src_hex)
-                    && base_compat.legacy_pre_v171_resolver
-                {
-                    let leg_sim = state
+                if base_sim.bundle_hash.map(hex::encode).as_deref() != Some(src_hex) {
+                    let mut v171_compat = active_base_compat;
+                    v171_compat.legacy_v171_bidirectional_contradiction = true;
+                    let v171_sim = state
                         .pipeline
                         .simulate_compile_with_compat(
-                            base_req,
+                            base_req.clone(),
                             None,
                             Some(base_res),
-                            base_compat,
+                            v171_compat,
                         )
                         .await
                         .map_err(|e| e.to_string())?;
-                    if leg_sim.bundle_hash.map(hex::encode).as_deref() == Some(src_hex) {
-                        base_sim = leg_sim;
-                        resolved_legacy_v171 = true;
+                    if v171_sim.bundle_hash.map(hex::encode).as_deref() == Some(src_hex) {
+                        base_sim = v171_sim;
+                        active_base_compat = v171_compat;
+                    } else if base_compat.legacy_pre_v171_resolver {
+                        let mut pre_v171_compat = base_compat;
+                        pre_v171_compat.legacy_v171_bidirectional_contradiction = true;
+                        let leg_sim = state
+                            .pipeline
+                            .simulate_compile_with_compat(
+                                base_req,
+                                None,
+                                Some(base_res),
+                                pre_v171_compat,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if leg_sim.bundle_hash.map(hex::encode).as_deref() == Some(src_hex) {
+                            base_sim = leg_sim;
+                            active_base_compat = pre_v171_compat;
+                        }
                     }
                 }
             }
@@ -1882,17 +1946,20 @@ async fn dispatch_mcp_tool(
                 override_min.is_none() && override_dec.is_none() && explicit_budget.is_none();
             let cf_compat = acta_engine::SimulationCompat {
                 include_resolver_manifest: if no_cf_overrides {
-                    base_compat.include_resolver_manifest
+                    active_base_compat.include_resolver_manifest
                 } else {
                     true
                 },
                 legacy_pre_v166_disputes: false,
                 include_resolved_facts_omitted: if no_cf_overrides {
-                    base_compat.include_resolved_facts_omitted
+                    active_base_compat.include_resolved_facts_omitted
                 } else {
                     true
                 },
-                legacy_pre_v171_resolver: no_cf_overrides && resolved_legacy_v171,
+                legacy_pre_v171_resolver: no_cf_overrides
+                    && active_base_compat.legacy_pre_v171_resolver,
+                legacy_v171_bidirectional_contradiction: no_cf_overrides
+                    && active_base_compat.legacy_v171_bidirectional_contradiction,
             };
 
             let cf_sim = state
@@ -2019,6 +2086,8 @@ async fn dispatch_mcp_tool(
 
             let mut out_json = json!({
                 "replay_valid": replay_valid,
+                "resolver_compat": active_base_compat.resolver_compat_label(),
+                "counterfactual_resolver_compat": cf_compat.resolver_compat_label(),
                 "pinned_task_id": task_id,
                 "pinned_evaluation_time": effective_issued_at,
                 "baseline_policy_decision": base_sim.policy_decision,
@@ -2079,9 +2148,9 @@ async fn dispatch_mcp_tool(
                 ];
                 for key in obj.keys() {
                     if !ALLOWED_KEYS.contains(&key.as_str()) {
-                        return Err(format!(
+                        return Err(crate::routes::ApiError::bad_request(format!(
                             "unknown argument '{key}' on acta_verify_bundle (supported: tenant_id, bundle_hash, proof_mode, from_seq, limit, anchor_tree_size, anchored_tree_size, include_archive, dump_preimages)"
-                        ));
+                        )));
                     }
                 }
             }
@@ -2109,9 +2178,9 @@ async fn dispatch_mcp_tool(
                 "" | "full" => true,
                 "merkle" => false,
                 other => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "invalid proof_mode '{other}' (expected 'full' or 'merkle')"
-                    ))
+                    )))
                 }
             };
             let chain_from_seq = match args.get("from_seq").or_else(|| args.get("chain_from_seq")) {
@@ -2120,7 +2189,7 @@ async fn dispatch_mcp_tool(
                         format!("from_seq must be an integer >= 1, got {v}")
                     })?;
                     if s < 1 {
-                        return Err(format!("from_seq must be >= 1 (got {s})"));
+                        return Err(crate::routes::ApiError::bad_request(format!("from_seq must be >= 1 (got {s})")));
                     }
                     s
                 }
@@ -2132,7 +2201,7 @@ async fn dispatch_mcp_tool(
                         format!("limit must be an integer in 1..=500, got {v}")
                     })?;
                     if !(1..=500).contains(&lim) {
-                        return Err(format!("limit must be between 1 and 500 (got {lim})"));
+                        return Err(crate::routes::ApiError::bad_request(format!("limit must be between 1 and 500 (got {lim})")));
                     }
                     lim
                 }
@@ -2152,9 +2221,9 @@ async fn dispatch_mcp_tool(
             };
             let anchor_tree_size = match (opt_anchor, opt_anchored) {
                 (Some(a), Some(b)) if a != b => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "conflicting anchor_tree_size ({a}) and anchored_tree_size ({b}); pass one or matching values"
-                    ));
+                    )));
                 }
                 (a, b) => a.or(b),
             };
@@ -2173,7 +2242,7 @@ async fn dispatch_mcp_tool(
                 anchor_tree_size,
             )
             .await
-            .map_err(|e| e.message)?;
+            ?;
 
             let default_include = archive.objects.len() + archive.claims.len() <= 64;
             let include_archive = args
@@ -2200,7 +2269,7 @@ async fn dispatch_mcp_tool(
                     let suffix = ev_seq
                         .map(|n| format!(" [logged at evidence seq_num={n}]"))
                         .unwrap_or_default();
-                    return Err(format!("{err}{suffix}"));
+                    return Err(crate::routes::ApiError::bad_request(format!("{err}{suffix}")));
                 }
             };
 
@@ -2295,8 +2364,8 @@ async fn dispatch_mcp_tool(
                 headers,
             )
             .await
-            .map_err(|e| e.message)?;
-            serde_json::to_value(ev).map_err(|e| e.to_string())
+            ?;
+            serde_json::to_value(ev).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_get_checkpoint" => {
             let tenant_id = state
@@ -2333,7 +2402,7 @@ async fn dispatch_mcp_tool(
                 headers,
             )
             .await
-            .map_err(|e| e.message)?;
+            ?;
 
             let mut verified = true;
             if let Some(ref sth) = cp_resp.checkpoint {
@@ -2388,8 +2457,8 @@ async fn dispatch_mcp_tool(
             let (_status, Json(resp)) =
                 handle_register_witness(State(state), headers, Json(req))
                     .await
-                    .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                    ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_revoke_witness" => {
             let tenant_id = state
@@ -2414,9 +2483,9 @@ async fn dispatch_mcp_tool(
             let raw_rev_mode = args.get("revocation_mode").and_then(Value::as_str);
             let mode = match (raw_mode, raw_rev_mode) {
                 (Some(a), Some(b)) if a.trim() != b.trim() => {
-                    return Err(format!(
+                    return Err(crate::routes::ApiError::bad_request(format!(
                         "conflicting mode ('{a}') and revocation_mode ('{b}') on acta_revoke_witness"
-                    ));
+                    )));
                 }
                 (a, b) => a.or(b).map(str::to_string),
             };
@@ -2431,8 +2500,8 @@ async fn dispatch_mcp_tool(
             let (_status, Json(resp)) =
                 handle_revoke_witness(State(state), headers, Json(req))
                     .await
-                    .map_err(|e| e.message)?;
-            serde_json::to_value(resp).map_err(|e| e.to_string())
+                    ?;
+            serde_json::to_value(resp).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
         "acta_anchor_checkpoint" => {
             let tenant_id = state
@@ -2485,9 +2554,9 @@ async fn dispatch_mcp_tool(
 
             let (_status, Json(anchor)) = handle_anchor_checkpoint(State(state), headers, Json(req))
                 .await
-                .map_err(|e| e.message)?;
-            serde_json::to_value(anchor).map_err(|e| e.to_string())
+                ?;
+            serde_json::to_value(anchor).map_err(|e| crate::routes::ApiError::bad_request(e.to_string()))
         }
-        unknown => Err(format!("unknown MCP tool: {unknown}")),
+        unknown => Err(crate::routes::ApiError::bad_request(format!("unknown MCP tool: {unknown}"))),
     }
 }

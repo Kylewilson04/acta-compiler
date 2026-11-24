@@ -427,7 +427,7 @@ pub async fn retract_claim_with_evidence_tx(
                c.predecessor_id, c.client_signature, c.client_public_key,
                c.retraction_reason, c.written_by, c.evidence_seq_num, c.created_at,
                FALSE AS is_superseded,
-                   FALSE AS is_retracted
+               FALSE AS is_retracted
         FROM knowledge_claims c
         WHERE c.tenant_id = $1 AND c.id = $2
         "#,
@@ -455,7 +455,7 @@ pub async fn retract_claim_with_evidence_tx(
                c.predecessor_id, c.client_signature, c.client_public_key,
                c.retraction_reason, c.written_by, c.evidence_seq_num, c.created_at,
                FALSE AS is_superseded,
-                   FALSE AS is_retracted
+               FALSE AS is_retracted
         FROM knowledge_claims c
         WHERE c.tenant_id = $1 AND c.predecessor_id = $2
         ORDER BY c.version DESC, c.created_at DESC
@@ -474,6 +474,7 @@ pub async fn retract_claim_with_evidence_tx(
         if succ_claim.status == ClaimStatus::Revoked
             && succ_claim.retraction_reason.as_deref() == Some(reason)
             && succ_claim.written_by.as_deref() == Some(retracted_by)
+            && succ_claim.client_public_key == client_public_key
         {
             if let Some(ex_seq) = succ_claim.evidence_seq_num {
                 if let Some(ex_ev) = fetch_evidence_by_seq(pool, tenant_id, ex_seq).await? {
@@ -677,7 +678,7 @@ pub async fn fetch_claim_by_id(
                c.predecessor_id, c.client_signature, c.client_public_key,
                c.retraction_reason, c.written_by, c.evidence_seq_num, c.created_at,
                FALSE AS is_superseded,
-                   FALSE AS is_retracted
+               FALSE AS is_retracted
         FROM knowledge_claims c
         WHERE c.tenant_id = $1 AND c.id = $2
         "#,
@@ -710,7 +711,7 @@ pub async fn fetch_claims_by_ids(
                c.predecessor_id, c.client_signature, c.client_public_key,
                c.retraction_reason, c.written_by, c.evidence_seq_num, c.created_at,
                FALSE AS is_superseded,
-                   FALSE AS is_retracted
+               FALSE AS is_retracted
         FROM knowledge_claims c
         WHERE c.tenant_id = $1 AND c.id = ANY($2)
         ORDER BY c.id ASC
@@ -800,7 +801,7 @@ pub async fn fetch_all_active_claim_hashes_in_scope(
     scope: &str,
     now: DateTime<Utc>,
 ) -> ActaResult<Vec<[u8; 32]>> {
-    let raw_hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
+    let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
         r#"
         SELECT c.content_hash
         FROM knowledge_claims c
@@ -814,7 +815,7 @@ pub async fn fetch_all_active_claim_hashes_in_scope(
               WHERE succ.tenant_id = c.tenant_id
                 AND succ.predecessor_id = c.id
           )
-        ORDER BY c.id ASC
+        ORDER BY c.content_hash ASC
         "#,
     )
     .bind(tenant_id)
@@ -824,11 +825,12 @@ pub async fn fetch_all_active_claim_hashes_in_scope(
     .await
     .map_err(|e| ActaError::Storage(format!("fetch_all_active_claim_hashes_in_scope failed: {e}")))?;
 
-    raw_hashes
-        .into_iter()
-        .map(|(v,)| {
-            v.try_into()
-                .map_err(|_| ActaError::Storage("claim content_hash is not 32 bytes".to_string()))
-        })
-        .collect()
+    let mut hashes = Vec::with_capacity(rows.len());
+    for (raw,) in rows {
+        let arr: [u8; 32] = raw.try_into().map_err(|_| {
+            ActaError::Storage("active claim content_hash is not 32 bytes".to_string())
+        })?;
+        hashes.push(arr);
+    }
+    Ok(hashes)
 }

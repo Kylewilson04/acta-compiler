@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
 use acta_store::{
-    claims_repo,
     evidence_repo::{self, TenantLookupScope},
     objects_repo, overrides_repo,
 };
@@ -36,8 +35,9 @@ impl ExportQueryParams {
     }
 }
 
-/// Builds an `ExportArchive` enforcing zero-oracle tenant scoping (`v1.6.7+`) and never mutating
-/// `evidence_history` on malformed hex, wrong-length hex, `not_found`, or selector validation errors.
+/// Builds an `ExportArchive` enforcing zero-oracle tenant scoping (`v1.6.7+`), including every
+/// corroborating claim in the winning `ValueBucket` (`v1.7.2+`, Must-Fix 2) so damped noisy-OR
+/// `effective_confidence` is 100% recomputable offline.
 pub async fn build_export_archive_scoped(
     state: &AppState,
     bundle_hash_hex: &str,
@@ -87,28 +87,22 @@ pub async fn build_export_archive_scoped(
         .into_iter()
         .collect();
 
-    let mut claim_id_set = BTreeSet::new();
     let mut override_id_set = BTreeSet::new();
     for res in &bundle.resolution_records {
-        claim_id_set.insert(res.winning_claim.id);
         if let Some(ref ovr) = res.override_attestation {
             override_id_set.insert(ovr.attestation_id);
         }
     }
     for disp in &bundle.dispute_records {
-        for cand in &disp.competing_claims {
-            claim_id_set.insert(cand.id);
-        }
         if let Some(ref lapsed) = disp.lapsed_override {
             override_id_set.insert(lapsed.attestation_id);
         }
     }
-    let claim_ids: Vec<Uuid> = claim_id_set.into_iter().collect();
     let override_ids: Vec<Uuid> = override_id_set.into_iter().collect();
 
     let (objects, claims, override_attestations) = tokio::try_join!(
         objects_repo::fetch_objects_by_ids(&state.pool, &bundle.tenant_id, &object_ids),
-        claims_repo::fetch_claims_by_ids(&state.pool, &bundle.tenant_id, &claim_ids),
+        evidence_repo::fetch_bundle_verifiable_claims(&state.pool, &bundle.tenant_id, &bundle),
         overrides_repo::fetch_overrides_by_ids(&state.pool, &bundle.tenant_id, &override_ids),
     )?;
 

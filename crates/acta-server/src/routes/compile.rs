@@ -64,7 +64,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
             Json(serde_json::json!({
                 "status": "ok",
                 "service": "acta-compiler",
-                "version": "1.7.1",
+                "version": "1.7.2",
                 "host_public_key": hex::encode(state.host_public_key),
                 "permission_root": hex::encode(state.policy_gate.permission_root()),
                 "auth_mode": if state.api_key.is_some() { "mcp_oauth21_github_and_blake3_mac" } else { "open" },

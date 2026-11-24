@@ -32,6 +32,8 @@ export interface RefusalMetadata {
   summary: string;
   scope_state_commitment?: string | null;
   attempted_checkpoint_hash?: string | null;
+  signing_domain?: string | null;
+  expected_intent_digest_hex?: string | null;
 }
 
 export interface OverrideLedgerSummary {
@@ -130,6 +132,7 @@ export interface VerificationSummary {
   state_commitment_hex: string;
   verified_objects: number;
   verified_claims: number;
+  verified_corroborated_resolutions?: number;
   verified_overrides: number;
   verified_writes: number;
   verified_answer_caches: number;
@@ -600,3 +603,41 @@ export declare function verifyAndRebuildScopeStateOffline(
   expectedPubkeyHex: string,
   scopeOverride?: string
 ): Record<string, any>;
+
+export declare const REBUILD_HEADER_DOMAIN_V1: string;
+export declare const REBUILD_SIG_DOMAIN_V1: string;
+export declare function rebuildArchiveHeaderPreimageBytes(params: {
+  schemaVersion?: string;
+  tenantId: string;
+  scope: string;
+  upToSeq: number | bigint;
+  evaluatedAt: string | bigint;
+  permissionRoot: string | Uint8Array;
+}): Uint8Array;
+export declare function computeRebuildArchiveHeaderHash(params: {
+  schemaVersion?: string;
+  tenantId: string;
+  scope: string;
+  upToSeq: number | bigint;
+  evaluatedAt: string | bigint;
+  permissionRoot: string | Uint8Array;
+}): string;
+export declare function signRebuildArchiveHeader(
+  seedHexOrBytes: string | Uint8Array,
+  tenantId: string,
+  headerHash: string | Uint8Array
+): string;
+export declare function verifyRebuildArchiveHeaderSignature(
+  pubkeyHexOrBytes: string | Uint8Array,
+  tenantId: string,
+  headerHash: string | Uint8Array,
+  sigHexOrBytes: string | Uint8Array
+): boolean;
+export declare function claimsShareWinningValueBucket(
+  winner: Record<string, any>,
+  candidate: Record<string, any>
+): boolean;
+export declare function recomputeWinningBucketCorroboration(
+  bucketClaims: Array<Record<string, any>>,
+  damping?: number
+): { corroboratingCount: number; corroboratingSources: string[]; effectiveConfidence: number };

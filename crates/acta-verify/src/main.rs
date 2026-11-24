@@ -126,10 +126,11 @@ fn main() -> ExitCode {
         ) {
             Ok(summary) => {
                 println!(
-                    "REBUILT_VERIFIED tenant={} scope={} up_to_seq={} state_commitment={} intents={} memories={} claims={} superseded_or_retracted={} overrides={} writes={} evidence_entries={} merkle_root={} anchored_tree_size={} witness_anchors={}",
+                    "REBUILT_VERIFIED tenant={} scope={} up_to_seq={} header_hash={} state_commitment={} intents={} memories={} claims={} superseded_or_retracted={} overrides={} writes={} evidence_entries={} merkle_root={} anchored_tree_size={} witness_anchors={}",
                     summary.tenant_id,
                     summary.scope,
                     summary.verified_up_to_seq,
+                    summary.header_hash_hex,
                     summary.reconstructed_state_commitment_hex,
                     summary.reconstructed_active_intents,
                     summary.reconstructed_active_memories,
@@ -168,13 +169,14 @@ fn main() -> ExitCode {
     match verify_export_archive(&archive, &expected_pubkey) {
         Ok(summary) => {
             println!(
-                "VERIFIED tenant={} mode={} bundle_hash={} state_commitment={} objects={} claims={} overrides={} writes={} answer_caches={} refusals={} evidence_entries={} merkle_tree_size={} anchored_tree_size={} witness_anchors={} non_default_thresholds={}",
+                "VERIFIED tenant={} mode={} bundle_hash={} state_commitment={} objects={} claims={} corroborated_resolutions={} overrides={} writes={} answer_caches={} refusals={} evidence_entries={} merkle_tree_size={} anchored_tree_size={} witness_anchors={} non_default_thresholds={}",
                 summary.tenant_id,
                 summary.verification_mode,
                 summary.bundle_hash_hex,
                 summary.state_commitment_hex,
                 summary.verified_objects,
                 summary.verified_claims,
+                summary.verified_corroborated_resolutions,
                 summary.verified_overrides,
                 summary.verified_writes,
                 summary.verified_answer_caches,
@@ -355,6 +357,8 @@ mod tests {
             summary: "policy escalation required on ingest to restricted scope".to_string(),
             scope_state_commitment: None,
             attempted_checkpoint_hash: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
         };
         let rcomm = compute_refusal_metadata_commitment(&rmeta).unwrap();
         let event_1 = compute_evidence_event_hash_with_meta(

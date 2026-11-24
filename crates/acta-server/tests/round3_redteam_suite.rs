@@ -733,7 +733,7 @@ async fn test_v161_mcp_boundary_rejects_spoofed_adjudicator_weak_witness_and_for
     let whoami_res = mcp_call(&app, &token, "acta_whoami", json!({})).await;
     assert_eq!(whoami_res["result"]["isError"], json!(false));
     let whoami_sc = &whoami_res["result"]["structuredContent"];
-    assert_eq!(whoami_sc["version"], json!("1.7.1"));
+    assert_eq!(whoami_sc["version"], json!("1.7.2"));
     assert!(whoami_sc.get("cached_answer_count").is_some());
     assert!(whoami_sc.get("quarantined_anchor_count").is_some());
     assert!(whoami_sc.get("quarantined_anchors").is_some());
@@ -1821,6 +1821,7 @@ async fn test_v166_time_pinned_replay_lapsed_override_margin_and_anchor_refusal_
                 legacy_pre_v166_disputes: true,
                 include_resolved_facts_omitted: false,
                 legacy_pre_v171_resolver: false,
+                legacy_v171_bidirectional_contradiction: false,
             },
         )
         .await
@@ -1846,6 +1847,8 @@ async fn test_v166_time_pinned_replay_lapsed_override_margin_and_anchor_refusal_
         summary: "witness 'retired-w' has been retired (attempted_tree_size=98)".to_string(),
         scope_state_commitment: None,
         attempted_checkpoint_hash: Some([0x77; 32]),
+        signing_domain: None,
+        expected_intent_digest_hex: None,
     };
     let ev = store
         .append_refusal_metadata(
@@ -2268,6 +2271,7 @@ async fn test_v167_directives_escaping_validation_budget_and_parity() {
                 legacy_pre_v166_disputes: false,
                 include_resolved_facts_omitted: false,
                 legacy_pre_v171_resolver: false,
+                legacy_v171_bidirectional_contradiction: false,
             },
         )
         .await
@@ -2592,6 +2596,8 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
         invalidation_reason: None,
         observed_state_commitment: None,
         observed_dependency_commitment: None,
+        invalidated_by: None,
+        invalidator_auth_kind: None,
     };
     let ac_comm = compute_answer_cache_summary_commitment(&acs).unwrap();
     let ev4_hash = compute_evidence_event_hash_full(

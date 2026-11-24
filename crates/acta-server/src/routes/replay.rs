@@ -30,6 +30,7 @@ pub struct ReplayRequest {
 pub struct ReplayBranchSummary {
     pub policy_decision: PolicyDecision,
     pub permission_root: String,
+    pub resolver_compat: String,
     pub bundle_hash: Option<String>,
     pub state_commitment: Option<String>,
     pub dependency_commitment: Option<String>,
@@ -74,6 +75,7 @@ impl From<CompileSimulation> for ReplayBranchSummary {
         Self {
             policy_decision: sim.policy_decision,
             permission_root: hex::encode(sim.permission_root),
+            resolver_compat: "v172_current".to_string(),
             bundle_hash: sim.bundle_hash.map(hex::encode),
             state_commitment,
             dependency_commitment,

@@ -1,6 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 
-use acta_crypto::verify_and_rebuild_scope_state_offline;
+use acta_crypto::{
+    compute_rebuild_archive_header_hash, sign_rebuild_archive_header,
+    verify_and_rebuild_scope_state_offline,
+};
 use acta_types::{
     ActaError, ActaResult, ClaimStatus, ContextBundle, ImpactBundleRecord,
     ImpactedCachedAnswerRecord, LedgerStateRebuildResponse, LifecycleStatus, ObjectType,
@@ -143,7 +146,9 @@ struct ImpactedCacheRow {
     dependency_spec: Option<Value>,
     answer_hash: Vec<u8>,
     evidence_seq_num: i64,
+    expires_at: Option<DateTime<Utc>>,
     invalidation_evidence_seq_num: Option<i64>,
+    recorded_invalidation_reason: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -387,8 +392,9 @@ pub async fn trace_item_impact(
             r#"
             SELECT ca.id, ca.scope, ca.task_id, ca.query_hash, ca.source_bundle_hash,
                    ca.state_commitment, ca.validity_mode, ca.task_dependency_commitment,
-                   ca.dependency_spec, ca.answer_hash, ca.evidence_seq_num,
+                   ca.dependency_spec, ca.answer_hash, ca.evidence_seq_num, ca.expires_at,
                    cai.evidence_seq_num AS invalidation_evidence_seq_num,
+                   cai.invalidation_reason AS recorded_invalidation_reason,
                    ca.created_at
             FROM cached_answers ca
             LEFT JOIN cached_answer_invalidations cai
@@ -424,8 +430,11 @@ pub async fn trace_item_impact(
             let stored_sc: [u8; 32] = cr.state_commitment.try_into().map_err(|_| {
                 ActaError::Storage("cached_answers.state_commitment not 32 bytes".to_string())
             })?;
-            let is_invalidated = if cr.invalidation_evidence_seq_num.is_some() {
-                true
+            let (is_invalidated, invalidation_reason) = if cr.invalidation_evidence_seq_num.is_some()
+            {
+                (true, cr.recorded_invalidation_reason)
+            } else if cr.expires_at.is_some_and(|exp| now > exp) {
+                (true, Some("expired_ttl".to_string()))
             } else if cr.validity_mode == "dependency_subset" {
                 match (cr.task_dependency_commitment, cr.dependency_spec) {
                     (Some(raw_tdc), Some(raw_spec)) => {
@@ -446,13 +455,26 @@ pub async fn trace_item_impact(
                             None,
                         )
                         .await?;
-                        stored_tdc != live_tdc
+                        if stored_tdc != live_tdc {
+                            (true, Some("stale_dependency_commitment".to_string()))
+                        } else {
+                            (false, None)
+                        }
                     }
-                    _ => stored_sc != live_sc,
+                    _ => {
+                        if stored_sc != live_sc {
+                            (true, Some("stale_state_commitment".to_string()))
+                        } else {
+                            (false, None)
+                        }
+                    }
                 }
+            } else if stored_sc != live_sc {
+                (true, Some("stale_state_commitment".to_string()))
             } else {
-                stored_sc != live_sc
+                (false, None)
             };
+
             out.push(ImpactedCachedAnswerRecord {
                 cache_id: cr.id,
                 scope: cr.scope,
@@ -463,6 +485,7 @@ pub async fn trace_item_impact(
                 answer_hash: hex::encode(cr.answer_hash),
                 evidence_seq_num: cr.evidence_seq_num,
                 invalidated_by_state_change: is_invalidated,
+                invalidation_reason,
                 invalidation_evidence_seq_num: cr.invalidation_evidence_seq_num,
                 created_at: cr.created_at,
             });
@@ -491,7 +514,8 @@ pub async fn trace_item_impact(
     })
 }
 
-/// Verifies `evidence_history[1..=up_to_seq]` cryptographically (plus SignedTreeHead + witness anchors)
+/// Verifies `evidence_history[1..=up_to_seq]` cryptographically (plus SignedTreeHead + witness anchors
+/// + host-signed `StateRebuildArchive` header binding `(scope, up_to_seq, evaluated_at, permission_root)`)
 /// via standalone `verify_and_rebuild_scope_state_offline` and optionally returns the portable
 /// `StateRebuildArchive` for third-party offline verification (`acta-verify`, Python/TS SDKs).
 pub async fn rebuild_scope_state_from_ledger(
@@ -504,8 +528,6 @@ pub async fn rebuild_scope_state_from_ledger(
     up_to_seq: Option<i64>,
     include_proof_archive: bool,
 ) -> ActaResult<LedgerStateRebuildResponse> {
-    let evaluated_at = Utc::now().trunc_subsecs(6);
-
     let chain = evidence_repo::fetch_tenant_evidence_chain(pool, tenant_id, up_to_seq).await?;
     if let Some(req_seq) = up_to_seq {
         if (chain.len() as i64) != req_seq {
@@ -515,6 +537,13 @@ pub async fn rebuild_scope_state_from_ledger(
             )));
         }
     }
+
+    // When `up_to_seq` is specified, deterministically pin `evaluated_at` to `evidence_chain[up_to_seq - 1].created_at`
+    // so historical state rebuilds (`e.g. up_to_seq = 184`) are 100% clock-independent (`v1.7.2+`, Should-Fix 4)!
+    let evaluated_at = match (up_to_seq, chain.last()) {
+        (Some(_), Some(tail)) => tail.created_at.trunc_subsecs(6),
+        _ => Utc::now().trunc_subsecs(6),
+    };
 
     let effective_seq = chain.len() as i64;
     let scoped_overrides = overrides_repo::fetch_all_scoped_overrides_up_to_seq(
@@ -544,17 +573,23 @@ pub async fn rebuild_scope_state_from_ledger(
                     Some(ref a) if a.tree_size == sth.tree_size => None,
                     other => other,
                 };
-                (
-                    Some(sth),
-                    prior_only,
-                    cons_opt.unwrap_or_default(),
-                )
+                (Some(sth), prior_only, cons_opt.unwrap_or_default())
             } else {
                 (None, None, Vec::new())
             }
         } else {
             (None, None, Vec::new())
         };
+
+    let header_hash = compute_rebuild_archive_header_hash(
+        STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+        tenant_id,
+        scope,
+        effective_seq,
+        evaluated_at.timestamp_micros(),
+        permission_root,
+    );
+    let host_header_signature = sign_rebuild_archive_header(host_key, tenant_id, &header_hash);
 
     let archive = StateRebuildArchive {
         schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1.to_string(),
@@ -564,6 +599,8 @@ pub async fn rebuild_scope_state_from_ledger(
         evaluated_at,
         host_public_key: *host_public_key,
         permission_root: *permission_root,
+        header_hash,
+        host_header_signature,
         override_attestations: scoped_overrides,
         evidence_chain: chain,
         checkpoint,
@@ -625,6 +662,8 @@ pub async fn rebuild_scope_state_from_ledger(
         matches_live_store_bit_for_bit: up_to_seq.is_none()
             && offline.reconstructed_state_commitment_hex == live_sc_hex,
         evaluated_at,
+        header_hash: Some(hex::encode(header_hash)),
+        host_header_signature: Some(hex::encode(host_header_signature)),
         merkle_root: offline.merkle_root_hex,
         latest_anchored_tree_size: offline.anchored_tree_size,
         rebuild_proof_archive: if include_proof_archive {

@@ -196,7 +196,7 @@ pub struct OverrideAttestation {
     pub subject: String,
     pub predicate: String,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
-    pub source_bundle_hash: Option<[u8; 32]>,
+    pub source_bundle_hash: Option<[u8; 32],>,
     pub winning_claim_id: Uuid,
     #[serde(with = "hex_32")]
     pub winning_claim_content_hash: [u8; 32],
@@ -355,6 +355,8 @@ pub struct RetractClaimRequest {
     #[serde(default)]
     pub id: Option<Uuid>,
     pub tenant_id: String,
+    #[serde(default)]
+    pub scope: Option<String>,
     pub claim_id: Uuid,
     pub reason: String,
     #[serde(default)]

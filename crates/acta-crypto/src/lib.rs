@@ -13,26 +13,28 @@ pub use commitment::{
 pub use hash::{
     answer_cache_client_intent_preimage_bytes, bundle_hash_preimage_bytes,
     checkpoint_hash_preimage_bytes, claim_client_intent_preimage_bytes,
-    claim_content_preimage_bytes, claim_group_preimage_bytes,
+    claim_content_preimage_bytes, claim_group_preimage_bytes, claims_share_winning_value_bucket,
     compute_answer_cache_client_intent_hash, compute_answer_cache_summary_commitment,
     compute_answer_text_hash, compute_bundle_hash, compute_checkpoint_hash,
     compute_claim_client_intent_hash, compute_claim_content_hash, compute_claim_group_key,
     compute_evidence_event_hash, compute_evidence_event_hash_full,
-    compute_evidence_event_hash_with_meta, compute_logical_claim_group_key,
-    compute_object_client_intent_hash, compute_object_content_hash, compute_omission_list_hash,
-    compute_override_attestation_hash, compute_override_client_intent_hash,
-    compute_query_text_hash, compute_refusal_commitment, compute_refusal_metadata_commitment,
-    compute_retract_claim_client_intent_hash, compute_source_content_commitment,
-    compute_task_dependency_commitment,
+    compute_evidence_event_hash_v172, compute_evidence_event_hash_with_meta,
+    compute_logical_claim_group_key, compute_object_client_intent_hash,
+    compute_object_content_hash, compute_omission_list_hash, compute_override_attestation_hash,
+    compute_override_client_intent_hash, compute_query_text_hash,
+    compute_rebuild_archive_header_hash, compute_refusal_commitment,
+    compute_refusal_metadata_commitment, compute_retract_claim_client_intent_hash,
+    compute_source_content_commitment, compute_task_dependency_commitment,
     compute_witness_registration_by_domain, compute_witness_registration_commitment,
     compute_witness_registration_v2_commitment, compute_witness_registration_v3_commitment,
     compute_witness_revocation_by_domain, compute_witness_revocation_commitment,
     compute_witness_revocation_v2_commitment, compute_write_summary_commitment,
     encode_length_delimited, evidence_event_preimage_bytes, evidence_event_preimage_bytes_full,
-    hash_length_delimited, object_client_intent_preimage_bytes, object_content_preimage_bytes,
-    override_attestation_preimage_bytes, override_client_intent_preimage_bytes,
-    retract_claim_client_intent_preimage_bytes, witness_registration_preimage_bytes,
-    witness_revocation_preimage_bytes, OverrideHashInput,
+    evidence_event_preimage_bytes_v172, hash_length_delimited, object_client_intent_preimage_bytes,
+    object_content_preimage_bytes, override_attestation_preimage_bytes,
+    override_client_intent_preimage_bytes, rebuild_archive_header_preimage_bytes,
+    recompute_winning_bucket_corroboration, retract_claim_client_intent_preimage_bytes,
+    witness_registration_preimage_bytes, witness_revocation_preimage_bytes, OverrideHashInput,
 };
 pub use merkle::{
     compute_legacy_blake3_merkle_root_from_events, compute_legacy_blake3_merkle_root_from_leaves,
@@ -46,10 +48,12 @@ pub use signing::{
     answer_cache_signing_preimage, answer_cache_signing_preimage_bytes,
     checkpoint_signing_preimage, checkpoint_signing_preimage_bytes, evidence_signing_preimage,
     evidence_signing_preimage_bytes, override_signing_preimage, override_signing_preimage_bytes,
+    rebuild_header_signing_preimage, rebuild_header_signing_preimage_bytes,
     sign_answer_cache_receipt, sign_checkpoint_head, sign_evidence_entry,
-    sign_override_attestation, sign_witness_anchor, verify_answer_cache_signature,
-    verify_checkpoint_signature, verify_client_content_signature, verify_evidence_signature,
-    verify_override_signature, verify_witness_anchor_signature, witness_anchor_signing_preimage,
+    sign_override_attestation, sign_rebuild_archive_header, sign_witness_anchor,
+    verify_answer_cache_signature, verify_checkpoint_signature, verify_client_content_signature,
+    verify_evidence_signature, verify_override_signature, verify_rebuild_archive_header_signature,
+    verify_witness_anchor_signature, witness_anchor_signing_preimage,
     witness_anchor_signing_preimage_bytes,
 };
 pub use token::{
@@ -68,14 +72,17 @@ pub use verify::{
 mod tests {
     use super::*;
     use acta_types::{
-        AnswerCacheLedgerSummary, ClaimStatus, KnowledgeClaim, LifecycleStatus, ObjectType,
-        OmissionReason, OmittedItem, PolicyResultTag, RefusalMetadata, StoredObject,
+        AnswerCacheLedgerSummary, ClaimCandidate, ClaimStatus, ContextBudget, ContextBundle,
+        EvidenceEntry, ExportArchive, KnowledgeClaim, LifecycleStatus, ObjectType, OmissionReason,
+        OmissionRecord, OmittedItem, PolicyResultTag, RefusalMetadata, ResolutionRecord,
+        ResolverManifest, StateRebuildArchive, StoredObject, WitnessRegistrationSummary,
         WriteLedgerSummary, WriteOperationKind, ANSWER_CACHE_DOMAIN_V1, OVERRIDE_DOMAIN_V2,
+        SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1, WITNESS_REG_DOMAIN_V3,
         WRITE_EVENT_DOMAIN_V1,
     };
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use uuid::Uuid;
 
     #[test]
@@ -100,6 +107,35 @@ mod tests {
         let hash_a = hash_length_delimited(&[&bytes_a]);
         let hash_b = hash_length_delimited(&[&bytes_b]);
         assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn test_spec_2_5_empty_sub_commitment_and_state_layout() {
+        // SPEC.md §2.5: empty sub-commitment has 0 slices -> BLAKE3(b"")
+        let empty = compute_sub_commitment(&[]);
+        assert_eq!(
+            hex::encode(empty),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        let h1 = [0x11; 32];
+        let h2 = [0x22; 32];
+        assert_eq!(
+            compute_sub_commitment(&[h2, h1]),
+            hash_length_delimited(&[&h1, &h2])
+        );
+        let perm = [0x33; 32];
+        assert_eq!(
+            compute_state_commitment(SCHEMA_VERSION, "t", "s", &h1, &h2, &empty, &perm),
+            hash_length_delimited(&[
+                SCHEMA_VERSION.as_bytes(),
+                b"t",
+                b"s",
+                &h1,
+                &h2,
+                &empty,
+                &perm
+            ])
+        );
     }
 
     #[test]
@@ -409,6 +445,8 @@ mod tests {
             summary: "policy escalation required on ingest to restricted scope".to_string(),
             scope_state_commitment: None,
             attempted_checkpoint_hash: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
         };
         let comm = compute_refusal_metadata_commitment(&meta).unwrap();
         let h_v2 = compute_evidence_event_hash_with_meta(
@@ -624,7 +662,7 @@ mod tests {
         .unwrap();
         assert_ne!(ev_hash, ev_stripped, "stripping write_summary must mutate event_hash");
 
-        let entry = acta_types::EvidenceEntry {
+        let entry = EvidenceEntry {
             tenant_id: "kylewilson04".to_string(),
             seq_num: 154,
             event_domain: Some("acta:evidence_event:v3".to_string()),
@@ -647,28 +685,42 @@ mod tests {
 
         let qh = compute_query_text_hash("What is vendor:acme lead_days?");
         let ah = compute_answer_text_hash("14 days per signed-po.");
-        let acs = AnswerCacheLedgerSummary {
+        let ans_intent = compute_answer_cache_client_intent_hash(
+            "kylewilson04",
+            "acta-test/v170",
+            "task-1",
+            &qh,
+            &[0xAB; 32],
+            &[0xCD; 32],
+            &ah,
+        );
+        let ans_sig = author_sk.sign(&ans_intent).to_bytes().to_vec();
+
+        // v1.7.2 invalidation receipt preserving original ed25519_client_sig + invalidated_by:
+        let inv_acs = AnswerCacheLedgerSummary {
             cache_domain: ANSWER_CACHE_DOMAIN_V1.to_string(),
+            event_kind: Some("invalidated".to_string()),
             cache_id: Uuid::from_bytes([0x77; 16]),
             scope: "acta-test/v170".to_string(),
             task_id: "task-1".to_string(),
             query_hash: qh,
             source_bundle_hash: [0xAB; 32],
             state_commitment: [0xCD; 32],
+            validity_mode: Some("dependency_subset".to_string()),
+            task_dependency_commitment: Some([0xDD; 32]),
             answer_hash: ah,
             cached_by: "kylewilson04::oauth:kylewilson04".to_string(),
-            cacher_auth_kind: "oauth_github_principal".to_string(),
-            event_kind: None,
-            validity_mode: None,
-            task_dependency_commitment: None,
-            client_public_key: None,
-            client_signature: None,
+            cacher_auth_kind: "ed25519_client_sig".to_string(),
+            client_public_key: Some(author_pk),
+            client_signature: Some(ans_sig),
             expires_at: None,
-            invalidation_reason: None,
-            observed_state_commitment: None,
-            observed_dependency_commitment: None,
+            invalidation_reason: Some("stale_dependency_commitment".to_string()),
+            invalidated_by: Some("kylewilson04::oauth:kylewilson04".to_string()),
+            invalidator_auth_kind: Some("oauth_github_principal".to_string()),
+            observed_state_commitment: Some([0xEE; 32]),
+            observed_dependency_commitment: Some([0xFF; 32]),
         };
-        let ac_comm = compute_answer_cache_summary_commitment(&acs).unwrap();
+        let ac_comm = compute_answer_cache_summary_commitment(&inv_acs).unwrap();
         let ac_ev_hash = compute_evidence_event_hash_full(
             "kylewilson04",
             155,
@@ -680,10 +732,10 @@ mod tests {
             None,
             None,
             None,
-            Some(&acs),
+            Some(&inv_acs),
         )
         .unwrap();
-        let ac_entry = acta_types::EvidenceEntry {
+        let ac_entry = EvidenceEntry {
             tenant_id: "kylewilson04".to_string(),
             seq_num: 155,
             event_domain: Some("acta:evidence_event:v3".to_string()),
@@ -695,13 +747,286 @@ mod tests {
             refusal_metadata: None,
             override_summary: None,
             write_summary: None,
-            answer_cache_summary: Some(acs),
+            answer_cache_summary: Some(inv_acs),
             witness_reg_summary: None,
             witness_revoke_summary: None,
             host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 155, &ev_hash, &ac_ev_hash),
             created_at: t,
         };
         verify_single_evidence_entry_public(&ac_entry, "kylewilson04", &host_vk)
-            .expect("valid v3 answer-cache entry must verify");
+            .expect("valid v1.7.2 invalidation entry preserving ed25519_client_sig must verify");
+    }
+
+    #[test]
+    fn test_v172_witness_v3_and_signed_rebuild_header_and_corroboration_proof() {
+        let host_sk = SigningKey::from_bytes(&[0x71; 32]);
+        let host_pk = host_sk.verifying_key().to_bytes();
+        let host_vk = host_sk.verifying_key();
+        let wit_pk = [0x82; 32];
+        let t = Utc.with_ymd_and_hms(2026, 11, 24, 18, 0, 0).unwrap();
+
+        // 1. Legacy v1 witness entry (like seq 183) vs v1.7.2 v3 witness entry:
+        let (reg_pre, reg_comm) = compute_witness_registration_v3_commitment(
+            "kylewilson04",
+            "claude-witness-v172",
+            &wit_pk,
+            "kylewilson04::oauth:kylewilson04",
+            Some("v1.7.2 witness"),
+        );
+        let wreg = WitnessRegistrationSummary {
+            witness_id: "claude-witness-v172".to_string(),
+            public_key: wit_pk,
+            registered_by: "kylewilson04::oauth:kylewilson04".to_string(),
+            description: Some("v1.7.2 witness".to_string()),
+            registration_domain: WITNESS_REG_DOMAIN_V3.to_string(),
+            registration_blake3_preimage_hex: hex::encode(&reg_pre),
+        };
+        let v1_hash = compute_evidence_event_hash_v172(
+            "kylewilson04",
+            1,
+            &[0u8; 32],
+            None,
+            Some(&reg_comm),
+            PolicyResultTag::Allow,
+            t.timestamp_micros(),
+            None,
+            None,
+            None,
+            None,
+            Some(&wreg),
+            None,
+            false,
+        )
+        .unwrap();
+        let v3_hash = compute_evidence_event_hash_v172(
+            "kylewilson04",
+            1,
+            &[0u8; 32],
+            None,
+            Some(&reg_comm),
+            PolicyResultTag::Allow,
+            t.timestamp_micros(),
+            None,
+            None,
+            None,
+            None,
+            Some(&wreg),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_ne!(v1_hash, v3_hash, "v3 witness preimage must differ from legacy v1");
+
+        let entry_v3_wit = EvidenceEntry {
+            tenant_id: "kylewilson04".to_string(),
+            seq_num: 1,
+            event_domain: Some("acta:evidence_event:v3".to_string()),
+            prev_hash: [0u8; 32],
+            event_hash: v3_hash,
+            bundle_hash: None,
+            state_commitment: Some(reg_comm),
+            policy_result: PolicyResultTag::Allow,
+            refusal_metadata: None,
+            override_summary: None,
+            write_summary: None,
+            answer_cache_summary: None,
+            witness_reg_summary: Some(wreg),
+            witness_revoke_summary: None,
+            host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 1, &[0u8; 32], &v3_hash),
+            created_at: t,
+        };
+        verify_single_evidence_entry_public(&entry_v3_wit, "kylewilson04", &host_vk)
+            .expect("v1.7.2 v3 witness entry must verify");
+
+        // 2. Signed StateRebuildArchive header rejects swapped evaluated_at!
+        let perm_root = [0x3F; 32];
+        let hdr_hash = compute_rebuild_archive_header_hash(
+            STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+            "kylewilson04",
+            "acta-test/v172",
+            1,
+            t.timestamp_micros(),
+            &perm_root,
+        );
+        let hdr_sig = sign_rebuild_archive_header(&host_sk, "kylewilson04", &hdr_hash);
+        let mut reb_archive = StateRebuildArchive {
+            schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1.to_string(),
+            tenant_id: "kylewilson04".to_string(),
+            scope: "acta-test/v172".to_string(),
+            up_to_seq: 1,
+            evaluated_at: t,
+            host_public_key: host_pk,
+            permission_root: perm_root,
+            header_hash: hdr_hash,
+            host_header_signature: hdr_sig,
+            override_attestations: vec![],
+            evidence_chain: vec![entry_v3_wit.clone()],
+            checkpoint: None,
+            latest_anchored_checkpoint: None,
+            consistency_proof_from_latest_anchor: vec![],
+        };
+        let reb_ok =
+            verify_and_rebuild_scope_state_offline(&reb_archive, &host_pk, None).expect("signed header passes");
+        assert!(reb_ok.header_signature_verified);
+
+        // Swap evaluated_at forward by 1 year -> MUST fail header check!
+        reb_archive.evaluated_at = t + Duration::days(365);
+        assert!(
+            verify_and_rebuild_scope_state_offline(&reb_archive, &host_pk, None).is_err(),
+            "swapping evaluated_at without host signature MUST fail verification"
+        );
+
+        // 3. Corroborating claims in ExportArchive: missing A1 fails, both A1 + A2 pass with verified_claims == 2 and 0.72!
+        let gkey = compute_logical_claim_group_key(
+            "kylewilson04",
+            "supplier:titan",
+            "lead_days",
+            "acta-test/v172",
+        );
+        let mut c1 = KnowledgeClaim {
+            id: Uuid::from_bytes([0x11; 16]),
+            tenant_id: "kylewilson04".to_string(),
+            claim_group_key: gkey,
+            scope: "acta-test/v172".to_string(),
+            subject: "supplier:titan".to_string(),
+            predicate: "lead_days".to_string(),
+            object_val: json!(14),
+            object_type: "int".to_string(),
+            confidence: 0.60,
+            source_provenance_class: 2,
+            source_descriptor: "erp-feed-a".to_string(),
+            source_commitment: [0xA1; 32],
+            content_hash: [0u8; 32],
+            status: ClaimStatus::Active,
+            contradiction_ids: vec![],
+            valid_from: None,
+            valid_to: None,
+            version: 1,
+            predecessor_id: None,
+            client_signature: None,
+            client_public_key: None,
+            retraction_reason: None,
+            written_by: None,
+            evidence_seq_num: None,
+            created_at: t,
+        };
+        c1.content_hash = compute_claim_content_hash(&c1).unwrap();
+
+        let mut c2 = c1.clone();
+        c2.id = Uuid::from_bytes([0x22; 16]);
+        c2.source_descriptor = "carrier-bol-b".to_string();
+        c2.source_commitment = [0xA2; 32];
+        c2.created_at = t + Duration::seconds(1);
+        c2.content_hash = compute_claim_content_hash(&c2).unwrap();
+
+        let mut winner_cand = ClaimCandidate::from(&c2);
+        winner_cand.corroborating_count = 2;
+        winner_cand.corroborating_sources =
+            vec!["carrier-bol-b".to_string(), "erp-feed-a".to_string()];
+        winner_cand.effective_confidence = Some(0.72);
+
+        let empty_root = compute_sub_commitment(&[]);
+        let know_root = compute_sub_commitment(&[c1.content_hash, c2.content_hash]);
+        let sc = compute_state_commitment(
+            SCHEMA_VERSION,
+            "kylewilson04",
+            "acta-test/v172",
+            &empty_root,
+            &know_root,
+            &empty_root,
+            &perm_root,
+        );
+        let bundle = ContextBundle {
+            schema_version: SCHEMA_VERSION.to_string(),
+            tenant_id: "kylewilson04".to_string(),
+            task_id: "po-lead".to_string(),
+            scope: "acta-test/v172".to_string(),
+            policy_result: PolicyResultTag::Allow,
+            embedding_model_version: "text-embedding-3-small-1536".to_string(),
+            resolver_manifest: Some(ResolverManifest::new(
+                0.70,
+                0.15,
+                0.50,
+                ContextBudget::Tokens(2048),
+                perm_root,
+            )),
+            selected_objects: vec![],
+            resolution_records: vec![ResolutionRecord {
+                claim_group_key: gkey,
+                winning_claim: winner_cand,
+                margin: None,
+                suppressed_claim_ids: vec![c1.id],
+                override_attestation: None,
+            }],
+            dispute_records: vec![],
+            omission_record: OmissionRecord {
+                inline_items: vec![],
+                total_omitted_count: 0,
+                full_excluded_hash: compute_omission_list_hash(&[]).unwrap(),
+                has_unresolved_claims: false,
+            },
+            resolved_facts_omitted: Some(0),
+            state_commitment: sc,
+            dependency_commitment: know_root,
+            issued_at: c2.created_at,
+        };
+        let (bh, _) = compute_bundle_hash(&bundle).unwrap();
+        let b_ev_hash = compute_evidence_event_hash(
+            "kylewilson04",
+            2,
+            &v3_hash,
+            Some(&bh),
+            Some(&sc),
+            PolicyResultTag::Allow,
+            c2.created_at.timestamp_micros(),
+        );
+        let b_entry = EvidenceEntry {
+            tenant_id: "kylewilson04".to_string(),
+            seq_num: 2,
+            event_domain: Some("acta:evidence_event:v1".to_string()),
+            prev_hash: v3_hash,
+            event_hash: b_ev_hash,
+            bundle_hash: Some(bh),
+            state_commitment: Some(sc),
+            policy_result: PolicyResultTag::Allow,
+            refusal_metadata: None,
+            override_summary: None,
+            write_summary: None,
+            answer_cache_summary: None,
+            witness_reg_summary: None,
+            witness_revoke_summary: None,
+            host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 2, &v3_hash, &b_ev_hash),
+            created_at: c2.created_at,
+        };
+
+        let incomplete_archive = ExportArchive {
+            bundle_hash: bh,
+            bundle: bundle.clone(),
+            objects: vec![],
+            claims: vec![c2.clone()],
+            override_attestations: vec![],
+            evidence_chain: vec![entry_v3_wit.clone(), b_entry.clone()],
+            merkle_proof: None,
+            host_public_key: host_pk,
+        };
+        assert!(
+            verify_export_archive(&incomplete_archive, &host_pk).is_err(),
+            "missing corroborating claim c1 in archive.claims must fail verification"
+        );
+
+        let full_archive = ExportArchive {
+            bundle_hash: bh,
+            bundle,
+            objects: vec![],
+            claims: vec![c1, c2],
+            override_attestations: vec![],
+            evidence_chain: vec![entry_v3_wit, b_entry],
+            merkle_proof: None,
+            host_public_key: host_pk,
+        };
+        let sum = verify_export_archive(&full_archive, &host_pk)
+            .expect("archive with both corroborating claims must verify");
+        assert_eq!(sum.verified_claims, 2);
+        assert_eq!(sum.verified_corroborated_resolutions, 1);
     }
 }

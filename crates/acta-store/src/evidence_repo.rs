@@ -1,20 +1,22 @@
+use std::collections::BTreeSet;
+
 use acta_crypto::{
-    compute_checkpoint_hash, compute_evidence_event_hash_with_meta,
-    compute_legacy_blake3_merkle_root_from_events,
+    claims_share_winning_value_bucket, compute_checkpoint_hash, compute_evidence_event_hash_v172,
+    compute_evidence_event_hash_with_meta, compute_legacy_blake3_merkle_root_from_events,
     compute_merkle_consistency_proof, compute_merkle_inclusion_proof,
     compute_merkle_root_from_leaves, compute_refusal_metadata_commitment,
     compute_witness_registration_by_domain, compute_witness_registration_v3_commitment,
     compute_witness_revocation_by_domain, compute_witness_revocation_v2_commitment,
-    merkle_leaf_hash,
-    sign_checkpoint_head,
-    sign_evidence_entry, witness_registration_preimage_bytes, witness_revocation_preimage_bytes,
+    merkle_leaf_hash, sign_checkpoint_head, sign_evidence_entry,
+    witness_registration_preimage_bytes, witness_revocation_preimage_bytes,
 };
 use acta_types::{
-    ActaError, ActaResult, AnswerCacheLedgerSummary, ContextBundle, EntryInclusionProof, EvidenceEntry, WriteLedgerSummary,
-    ExternalWitnessAnchor, MerkleBundleProof, OverrideLedgerSummary, PolicyResultTag,
-    QuarantinedAnchorRecord, RefusalMetadata, SignedTreeHead, TrustedWitness,
-    WitnessRegistrationSummary, WitnessRevocationSummary, WITNESS_REG_DOMAIN_V1,
-    WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1, WITNESS_REVOKE_DOMAIN_V2,
+    ActaError, ActaResult, AnswerCacheLedgerSummary, ContextBundle, EntryInclusionProof,
+    EvidenceEntry, ExternalWitnessAnchor, KnowledgeClaim, MerkleBundleProof,
+    OverrideLedgerSummary, PolicyResultTag, QuarantinedAnchorRecord, RefusalMetadata,
+    SignedTreeHead, TrustedWitness, WitnessRegistrationSummary, WitnessRevocationSummary,
+    WriteLedgerSummary, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1,
+    WITNESS_REVOKE_DOMAIN_V2,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
@@ -43,6 +45,8 @@ struct EvidenceRow {
     override_meta: Option<Value>,
     write_meta: Option<Value>,
     answer_cache_meta: Option<Value>,
+    witness_reg_meta: Option<Value>,
+    witness_revoke_meta: Option<Value>,
     host_signature: Vec<u8>,
     created_at: DateTime<Utc>,
     witness_reg_id: Option<String>,
@@ -122,91 +126,108 @@ impl EvidenceRow {
             .try_into()
             .map_err(|_| ActaError::Storage("host_signature is not 64 bytes".to_string()))?;
 
-        let witness_reg_summary = match (
-            self.witness_reg_id,
-            self.witness_reg_public_key,
-            self.witness_reg_by,
-        ) {
-            (Some(wid), Some(raw_pk), Some(reg_by)) => {
-                let pk_arr: [u8; 32] = raw_pk.try_into().map_err(|_| {
-                    ActaError::Storage(
-                        "trusted_witnesses.public_key join column is not 32 bytes".to_string(),
+        let witness_in_v3 =
+            self.witness_reg_meta.is_some() || self.witness_revoke_meta.is_some();
+
+        let witness_reg_summary = if let Some(v) = self.witness_reg_meta {
+            Some(serde_json::from_value(v).map_err(|e| {
+                ActaError::Storage(format!("witness_reg_meta deserialization failed: {e}"))
+            })?)
+        } else {
+            match (
+                self.witness_reg_id,
+                self.witness_reg_public_key,
+                self.witness_reg_by,
+            ) {
+                (Some(wid), Some(raw_pk), Some(reg_by)) => {
+                    let pk_arr: [u8; 32] = raw_pk.try_into().map_err(|_| {
+                        ActaError::Storage(
+                            "trusted_witnesses.public_key join column is not 32 bytes".to_string(),
+                        )
+                    })?;
+                    let reg_domain = self
+                        .witness_reg_domain
+                        .unwrap_or_else(|| WITNESS_REG_DOMAIN_V1.to_string());
+                    let preimage = witness_registration_preimage_bytes(
+                        &reg_domain,
+                        &self.tenant_id,
+                        &wid,
+                        &pk_arr,
+                        &reg_by,
+                        self.witness_reg_desc.as_deref(),
                     )
-                })?;
-                let reg_domain = self
-                    .witness_reg_domain
-                    .unwrap_or_else(|| WITNESS_REG_DOMAIN_V1.to_string());
-                let preimage = witness_registration_preimage_bytes(
-                    &reg_domain,
-                    &self.tenant_id,
-                    &wid,
-                    &pk_arr,
-                    &reg_by,
-                    self.witness_reg_desc.as_deref(),
-                )
-                .map_err(ActaError::Storage)?;
-                Some(WitnessRegistrationSummary {
-                    witness_id: wid,
-                    public_key: pk_arr,
-                    registered_by: reg_by,
-                    description: self.witness_reg_desc,
-                    registration_domain: reg_domain,
-                    registration_blake3_preimage_hex: acta_crypto_hex(&preimage),
-                })
+                    .map_err(ActaError::Storage)?;
+                    Some(WitnessRegistrationSummary {
+                        witness_id: wid,
+                        public_key: pk_arr,
+                        registered_by: reg_by,
+                        description: self.witness_reg_desc,
+                        registration_domain: reg_domain,
+                        registration_blake3_preimage_hex: acta_crypto_hex(&preimage),
+                    })
+                }
+                _ => None,
             }
-            _ => None,
         };
 
-        let witness_revoke_summary = match (
-            self.witness_rev_id,
-            self.witness_rev_public_key,
-            self.witness_rev_by,
-            self.witness_rev_reason,
-        ) {
-            (Some(wid), Some(raw_pk), Some(rev_by), Some(reason)) => {
-                let pk_arr: [u8; 32] = raw_pk.try_into().map_err(|_| {
-                    ActaError::Storage(
-                        "witness_revocations.public_key join column is not 32 bytes".to_string(),
+        let witness_revoke_summary = if let Some(v) = self.witness_revoke_meta {
+            Some(serde_json::from_value(v).map_err(|e| {
+                ActaError::Storage(format!("witness_revoke_meta deserialization failed: {e}"))
+            })?)
+        } else {
+            match (
+                self.witness_rev_id,
+                self.witness_rev_public_key,
+                self.witness_rev_by,
+                self.witness_rev_reason,
+            ) {
+                (Some(wid), Some(raw_pk), Some(rev_by), Some(reason)) => {
+                    let pk_arr: [u8; 32] = raw_pk.try_into().map_err(|_| {
+                        ActaError::Storage(
+                            "witness_revocations.public_key join column is not 32 bytes"
+                                .to_string(),
+                        )
+                    })?;
+                    let rev_domain = self
+                        .witness_rev_domain
+                        .unwrap_or_else(|| WITNESS_REVOKE_DOMAIN_V1.to_string());
+                    let rev_mode = self
+                        .witness_rev_mode
+                        .unwrap_or_else(|| "compromise".to_string());
+                    let rev_eff = self.witness_rev_eff_tree_size;
+                    let preimage = witness_revocation_preimage_bytes(
+                        &rev_domain,
+                        &self.tenant_id,
+                        &wid,
+                        &pk_arr,
+                        &rev_by,
+                        &rev_mode,
+                        rev_eff,
+                        &reason,
                     )
-                })?;
-                let rev_domain = self
-                    .witness_rev_domain
-                    .unwrap_or_else(|| WITNESS_REVOKE_DOMAIN_V1.to_string());
-                let rev_mode = self
-                    .witness_rev_mode
-                    .unwrap_or_else(|| "compromise".to_string());
-                let rev_eff = self.witness_rev_eff_tree_size;
-                let preimage = witness_revocation_preimage_bytes(
-                    &rev_domain,
-                    &self.tenant_id,
-                    &wid,
-                    &pk_arr,
-                    &rev_by,
-                    &rev_mode,
-                    rev_eff,
-                    &reason,
-                )
-                .map_err(ActaError::Storage)?;
-                Some(WitnessRevocationSummary {
-                    witness_id: wid,
-                    public_key: pk_arr,
-                    revoked_by: rev_by,
-                    revocation_mode: rev_mode,
-                    effective_from_tree_size: rev_eff,
-                    reason,
-                    revocation_domain: rev_domain,
-                    revocation_blake3_preimage_hex: acta_crypto_hex(&preimage),
-                })
+                    .map_err(ActaError::Storage)?;
+                    Some(WitnessRevocationSummary {
+                        witness_id: wid,
+                        public_key: pk_arr,
+                        revoked_by: rev_by,
+                        revocation_mode: rev_mode,
+                        effective_from_tree_size: rev_eff,
+                        reason,
+                        revocation_domain: rev_domain,
+                        revocation_blake3_preimage_hex: acta_crypto_hex(&preimage),
+                    })
+                }
+                _ => None,
             }
-            _ => None,
         };
 
         let event_domain = Some(
-            EvidenceEntry::inferred_event_domain_v17(
+            EvidenceEntry::inferred_event_domain_v172(
                 refusal_metadata.is_some(),
                 override_summary.is_some(),
                 write_summary.is_some(),
                 answer_cache_summary.is_some(),
+                witness_in_v3,
             )
             .to_string(),
         );
@@ -408,26 +429,16 @@ impl QuarantinedAnchorRow {
     }
 }
 
-/// Atomically appends an entry to `evidence_history` (and `context_bundles` when `bundle` is `Some`),
-/// optionally binding `explicit_state_commitment` and structured `refusal_metadata`.
 /// Acquires an exclusive 64-bit BLAKE3-keyed per-tenant PostgreSQL advisory transaction lock
 /// (`pg_advisory_xact_lock`) as a standalone statement FIRST, and ONLY THEN executes a second
 /// `SELECT` statement to read the latest `(seq_num, event_hash)` head (`v1.6.7+`).
-///
-/// Under PostgreSQL `READ COMMITTED`, a single-statement `WITH _lock AS MATERIALIZED (SELECT pg_advisory_xact_lock(...))`
-/// acquires its MVCC snapshot *before* blocking on the advisory lock, causing concurrent writers to
-/// read a stale pre-lock `seq_num` and collide on `evidence_history_pkey`. Splitting the lock and
-/// head read into two separate statements forces a fresh post-lock MVCC snapshot on every transaction.
 pub(crate) async fn lock_and_read_latest_evidence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_id: &str,
 ) -> ActaResult<(i64, [u8; 32])> {
-    let lock_digest = acta_crypto::hash_length_delimited(&[b"acta:evidence_lock:v1", tenant_id.as_bytes()]);
-    let lock_id = i64::from_le_bytes(
-        lock_digest[..8]
-            .try_into()
-            .expect("8-byte slice"),
-    );
+    let lock_digest =
+        acta_crypto::hash_length_delimited(&[b"acta:evidence_lock:v1", tenant_id.as_bytes()]);
+    let lock_id = i64::from_le_bytes(lock_digest[..8].try_into().expect("8-byte slice"));
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_id)
         .execute(&mut **tx)
@@ -675,7 +686,9 @@ pub async fn fetch_evidence_by_seq(
         r#"
         SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                e.bundle_hash, e.state_commitment, e.policy_result,
-               e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+               e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+               e.witness_reg_meta, e.witness_revoke_meta,
+               e.host_signature, e.created_at,
                tw.witness_id AS witness_reg_id,
                tw.public_key AS witness_reg_public_key,
                tw.registered_by AS witness_reg_by,
@@ -719,7 +732,9 @@ pub async fn fetch_evidence_by_seqs(
         r#"
         SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                e.bundle_hash, e.state_commitment, e.policy_result,
-               e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+               e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+               e.witness_reg_meta, e.witness_revoke_meta,
+               e.host_signature, e.created_at,
                tw.witness_id AS witness_reg_id,
                tw.public_key AS witness_reg_public_key,
                tw.registered_by AS witness_reg_by,
@@ -763,7 +778,9 @@ pub async fn fetch_tenant_evidence_chain(
                 r#"
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
-                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
                        tw.registered_by AS witness_reg_by,
@@ -797,7 +814,9 @@ pub async fn fetch_tenant_evidence_chain(
                 r#"
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
-                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
                        tw.registered_by AS witness_reg_by,
@@ -874,7 +893,9 @@ pub async fn fetch_tenant_evidence_page(
                 r#"
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
-                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
                        tw.registered_by AS witness_reg_by,
@@ -911,7 +932,9 @@ pub async fn fetch_tenant_evidence_page(
                 r#"
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
-                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta, e.host_signature, e.created_at,
+                       e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
                        tw.registered_by AS witness_reg_by,
@@ -1008,6 +1031,57 @@ async fn fetch_scoped_bundle_row(
             acta_crypto_hex(bundle_hash)
         ))
     })
+}
+
+/// Collects every `KnowledgeClaim` needed for full offline bundle verification (`v1.7.2+`):
+/// - `res.winning_claim.id` PLUS every corroborating claim in the winning `ValueBucket` from `res.suppressed_claim_ids`
+///   (so damped noisy-OR `effective_confidence` is 100% recomputable offline — Must-Fix 2!),
+/// - PLUS every `cand.id` in `disp.competing_claims`.
+pub async fn fetch_bundle_verifiable_claims(
+    pool: &PgPool,
+    tenant_id: &str,
+    bundle: &ContextBundle,
+) -> ActaResult<Vec<KnowledgeClaim>> {
+    let mut direct_ids: BTreeSet<Uuid> = BTreeSet::new();
+    let mut suppressed_corroboration_candidates: BTreeSet<Uuid> = BTreeSet::new();
+
+    for res in &bundle.resolution_records {
+        direct_ids.insert(res.winning_claim.id);
+        if res.winning_claim.corroborating_count > 1 {
+            for &sid in &res.suppressed_claim_ids {
+                suppressed_corroboration_candidates.insert(sid);
+            }
+        }
+    }
+    for disp in &bundle.dispute_records {
+        for cand in &disp.competing_claims {
+            direct_ids.insert(cand.id);
+        }
+    }
+
+    let mut query_ids: Vec<Uuid> = direct_ids
+        .union(&suppressed_corroboration_candidates)
+        .copied()
+        .collect();
+    query_ids.sort_unstable();
+    let fetched = crate::claims_repo::fetch_claims_by_ids(pool, tenant_id, &query_ids).await?;
+
+    let mut out = Vec::with_capacity(fetched.len());
+    for c in fetched {
+        if direct_ids.contains(&c.id) {
+            out.push(c);
+            continue;
+        }
+        let in_winning_bucket = bundle.resolution_records.iter().any(|res| {
+            res.winning_claim.corroborating_count > 1
+                && res.suppressed_claim_ids.contains(&c.id)
+                && claims_share_winning_value_bucket(&res.winning_claim, &c)
+        });
+        if in_winning_bucket {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 /// Fetches lightweight `(seq_num, event_hash, created_at)` leaf headers for a tenant up to `up_to_size`
@@ -1109,8 +1183,8 @@ pub async fn build_signed_tree_head(
 }
 
 /// Fetches a persisted `ContextBundle`, its notarizing `EvidenceEntry`, optional linear `evidence_chain`,
-/// and `MerkleBundleProof` — automatically attaching `anchored_checkpoint` + `consistency_proof_to_anchor`
-/// when `anchor_tree_size` is requested or when a newer active witness-anchored checkpoint exists (`v1.6.2+`).
+/// and `MerkleBundleProof` — automatically attaching corroborating winning-bucket claim write proofs (`v1.7.2+`)
+/// and `anchored_checkpoint` + `consistency_proof_to_anchor`.
 pub async fn fetch_bundle_with_merkle_options(
     pool: &PgPool,
     host_key: &SigningKey,
@@ -1217,15 +1291,8 @@ pub async fn fetch_bundle_with_merkle_options_scoped(
     }
 
     let sel_obj_ids: Vec<Uuid> = bundle.selected_objects.iter().map(|o| o.id).collect();
-    let mut sel_claim_ids: Vec<Uuid> = Vec::new();
-    for res in &bundle.resolution_records {
-        sel_claim_ids.push(res.winning_claim.id);
-    }
-    for disp in &bundle.dispute_records {
-        for cand in &disp.competing_claims {
-            sel_claim_ids.push(cand.id);
-        }
-    }
+    let verifiable_claims = fetch_bundle_verifiable_claims(pool, &tenant_id, &bundle).await?;
+
     let mut unique_write_seqs: Vec<i64> = Vec::new();
     if !sel_obj_ids.is_empty() {
         let obj_seqs: Vec<(Option<i64>,)> = sqlx::query_as(
@@ -1242,19 +1309,9 @@ pub async fn fetch_bundle_with_merkle_options_scoped(
             }
         }
     }
-    if !sel_claim_ids.is_empty() {
-        let clm_seqs: Vec<(Option<i64>,)> = sqlx::query_as(
-            "SELECT evidence_seq_num FROM knowledge_claims WHERE tenant_id = $1 AND id = ANY($2) AND evidence_seq_num IS NOT NULL",
-        )
-        .bind(&tenant_id)
-        .bind(&sel_claim_ids)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| ActaError::Storage(format!("lookup claim evidence_seq_num failed: {e}")))?;
-        for (s_opt,) in clm_seqs {
-            if let Some(s) = s_opt {
-                unique_write_seqs.push(s);
-            }
+    for clm in &verifiable_claims {
+        if let Some(s) = clm.evidence_seq_num {
+            unique_write_seqs.push(s);
         }
     }
     unique_write_seqs.retain(|&s| s >= 1 && s <= target_seq);
@@ -1439,7 +1496,8 @@ pub async fn fetch_bundle_with_evidence_slice_scoped(
 }
 
 /// Atomically registers an immutable trusted witness Ed25519 key in `trusted_witnesses` and
-/// notarizes its principal- and description-bound commitment (`b"acta:witness_reg:v3"`) in `evidence_history`.
+/// notarizes its principal- and description-bound commitment (`b"acta:witness_reg:v3"`) AND full
+/// `WitnessRegistrationSummary` under `b"acta:evidence_event:v3"` (`v1.7.2+`, Should-Fix 6).
 pub async fn register_trusted_witness_tx(
     pool: &PgPool,
     host_key: &SigningKey,
@@ -1522,10 +1580,17 @@ pub async fn register_trusted_witness_tx(
         });
     }
 
-
     let seq_num = prev_seq + 1;
+    let wreg_summary = WitnessRegistrationSummary {
+        witness_id: witness_id.to_string(),
+        public_key: *public_key,
+        registered_by: registered_by.to_string(),
+        description: description.map(str::to_string),
+        registration_domain: WITNESS_REG_DOMAIN_V3.to_string(),
+        registration_blake3_preimage_hex: acta_crypto_hex(&reg_preimage),
+    };
 
-    let ev_hash = compute_evidence_event_hash_with_meta(
+    let ev_hash = compute_evidence_event_hash_v172(
         tenant_id,
         seq_num,
         &prev_hash,
@@ -1535,17 +1600,26 @@ pub async fn register_trusted_witness_tx(
         created_at.timestamp_micros(),
         None,
         None,
+        None,
+        None,
+        Some(&wreg_summary),
+        None,
+        true,
     )?;
     let ev_sig = sign_evidence_entry(host_key, tenant_id, seq_num, &prev_hash, &ev_hash);
+    let wreg_meta_json = serde_json::to_value(&wreg_summary).map_err(|e| {
+        ActaError::Storage(format!("serialize witness_reg_meta failed: {e}"))
+    })?;
 
     sqlx::query(
         r#"
         INSERT INTO evidence_history (
             tenant_id, seq_num, prev_hash, event_hash,
             bundle_hash, state_commitment, policy_result,
-            refusal_meta, override_meta, host_signature, created_at
+            refusal_meta, override_meta, witness_reg_meta,
+            host_signature, created_at
         )
-        VALUES ($1, $2, $3, $4, NULL, $5, 'allow', NULL, NULL, $6, $7)
+        VALUES ($1, $2, $3, $4, NULL, $5, 'allow', NULL, NULL, $6, $7, $8)
         "#,
     )
     .bind(tenant_id)
@@ -1553,6 +1627,7 @@ pub async fn register_trusted_witness_tx(
     .bind(prev_hash.as_slice())
     .bind(ev_hash.as_slice())
     .bind(reg_comm.as_slice())
+    .bind(wreg_meta_json)
     .bind(ev_sig.as_slice())
     .bind(created_at)
     .execute(&mut *tx)
@@ -1610,8 +1685,7 @@ pub async fn register_trusted_witness_tx(
 }
 
 /// Atomically revokes (`mode = "compromise"`) or retires (`mode = "retire"`) an enrolled witness via
-/// append-only `witness_revocations` + `evidence_history` (`b"acta:witness_revoke:v2"`) without mutating
-/// `trusted_witnesses` or `checkpoint_anchors`.
+/// append-only `witness_revocations` + `evidence_history` (`b"acta:witness_revoke:v2"` under `b"acta:evidence_event:v3"`, `v1.7.2+`).
 pub async fn revoke_trusted_witness_tx(
     pool: &PgPool,
     host_key: &SigningKey,
@@ -1706,7 +1780,6 @@ pub async fn revoke_trusted_witness_tx(
         });
     }
 
-
     let seq_num = prev_seq + 1;
     let effective_from_tree_size = if revocation_mode == "retire" {
         Some(seq_num)
@@ -1725,7 +1798,18 @@ pub async fn revoke_trusted_witness_tx(
     )
     .map_err(ActaError::Validation)?;
 
-    let ev_hash = compute_evidence_event_hash_with_meta(
+    let wrev_summary = WitnessRevocationSummary {
+        witness_id: witness_id.to_string(),
+        public_key: existing.public_key,
+        revoked_by: revoked_by.to_string(),
+        revocation_mode: revocation_mode.to_string(),
+        effective_from_tree_size,
+        reason: reason.to_string(),
+        revocation_domain: WITNESS_REVOKE_DOMAIN_V2.to_string(),
+        revocation_blake3_preimage_hex: acta_crypto_hex(&rev_preimage),
+    };
+
+    let ev_hash = compute_evidence_event_hash_v172(
         tenant_id,
         seq_num,
         &prev_hash,
@@ -1735,17 +1819,26 @@ pub async fn revoke_trusted_witness_tx(
         created_at.timestamp_micros(),
         None,
         None,
+        None,
+        None,
+        None,
+        Some(&wrev_summary),
+        true,
     )?;
     let ev_sig = sign_evidence_entry(host_key, tenant_id, seq_num, &prev_hash, &ev_hash);
+    let wrev_meta_json = serde_json::to_value(&wrev_summary).map_err(|e| {
+        ActaError::Storage(format!("serialize witness_revoke_meta failed: {e}"))
+    })?;
 
     sqlx::query(
         r#"
         INSERT INTO evidence_history (
             tenant_id, seq_num, prev_hash, event_hash,
             bundle_hash, state_commitment, policy_result,
-            refusal_meta, override_meta, host_signature, created_at
+            refusal_meta, override_meta, witness_revoke_meta,
+            host_signature, created_at
         )
-        VALUES ($1, $2, $3, $4, NULL, $5, 'allow', NULL, NULL, $6, $7)
+        VALUES ($1, $2, $3, $4, NULL, $5, 'allow', NULL, NULL, $6, $7, $8)
         "#,
     )
     .bind(tenant_id)
@@ -1753,6 +1846,7 @@ pub async fn revoke_trusted_witness_tx(
     .bind(prev_hash.as_slice())
     .bind(ev_hash.as_slice())
     .bind(rev_comm.as_slice())
+    .bind(wrev_meta_json)
     .bind(ev_sig.as_slice())
     .bind(created_at)
     .execute(&mut *tx)
@@ -1876,7 +1970,7 @@ pub async fn fetch_tenant_trusted_witnesses(
 }
 
 /// Fetches all append-only `checkpoint_anchors` rows quarantined because their witness/key is not
-/// currently active in `trusted_witnesses` (e.g. legacy `v1.6.0` throwaway rows or revoked witnesses).
+/// currently active in `trusted_witnesses`.
 pub async fn fetch_quarantined_witness_anchors(
     pool: &PgPool,
     tenant_id: &str,
