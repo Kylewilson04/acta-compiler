@@ -328,9 +328,11 @@ pub async fn handle_tenant_vault(
         scope_filter.as_deref(),
     );
     let evidence_fut = evidence_repo::fetch_tenant_evidence_chain(&state.pool, clean_tenant, None);
+    let active_sk = state.signing_key_for_tenant(clean_tenant);
+    let active_pk = active_sk.verifying_key().to_bytes();
     let cp_fut = evidence_repo::build_signed_tree_head(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         clean_tenant,
         None,
     );
@@ -510,7 +512,7 @@ pub async fn handle_tenant_vault(
     Ok(Json(TenantVaultResponse {
         tenant_id: clean_tenant.to_string(),
         active_scope_filter: scope_filter,
-        host_public_key: hex::encode(state.host_public_key),
+        host_public_key: hex::encode(active_pk),
         permission_root: hex::encode(state.policy_gate.permission_root()),
         latest_checkpoint,
         witness_anchors,

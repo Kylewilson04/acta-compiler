@@ -297,6 +297,7 @@ pub async fn insert_object_with_evidence_tx(
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature,
         created_at: obj.created_at,
     };

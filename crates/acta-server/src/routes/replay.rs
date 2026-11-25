@@ -30,6 +30,9 @@ pub struct ReplayRequest {
 pub struct ReplayBranchSummary {
     pub policy_decision: PolicyDecision,
     pub permission_root: String,
+    pub reproducing_resolver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_resolver_version: Option<String>,
     pub resolver_compat: String,
     pub bundle_hash: Option<String>,
     pub state_commitment: Option<String>,
@@ -72,10 +75,15 @@ impl From<CompileSimulation> for ReplayBranchSummary {
             None => (None, None, None, 0, 0, 0, 0, None),
         };
 
+        let recorded_resolver_version = resolver_manifest
+            .as_ref()
+            .and_then(|m| m.resolver_version.clone());
         Self {
             policy_decision: sim.policy_decision,
             permission_root: hex::encode(sim.permission_root),
-            resolver_compat: "v172_current".to_string(),
+            reproducing_resolver: "v173_current".to_string(),
+            recorded_resolver_version,
+            resolver_compat: "v173_current".to_string(),
             bundle_hash: sim.bundle_hash.map(hex::encode),
             state_commitment,
             dependency_commitment,

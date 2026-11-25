@@ -8,7 +8,9 @@ pub mod verify;
 
 pub use canonical::to_canonical_bytes;
 pub use commitment::{
-    compute_dependency_commitment, compute_state_commitment, compute_sub_commitment,
+    canonical_bundle_schema_for_state, compute_dependency_commitment,
+    compute_dependency_commitment_for_schema, compute_state_commitment, compute_sub_commitment,
+    compute_sub_commitment_for_schema, compute_sub_commitment_v2, is_v2_state_schema,
 };
 pub use hash::{
     answer_cache_client_intent_preimage_bytes, bundle_hash_preimage_bytes,
@@ -17,8 +19,10 @@ pub use hash::{
     compute_answer_cache_client_intent_hash, compute_answer_cache_summary_commitment,
     compute_answer_text_hash, compute_bundle_hash, compute_checkpoint_hash,
     compute_claim_client_intent_hash, compute_claim_content_hash, compute_claim_group_key,
-    compute_evidence_event_hash, compute_evidence_event_hash_full,
-    compute_evidence_event_hash_v172, compute_evidence_event_hash_with_meta,
+    compute_erasable_claim_commitment, compute_evidence_event_hash,
+    compute_evidence_event_hash_full, compute_evidence_event_hash_v172,
+    compute_evidence_event_hash_v173, compute_evidence_event_hash_with_meta,
+    compute_host_key_rotation_commitment,
     compute_logical_claim_group_key, compute_object_client_intent_hash,
     compute_object_content_hash, compute_omission_list_hash, compute_override_attestation_hash,
     compute_override_client_intent_hash, compute_query_text_hash,
@@ -30,7 +34,7 @@ pub use hash::{
     compute_witness_revocation_by_domain, compute_witness_revocation_commitment,
     compute_witness_revocation_v2_commitment, compute_write_summary_commitment,
     encode_length_delimited, evidence_event_preimage_bytes, evidence_event_preimage_bytes_full,
-    evidence_event_preimage_bytes_v172, hash_length_delimited, object_client_intent_preimage_bytes,
+    evidence_event_preimage_bytes_v172, evidence_event_preimage_bytes_v173, hash_length_delimited, object_client_intent_preimage_bytes,
     object_content_preimage_bytes, override_attestation_preimage_bytes,
     override_client_intent_preimage_bytes, rebuild_archive_header_preimage_bytes,
     recompute_winning_bucket_corroboration, retract_claim_client_intent_preimage_bytes,
@@ -49,10 +53,12 @@ pub use signing::{
     checkpoint_signing_preimage, checkpoint_signing_preimage_bytes, evidence_signing_preimage,
     evidence_signing_preimage_bytes, override_signing_preimage, override_signing_preimage_bytes,
     rebuild_header_signing_preimage, rebuild_header_signing_preimage_bytes,
-    sign_answer_cache_receipt, sign_checkpoint_head, sign_evidence_entry,
+    host_key_rotation_signing_digest, sign_answer_cache_receipt, sign_checkpoint_head,
+    sign_evidence_entry, sign_host_key_rotation_new, sign_host_key_rotation_old,
     sign_override_attestation, sign_rebuild_archive_header, sign_witness_anchor,
     verify_answer_cache_signature, verify_checkpoint_signature, verify_client_content_signature,
-    verify_evidence_signature, verify_override_signature, verify_rebuild_archive_header_signature,
+    verify_evidence_signature, verify_host_key_rotation_new, verify_host_key_rotation_old,
+    verify_override_signature, verify_rebuild_archive_header_signature,
     verify_witness_anchor_signature, witness_anchor_signing_preimage,
     witness_anchor_signing_preimage_bytes,
 };
@@ -77,7 +83,9 @@ mod tests {
         OmissionRecord, OmittedItem, PolicyResultTag, RefusalMetadata, ResolutionRecord,
         ResolverManifest, StateRebuildArchive, StoredObject, WitnessRegistrationSummary,
         WriteLedgerSummary, WriteOperationKind, ANSWER_CACHE_DOMAIN_V1, OVERRIDE_DOMAIN_V2,
-        SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1, WITNESS_REG_DOMAIN_V3,
+        SCHEMA_VERSION, SCHEMA_VERSION_V1,
+        SCHEMA_VERSION_V2, STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+        WITNESS_REG_DOMAIN_V3,
         WRITE_EVENT_DOMAIN_V1,
     };
     use chrono::{Duration, TimeZone, Utc};
@@ -125,14 +133,34 @@ mod tests {
         );
         let perm = [0x33; 32];
         assert_eq!(
-            compute_state_commitment(SCHEMA_VERSION, "t", "s", &h1, &h2, &empty, &perm),
+            compute_state_commitment(SCHEMA_VERSION_V1, "t", "s", &h1, &h2, &empty, &perm),
             hash_length_delimited(&[
-                SCHEMA_VERSION.as_bytes(),
+                SCHEMA_VERSION_V1.as_bytes(),
                 b"t",
                 b"s",
                 &h1,
                 &h2,
                 &empty,
+                &perm
+            ])
+        );
+        let empty_v2 = compute_sub_commitment_v2(&[]);
+        assert_eq!(empty_v2, hash_length_delimited(&[b"acta:sub_commitment:v2"]));
+        assert_ne!(empty_v2, empty);
+        assert_eq!(
+            compute_sub_commitment_v2(&[h2, h1]),
+            hash_length_delimited(&[b"acta:sub_commitment:v2", &h1, &h2])
+        );
+        assert_eq!(
+            compute_state_commitment(SCHEMA_VERSION_V2, "t", "s", &h1, &h2, &empty_v2, &perm),
+            hash_length_delimited(&[
+                b"acta:state:v2",
+                SCHEMA_VERSION_V2.as_bytes(),
+                b"t",
+                b"s",
+                &h1,
+                &h2,
+                &empty_v2,
                 &perm
             ])
         );
@@ -677,6 +705,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 154, &[0x99; 32], &ev_hash),
             created_at: t,
         };
@@ -708,6 +737,7 @@ mod tests {
             state_commitment: [0xCD; 32],
             validity_mode: Some("dependency_subset".to_string()),
             task_dependency_commitment: Some([0xDD; 32]),
+            dependency_ids: Vec::new(),
             answer_hash: ah,
             cached_by: "kylewilson04::oauth:kylewilson04".to_string(),
             cacher_auth_kind: "ed25519_client_sig".to_string(),
@@ -750,6 +780,7 @@ mod tests {
             answer_cache_summary: Some(inv_acs),
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 155, &ev_hash, &ac_ev_hash),
             created_at: t,
         };
@@ -832,6 +863,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: Some(wreg),
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 1, &[0u8; 32], &v3_hash),
             created_at: t,
         };
@@ -855,6 +887,7 @@ mod tests {
             scope: "acta-test/v172".to_string(),
             up_to_seq: 1,
             evaluated_at: t,
+            genesis_host_public_key: None,
             host_public_key: host_pk,
             permission_root: perm_root,
             header_hash: hdr_hash,
@@ -995,6 +1028,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_sk, "kylewilson04", 2, &v3_hash, &b_ev_hash),
             created_at: c2.created_at,
         };

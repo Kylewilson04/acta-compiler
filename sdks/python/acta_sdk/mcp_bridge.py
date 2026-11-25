@@ -822,7 +822,7 @@ class ActaGitMcpBridge:
                     "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {
                         "name": "acta-mcp-git-bridge",
-                        "version": "1.7.2",
+                        "version": "1.7.3",
                     },
                 },
             }

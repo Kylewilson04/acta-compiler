@@ -4,7 +4,10 @@ pub use acta_crypto::{
     dump_archive_preimages, verify_and_rebuild_scope_state_offline, verify_export_archive,
     OfflineStateRebuildSummary, VerificationSummary,
 };
-use acta_types::{ExportArchive, StateRebuildArchive, STATE_REBUILD_ARCHIVE_SCHEMA_V1};
+use acta_types::{
+    ExportArchive, StateRebuildArchive, STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+};
 
 struct CliArgs {
     archive_path: String,
@@ -102,9 +105,10 @@ fn main() -> ExitCode {
     };
 
     // Unwrap if user saved the full LedgerStateRebuildResponse JSON (`{"rebuild_proof_archive": {...}}`)
-    let inner_rebuild_opt = if peek_val.get("schema_version").and_then(|s| s.as_str())
-        == Some(STATE_REBUILD_ARCHIVE_SCHEMA_V1)
-    {
+    let inner_rebuild_opt = if matches!(
+        peek_val.get("schema_version").and_then(|s| s.as_str()),
+        Some(STATE_REBUILD_ARCHIVE_SCHEMA_V1) | Some(STATE_REBUILD_ARCHIVE_SCHEMA_V2)
+    ) {
         Some(peek_val.clone())
     } else {
         peek_val.get("rebuild_proof_archive").cloned()
@@ -389,6 +393,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sig_1,
             created_at: now,
         };
@@ -421,6 +426,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sig_2,
             created_at: now,
         };
@@ -468,6 +474,7 @@ mod tests {
                 registration_blake3_preimage_hex: hex::encode(&wreg_preimage),
             }),
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sig_3,
             created_at: now,
         };
@@ -537,6 +544,7 @@ mod tests {
                 audit_path: path_2,
             },
             override_entry_proofs: vec![],
+            rotation_entry_proofs: vec![],
             write_entry_proofs: vec![],
             anchored_checkpoint: Some(SignedTreeHead {
                 tenant_id: "tenant-verify".to_string(),
@@ -823,6 +831,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-verify", 1, &[0u8; 32], &ev1_hash),
             created_at: now,
         };
@@ -869,6 +878,7 @@ mod tests {
                 registration_blake3_preimage_hex: hex::encode(&reg3_pre),
             }),
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-verify", 2, &ev1_hash, &ev2_hash),
             created_at: now,
         };
@@ -917,6 +927,7 @@ mod tests {
                 revocation_domain: WITNESS_REVOKE_DOMAIN_V1.to_string(),
                 revocation_blake3_preimage_hex: hex::encode(&rev_pre),
             }),
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-verify", 3, &ev2_hash, &ev3_hash),
             created_at: now,
         };
@@ -978,6 +989,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-verify", 4, &ev3_hash, &ev4_hash),
             created_at: now,
         };
@@ -1096,6 +1108,7 @@ mod tests {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-v164", 1, &[0u8; 32], &ev1_hash),
             created_at: now,
         };
@@ -1146,6 +1159,7 @@ mod tests {
                 revocation_domain: WITNESS_REVOKE_DOMAIN_V2.to_string(),
                 revocation_blake3_preimage_hex: hex::encode(&ret_pre),
             }),
+            host_key_rotation_summary: None,
             host_signature: sign_evidence_entry(&host_key, "tenant-v164", 2, &ev1_hash, &ev2_hash),
             created_at: now,
         };
@@ -1194,6 +1208,7 @@ mod tests {
                     audit_path: vec![],
                 },
                 override_entry_proofs: vec![],
+            rotation_entry_proofs: vec![],
             write_entry_proofs: vec![],
                 anchored_checkpoint: None,
                 consistency_proof_to_anchor: vec![],

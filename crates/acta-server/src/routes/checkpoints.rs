@@ -186,9 +186,10 @@ pub async fn handle_register_witness(
     }
 
     let now = Utc::now().trunc_subsecs(6);
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let outcome = evidence_repo::register_trusted_witness_tx(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         &req.tenant_id,
         &req.witness_id,
         &witness_public_key,
@@ -356,9 +357,10 @@ pub async fn handle_revoke_witness(
     }
 
     let now = Utc::now().trunc_subsecs(6);
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let outcome = evidence_repo::revoke_trusted_witness_tx(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         &req.tenant_id,
         &req.witness_id,
         &effective_actor,
@@ -518,9 +520,11 @@ pub async fn handle_get_checkpoint(
         }
     }
 
+    let active_sk = state.signing_key_for_tenant(clean_tenant);
+    let active_pk = active_sk.verifying_key().to_bytes();
     let head_opt = evidence_repo::build_signed_tree_head(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         clean_tenant,
         query.tree_size,
     )
@@ -535,7 +539,7 @@ pub async fn handle_get_checkpoint(
         return Ok(Json(CheckpointResponse {
             tenant_id: clean_tenant.to_string(),
             tree_size: 0,
-            host_public_key: hex::encode(state.host_public_key),
+            host_public_key: hex::encode(active_pk),
             empty_merkle_root: Some(hex::encode(merkle_empty_root())),
             head_witnessed: Some(false),
             checkpoint: None,
@@ -559,7 +563,7 @@ pub async fn handle_get_checkpoint(
             }
             let (prior_sth, _) = evidence_repo::build_signed_tree_head(
                 &state.pool,
-                &state.host_signing_key,
+                &active_sk,
                 clean_tenant,
                 Some(first_n),
             )
@@ -591,7 +595,7 @@ pub async fn handle_get_checkpoint(
         latest_anchor_consistency_verified,
     ) = evidence_repo::resolve_latest_anchored_for_head(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         clean_tenant,
         &sth,
         &leaves,
@@ -601,7 +605,7 @@ pub async fn handle_get_checkpoint(
     Ok(Json(CheckpointResponse {
         tenant_id: clean_tenant.to_string(),
         tree_size: sth.tree_size,
-        host_public_key: hex::encode(state.host_public_key),
+        host_public_key: hex::encode(active_pk),
         empty_merkle_root: None,
         head_witnessed: Some(head_witnessed),
         checkpoint: Some(sth),
@@ -754,9 +758,10 @@ pub async fn handle_anchor_checkpoint(
         return Err(ApiError::forbidden(format!("{msg}{suffix}")));
     }
 
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let (sth, _) = evidence_repo::build_signed_tree_head(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         &req.tenant_id,
         Some(req.tree_size),
     )

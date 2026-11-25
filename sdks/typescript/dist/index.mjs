@@ -1,5 +1,5 @@
 /**
- * @acta/sdk v1.7.2 — Zero-Dependency ESM Runtime for Acta Compiler v1.7.2
+ * @acta/sdk v1.7.3 — Zero-Dependency ESM Runtime for Acta Compiler v1.7.3
  *
  * Bit-for-bit compatible with Rust `acta-crypto`:
  * - Spec-exact pure-JS BLAKE3 (256-bit unkeyed + Keyed BLAKE3 MAC)
@@ -23,10 +23,18 @@ export const TENANT_TOKEN_PREFIX = "acta_tk_v1:";
 export const DEFAULT_MIN_CONFIDENCE = 0.7;
 export const DEFAULT_DECISIVENESS_THRESHOLD = 0.15;
 export const DEFAULT_CORROBORATION_DAMPING = 0.5;
-export const SCHEMA_VERSION = "acta-context-bundle/v1";
+export const SCHEMA_VERSION_V1 = "acta-context-bundle/v1";
+export const SCHEMA_VERSION_V2 = "acta-context-bundle/v2";
+export const SCHEMA_VERSION = SCHEMA_VERSION_V2;
+export const SUB_COMMITMENT_DOMAIN_V2 = "acta:sub_commitment:v2";
+export const STATE_COMMITMENT_DOMAIN_V2 = "acta:state:v2";
 export const STATE_REBUILD_ARCHIVE_SCHEMA_V1 = "acta-state-rebuild-archive/v1";
+export const STATE_REBUILD_ARCHIVE_SCHEMA_V2 = "acta-state-rebuild-archive/v2";
+export const STATE_REBUILD_ARCHIVE_SCHEMA = STATE_REBUILD_ARCHIVE_SCHEMA_V2;
 export const REBUILD_HEADER_DOMAIN_V1 = "acta:rebuild_header:v1";
 export const REBUILD_SIG_DOMAIN_V1 = "acta:rebuild_sig:v1";
+export const HOST_KEY_ROTATE_DOMAIN_V1 = "acta:host_key_rotate:v1";
+export const ERASABLE_CLAIM_DOMAIN_V1 = "acta:erasable_claim:v1";
 
 const BLOCK_LEN = 64;
 const CHUNK_LEN = 1024;
@@ -991,10 +999,27 @@ export function signRetractClaimClientIntent(seedHexOrBytes, { tenantId, claimId
   return { clientSignatureHex: sigHex, clientPublicKeyHex: deriveEd25519PublicKeyHex(seed) };
 }
 
+export function isV2StateSchema(schemaVersion) {
+  const sv = String(schemaVersion || "");
+  return sv === "acta-context-bundle/v2" || sv === "acta-state-rebuild-archive/v2" || sv === "v2";
+}
+
 export function computeSubCommitment(hashes) {
   const rawList = (hashes || []).map((h) => Buffer.from(asHash32(h)));
   rawList.sort(Buffer.compare);
   return bytesToHex(hashLengthDelimited(rawList));
+}
+
+export function computeSubCommitmentV2(hashes) {
+  const rawList = (hashes || []).map((h) => Buffer.from(asHash32(h)));
+  rawList.sort(Buffer.compare);
+  return bytesToHex(hashLengthDelimited(["acta:sub_commitment:v2", ...rawList]));
+}
+
+export function computeSubCommitmentForSchema(schemaVersion, hashes) {
+  return isV2StateSchema(schemaVersion)
+    ? computeSubCommitmentV2(hashes)
+    : computeSubCommitment(hashes);
 }
 
 export function computeStateCommitment({
@@ -1006,15 +1031,46 @@ export function computeStateCommitment({
   memoryRoot,
   permissionRoot,
 }) {
+  const sv = String(schemaVersion);
+  if (isV2StateSchema(sv)) {
+    const bundleSchema =
+      sv === "acta-state-rebuild-archive/v2" || sv === "v2" ? SCHEMA_VERSION_V2 : sv;
+    return bytesToHex(
+      hashLengthDelimited([
+        "acta:state:v2",
+        bundleSchema,
+        String(tenantId),
+        String(scope),
+        asHash32(intentRoot),
+        asHash32(knowledgeRoot),
+        asHash32(memoryRoot),
+        asHash32(permissionRoot),
+      ])
+    );
+  }
+  const bundleSchema =
+    sv === "acta-state-rebuild-archive/v1" || sv === "v1" ? SCHEMA_VERSION_V1 : sv;
   return bytesToHex(
     hashLengthDelimited([
-      String(schemaVersion),
+      bundleSchema,
       String(tenantId),
       String(scope),
       asHash32(intentRoot),
       asHash32(knowledgeRoot),
       asHash32(memoryRoot),
       asHash32(permissionRoot),
+    ])
+  );
+}
+
+export function computeErasableClaimCommitment({ claimId, salt32, objectVal, sourceCommitment }) {
+  return bytesToHex(
+    hashLengthDelimited([
+      "acta:erasable_claim:v1",
+      uuidToBytes(claimId),
+      asHash32(salt32),
+      toCanonicalBytes(objectVal),
+      asHash32(sourceCommitment),
     ])
   );
 }
@@ -1118,6 +1174,9 @@ function normalizeAnswerCacheSummary(acs) {
   if (acs.task_dependency_commitment != null) {
     out.task_dependency_commitment = bytesToHex(asHash32(acs.task_dependency_commitment)).toLowerCase();
   }
+  if (Array.isArray(acs.dependency_ids) && acs.dependency_ids.length > 0) {
+    out.dependency_ids = acs.dependency_ids.map((u) => normalizeUuidString(u));
+  }
   if (acs.client_public_key != null) {
     out.client_public_key = bytesToHex(asHash32(acs.client_public_key)).toLowerCase();
   }
@@ -1165,6 +1224,94 @@ function normalizeWitnessRevokeSummary(wrev) {
     out.effective_from_tree_size = Number(wrev.effective_from_tree_size);
   }
   return out;
+}
+
+function normalizeHostKeyRotationSummary(rot) {
+  const newSigBytes = hexToBytes(rot.new_key_signature);
+  if (newSigBytes.length !== 64) throw new Error("new_key_signature must be 64 bytes");
+  const out = {
+    rotation_domain: String(rot.rotation_domain || HOST_KEY_ROTATE_DOMAIN_V1),
+    old_public_key: bytesToHex(asHash32(rot.old_public_key)).toLowerCase(),
+    new_public_key: bytesToHex(asHash32(rot.new_public_key)).toLowerCase(),
+    effective_from_seq: Number(rot.effective_from_seq),
+    rotation_mode: String(rot.rotation_mode),
+    reason: String(rot.reason),
+    rotated_by: String(rot.rotated_by),
+    new_key_signature: bytesToHex(newSigBytes).toLowerCase(),
+  };
+  if (rot.compromised_from_seq != null) {
+    out.compromised_from_seq = Number(rot.compromised_from_seq);
+  }
+  if (rot.old_key_signature != null) {
+    const oldSigBytes = hexToBytes(rot.old_key_signature);
+    if (oldSigBytes.length !== 64) throw new Error("old_key_signature must be 64 bytes");
+    out.old_key_signature = bytesToHex(oldSigBytes).toLowerCase();
+  }
+  return out;
+}
+
+export function computeHostKeyRotationCommitment(rot) {
+  return bytesToHex(
+    hashLengthDelimited(["acta:host_key_rotate:v1", toCanonicalBytes(normalizeHostKeyRotationSummary(rot))])
+  );
+}
+
+export function hostKeyRotationSigningDigest(
+  domain,
+  tenantId,
+  effectiveFromSeq,
+  oldPublicKey,
+  newPublicKey,
+  rotationMode,
+  reason
+) {
+  return hashLengthDelimited([
+    String(domain),
+    String(tenantId),
+    i64LeBytes(BigInt(effectiveFromSeq)),
+    asHash32(oldPublicKey),
+    asHash32(newPublicKey),
+    String(rotationMode),
+    String(reason),
+  ]);
+}
+
+export function signHostKeyRotationOld(
+  oldSeedHexOrBytes,
+  { tenantId, effectiveFromSeq, oldPublicKey, newPublicKey, rotationMode, reason }
+) {
+  const seed = hexToBytes(oldSeedHexOrBytes);
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digest = hostKeyRotationSigningDigest(
+    "acta:host_key_rotate_old_sig:v1",
+    tenantId,
+    effectiveFromSeq,
+    oldPublicKey,
+    newPublicKey,
+    rotationMode,
+    reason
+  );
+  return bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
+}
+
+export function signHostKeyRotationNew(
+  newSeedHexOrBytes,
+  { tenantId, effectiveFromSeq, oldPublicKey, newPublicKey, rotationMode, reason }
+) {
+  const seed = hexToBytes(newSeedHexOrBytes);
+  const pkcs8 = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
+  const privKey = nodeCrypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const digest = hostKeyRotationSigningDigest(
+    "acta:host_key_rotate_new_sig:v1",
+    tenantId,
+    effectiveFromSeq,
+    oldPublicKey,
+    newPublicKey,
+    rotationMode,
+    reason
+  );
+  return bytesToHex(nodeCrypto.sign(null, Buffer.from(digest), privKey));
 }
 
 export function rebuildArchiveHeaderPreimageBytes({
@@ -1550,8 +1697,29 @@ export function computeEvidenceEventHash({
   witnessRegSummary = null,
   witnessRevokeSummary = null,
   witnessInV3 = false,
+  hostKeyRotationSummary = null,
 }) {
   const micros = typeof createdAt === "bigint" ? createdAt : parseRfc3339Micros(createdAt);
+  if (hostKeyRotationSummary != null) {
+    const rotTagged = encodeOptJcs(normalizeHostKeyRotationSummary(hostKeyRotationSummary));
+    return bytesToHex(
+      hashLengthDelimited([
+        "acta:evidence_event:v3",
+        String(tenantId),
+        i64LeBytes(BigInt(seqNum)),
+        asHash32(prevHash),
+        encodeOptHash32(bundleHash),
+        encodeOptHash32(stateCommitment),
+        String(policyResult),
+        i64LeBytes(micros),
+        new Uint8Array([0]),
+        new Uint8Array([0]),
+        new Uint8Array([0]),
+        new Uint8Array([0]),
+        rotTagged,
+      ])
+    );
+  }
   if (writeSummary != null || answerCacheSummary != null) {
     const writeTagged = encodeOptJcs(writeSummary != null ? normalizeWriteSummary(writeSummary) : null);
     const cacheTagged = encodeOptJcs(
@@ -2015,7 +2183,10 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     (entry.witness_reg_summary != null || entry.witness_revoke_summary != null) &&
     entry.event_domain === "acta:evidence_event:v3";
   const expectedEvDomain =
-    entry.write_summary != null || entry.answer_cache_summary != null || witnessInV3
+    entry.write_summary != null ||
+    entry.answer_cache_summary != null ||
+    witnessInV3 ||
+    entry.host_key_rotation_summary != null
       ? "acta:evidence_event:v3"
       : entry.refusal_metadata == null && entry.override_summary == null
       ? "acta:evidence_event:v1"
@@ -2052,7 +2223,7 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
       ActaSignatureVerificationError
     );
     const snap = { ...ws.record_snapshot };
-    if (ws.operation === "ingest_object") {
+    if (ws.operation === "ingest_object" || ws.operation === "legacy_import_object") {
       if (
         String(snap.tenant_id) !== String(entry.tenant_id) ||
         normalizeUuidString(snap.id) !== normalizeUuidString(ws.item_id) ||
@@ -2071,7 +2242,11 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
       snap.client_signature = ws.client_signature ?? null;
       snap.client_public_key = ws.client_public_key ?? null;
       verifyObjectAuthorSig(snap, lbl, ActaSignatureVerificationError);
-    } else if (ws.operation === "ingest_claim" || ws.operation === "retract_claim") {
+    } else if (
+      ws.operation === "ingest_claim" ||
+      ws.operation === "retract_claim" ||
+      ws.operation === "legacy_import_claim"
+    ) {
       if (
         String(snap.tenant_id) !== String(entry.tenant_id) ||
         normalizeUuidString(snap.id) !== normalizeUuidString(ws.item_id) ||
@@ -2287,6 +2462,72 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     }
   }
 
+  if (entry.host_key_rotation_summary != null) {
+    const rot = entry.host_key_rotation_summary;
+    if (
+      entry.bundle_hash != null ||
+      entry.refusal_metadata != null ||
+      entry.override_summary != null ||
+      entry.write_summary != null ||
+      entry.answer_cache_summary != null ||
+      entry.witness_reg_summary != null ||
+      entry.witness_revoke_summary != null
+    ) {
+      throw new ActaSignatureVerificationError("host_key_rotation_summary cannot coexist with other entry payloads");
+    }
+    if (String(rot.rotation_domain || HOST_KEY_ROTATE_DOMAIN_V1) !== HOST_KEY_ROTATE_DOMAIN_V1) {
+      throw new ActaSignatureVerificationError("unsupported rotation_domain");
+    }
+    if (Number(rot.effective_from_seq) !== Number(entry.seq_num)) {
+      throw new ActaSignatureVerificationError("effective_from_seq mismatch");
+    }
+    const expPkHex = bytesToHex(asHash32(expectedPubkeyHex)).toLowerCase();
+    const oldPkHex = bytesToHex(asHash32(rot.old_public_key)).toLowerCase();
+    const newPkHex = bytesToHex(asHash32(rot.new_public_key)).toLowerCase();
+    if (oldPkHex !== expPkHex || WEAK_ED25519_PUBKEYS.has(newPkHex)) {
+      throw new ActaSignatureVerificationError("invalid old_public_key or weak new_public_key");
+    }
+    if (rot.rotation_mode === "scheduled") {
+      if (!rot.old_key_signature) {
+        throw new ActaSignatureVerificationError("scheduled rotation requires old_key_signature");
+      }
+      const oldDig = hostKeyRotationSigningDigest(
+        "acta:host_key_rotate_old_sig:v1",
+        entry.tenant_id,
+        rot.effective_from_seq,
+        oldPkHex,
+        newPkHex,
+        rot.rotation_mode,
+        rot.reason
+      );
+      if (!verifyEd25519Strict(oldPkHex, oldDig, rot.old_key_signature)) {
+        throw new ActaSignatureVerificationError("old_key_signature verification failed");
+      }
+    } else if (rot.rotation_mode === "compromise_recovery") {
+      if (rot.compromised_from_seq == null) {
+        throw new ActaSignatureVerificationError("compromise_recovery requires compromised_from_seq");
+      }
+    } else {
+      throw new ActaSignatureVerificationError(`unsupported rotation_mode ${rot.rotation_mode}`);
+    }
+    const newDig = hostKeyRotationSigningDigest(
+      "acta:host_key_rotate_new_sig:v1",
+      entry.tenant_id,
+      rot.effective_from_seq,
+      oldPkHex,
+      newPkHex,
+      rot.rotation_mode,
+      rot.reason
+    );
+    if (!verifyEd25519Strict(newPkHex, newDig, rot.new_key_signature)) {
+      throw new ActaSignatureVerificationError("new_key_signature verification failed");
+    }
+    const expRotComm = computeHostKeyRotationCommitment(rot);
+    if (!entry.state_commitment || String(entry.state_commitment).toLowerCase() !== expRotComm) {
+      throw new ActaSignatureVerificationError("tampered host_key_rotation_summary state_commitment");
+    }
+  }
+
   const recomputed = computeEvidenceEventHash({
     tenantId: entry.tenant_id,
     seqNum: entry.seq_num,
@@ -2302,6 +2543,7 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     witnessRegSummary: entry.witness_reg_summary ?? null,
     witnessRevokeSummary: entry.witness_revoke_summary ?? null,
     witnessInV3,
+    hostKeyRotationSummary: entry.host_key_rotation_summary ?? null,
   });
   const storedHex = String(entry.event_hash).toLowerCase();
   if (recomputed !== storedHex) {
@@ -2310,7 +2552,12 @@ export function verifyEvidenceEntry(entry, expectedPubkeyHex) {
     );
   }
   const digest = evidenceSigningPreimage(entry.tenant_id, entry.seq_num, entry.prev_hash, recomputed);
-  if (!verifyEd25519Strict(expectedPubkeyHex, digest, entry.host_signature)) {
+  const sigOk =
+    verifyEd25519Strict(expectedPubkeyHex, digest, entry.host_signature) ||
+    (entry.host_key_rotation_summary != null &&
+      entry.host_key_rotation_summary.rotation_mode === "compromise_recovery" &&
+      verifyEd25519Strict(entry.host_key_rotation_summary.new_public_key, digest, entry.host_signature));
+  if (!sigOk) {
     throw new ActaSignatureVerificationError(
       `Ed25519 host_signature verification failed at evidence seq_num=${entry.seq_num}`
     );
@@ -2360,13 +2607,21 @@ function verifyEntryInclusion(proof, sth, expectedPubkeyHex) {
 }
 
 export function verifyExportArchive(archive, expectedPubkeyHex) {
-  const expectedClean = String(expectedPubkeyHex).trim().toLowerCase();
+  const expectedArg = String(expectedPubkeyHex).trim().toLowerCase();
   const archivePk = String(archive.host_public_key).trim().toLowerCase();
-  if (archivePk !== expectedClean) {
+  let firstRotOldPk = null;
+  for (const ev of archive.evidence_chain || []) {
+    if (ev.host_key_rotation_summary != null) {
+      firstRotOldPk = bytesToHex(asHash32(ev.host_key_rotation_summary.old_public_key)).toLowerCase();
+      break;
+    }
+  }
+  if (archivePk !== expectedArg && (!firstRotOldPk || firstRotOldPk !== expectedArg)) {
     throw new ActaVerificationError(
-      `host_public_key mismatch: archive contains ${archivePk}, expected ${expectedClean}`
+      `host_public_key mismatch: archive contains ${archivePk}, expected ${expectedArg}`
     );
   }
+  const expectedClean = archivePk;
   if (WEAK_ED25519_PUBKEYS.has(expectedClean)) {
     throw new ActaVerificationError("rejected weak low-order Ed25519 public key");
   }
@@ -2677,6 +2932,7 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
   const evidenceBySeq = new Map();
   const zeroHex = "00".repeat(32);
 
+  let chainPk = firstRotOldPk || expectedClean;
   for (let idx = 0; idx < chain.length; idx++) {
     const entry = chain[idx];
     if (entry.tenant_id !== bundle.tenant_id) {
@@ -2699,7 +2955,10 @@ export function verifyExportArchive(archive, expectedPubkeyHex) {
     if (entry.write_summary != null) verifiedWrites += 1;
     if (entry.answer_cache_summary != null) verifiedAnswerCaches += 1;
     try {
-      verifyEvidenceEntry(entry, expectedClean);
+      verifyEvidenceEntry(entry, chainPk);
+      if (entry.host_key_rotation_summary != null) {
+        chainPk = bytesToHex(asHash32(entry.host_key_rotation_summary.new_public_key)).toLowerCase();
+      }
     } catch (err) {
       throw new ActaVerificationError(err.message);
     }
@@ -2907,21 +3166,31 @@ export function verifyAndRebuildScopeStateOffline(
       ? archiveOrResponse.rebuild_proof_archive
       : archiveOrResponse;
   const schemaVer = String(archive.schema_version || STATE_REBUILD_ARCHIVE_SCHEMA_V1);
-  if (schemaVer !== STATE_REBUILD_ARCHIVE_SCHEMA_V1) {
+  let bundleStateSchema;
+  if (schemaVer === STATE_REBUILD_ARCHIVE_SCHEMA_V1) {
+    bundleStateSchema = SCHEMA_VERSION_V1;
+  } else if (schemaVer === STATE_REBUILD_ARCHIVE_SCHEMA_V2) {
+    bundleStateSchema = SCHEMA_VERSION_V2;
+  } else {
     throw new ActaVerificationError(
-      `unsupported StateRebuildArchive.schema_version '${schemaVer}' (expected '${STATE_REBUILD_ARCHIVE_SCHEMA_V1}')`
+      `unsupported StateRebuildArchive.schema_version '${schemaVer}'`
     );
   }
-  const expectedClean = String(expectedPubkeyHex).trim().toLowerCase();
+  const expectedArgClean = String(expectedPubkeyHex).trim().toLowerCase();
   const archivePk = String(archive.host_public_key).trim().toLowerCase();
-  if (archivePk !== expectedClean) {
+  const genesisPk = archive.genesis_host_public_key
+    ? String(archive.genesis_host_public_key).trim().toLowerCase()
+    : archivePk;
+  if (expectedArgClean !== archivePk && expectedArgClean !== genesisPk) {
     throw new ActaVerificationError(
-      `host_public_key mismatch: archive contains ${archivePk}, expected ${expectedClean}`
+      `host_public_key mismatch: archive tail=${archivePk} (genesis=${genesisPk}), expected ${expectedArgClean}`
     );
   }
-  if (WEAK_ED25519_PUBKEYS.has(expectedClean)) {
+  const expectedClean = archivePk;
+  if (WEAK_ED25519_PUBKEYS.has(expectedClean) || WEAK_ED25519_PUBKEYS.has(genesisPk)) {
     throw new ActaVerificationError("rejected weak low-order Ed25519 public key");
   }
+  let activePk = genesisPk;
 
   const tenantId = String(archive.tenant_id);
   const targetScope =
@@ -2997,10 +3266,14 @@ export function verifyAndRebuildScopeStateOffline(
         throw new ActaVerificationError(`broken prev_hash link at seq_num=${entry.seq_num}`);
       }
     }
+    const entryPk = activePk;
     try {
-      verifyEvidenceEntry(entry, expectedClean);
+      verifyEvidenceEntry(entry, entryPk);
     } catch (err) {
       throw new ActaVerificationError(err.message);
+    }
+    if (entry.host_key_rotation_summary != null) {
+      activePk = bytesToHex(asHash32(entry.host_key_rotation_summary.new_public_key)).toLowerCase();
     }
     leaves.push(merkleLeafHash(entry.seq_num, entry.event_hash));
 
@@ -3008,9 +3281,13 @@ export function verifyAndRebuildScopeStateOffline(
       writeEventsReplayed += 1;
       const ws = entry.write_summary;
       const snap = ws.record_snapshot;
-      if (ws.operation === "ingest_object") {
+      if (ws.operation === "ingest_object" || ws.operation === "legacy_import_object") {
         objectsMap.set(normalizeUuidString(snap.id), snap);
-      } else if (ws.operation === "ingest_claim" || ws.operation === "retract_claim") {
+      } else if (
+        ws.operation === "ingest_claim" ||
+        ws.operation === "retract_claim" ||
+        ws.operation === "legacy_import_claim"
+      ) {
         claimsMap.set(normalizeUuidString(snap.id), snap);
       }
     }
@@ -3023,8 +3300,12 @@ export function verifyAndRebuildScopeStateOffline(
       expectedOverrideSeqs.set(Number(entry.seq_num), {
         attId: normalizeUuidString(entry.override_summary.attestation_id),
         attComm: bytesToHex(asHash32(entry.state_commitment)).toLowerCase(),
+        entryPk,
       });
     }
+  }
+  if (upToSeq > 0 && activePk !== expectedClean) {
+    throw new ActaVerificationError("active host key after replaying chain != archive.host_public_key");
   }
 
   const verifiedOverridesBySeq = new Map();
@@ -3066,12 +3347,12 @@ export function verifyAndRebuildScopeStateOffline(
       throw new ActaVerificationError(`tampered override_attestation[id=${aid}]`);
     }
     const evSeq = Number(att.evidence_seq_num);
-    if (!verifyOverrideSignature(expectedClean, tenantId, evSeq, recomputedAtt, att.host_signature)) {
+    const exp = expectedOverrideSeqs.get(evSeq);
+    if (!exp || !verifyOverrideSignature(exp.entryPk, tenantId, evSeq, recomputedAtt, att.host_signature)) {
       throw new ActaVerificationError(
         `Ed25519 host_signature verification failed on override_attestation[id=${aid}]`
       );
     }
-    const exp = expectedOverrideSeqs.get(evSeq);
     if (!exp || exp.attId !== aid || exp.attComm !== storedAttHex) {
       throw new ActaVerificationError(
         `override_attestation[id=${aid}] mismatch against evidence_chain seq_num=${evSeq}`
@@ -3115,7 +3396,12 @@ export function verifyAndRebuildScopeStateOffline(
 
     if (archive.latest_anchored_checkpoint != null) {
       const anchorSth = archive.latest_anchored_checkpoint;
-      const anchorCnt = verifySignedTreeHead(anchorSth, tenantId, expectedClean);
+      let anchorCnt;
+      try {
+        anchorCnt = verifySignedTreeHead(anchorSth, tenantId, expectedClean);
+      } catch {
+        anchorCnt = verifySignedTreeHead(anchorSth, tenantId, genesisPk);
+      }
       if (anchorCnt === 0) {
         throw new ActaVerificationError(
           "latest_anchored_checkpoint contains zero verified witness_anchors"
@@ -3211,11 +3497,11 @@ export function verifyAndRebuildScopeStateOffline(
   }
 
   const permRootHex = bytesToHex(asHash32(archive.permission_root)).toLowerCase();
-  const intentRootHex = computeSubCommitment(intentHashes);
-  const memoryRootHex = computeSubCommitment(memoryHashes);
-  const knowledgeRootHex = computeSubCommitment(claimHashes);
+  const intentRootHex = computeSubCommitmentForSchema(bundleStateSchema, intentHashes);
+  const memoryRootHex = computeSubCommitmentForSchema(bundleStateSchema, memoryHashes);
+  const knowledgeRootHex = computeSubCommitmentForSchema(bundleStateSchema, claimHashes);
   const stateCommitmentHex = computeStateCommitment({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: bundleStateSchema,
     tenantId,
     scope: targetScope,
     intentRoot: intentRootHex,
@@ -3223,6 +3509,19 @@ export function verifyAndRebuildScopeStateOffline(
     memoryRoot: memoryRootHex,
     permissionRoot: permRootHex,
   });
+
+  const quarantinedCompromisedSeqs = [];
+  for (const entry of chain) {
+    const rot = entry.host_key_rotation_summary;
+    if (rot && rot.rotation_mode === "compromise_recovery" && rot.compromised_from_seq != null) {
+      const effSeq = Number(rot.effective_from_seq);
+      const protectedUpTo =
+        anchoredTreeSize != null && anchoredTreeSize < effSeq ? anchoredTreeSize : 0;
+      for (let s = Math.max(Number(rot.compromised_from_seq), protectedUpTo + 1); s < effSeq; s++) {
+        if (!quarantinedCompromisedSeqs.includes(s)) quarantinedCompromisedSeqs.push(s);
+      }
+    }
+  }
 
   return {
     tenant_id: tenantId,
@@ -3246,6 +3545,7 @@ export function verifyAndRebuildScopeStateOffline(
     merkle_root_hex: merkleRootHex,
     anchored_tree_size: anchoredTreeSize,
     verified_witness_anchors: verifiedWitnessAnchors,
+    quarantined_compromised_seqs: quarantinedCompromisedSeqs,
   };
 }
 
@@ -3786,6 +4086,7 @@ export class ActaClient {
     if (req.validFrom) body.valid_from = req.validFrom;
     if (req.validTo) body.valid_to = req.validTo;
     if (req.predecessorId) body.predecessor_id = req.predecessorId;
+    if (req.erasable !== undefined) body.erasable = Boolean(req.erasable);
     if (req.clientSignatureHex) body.client_signature_hex = req.clientSignatureHex;
     if (req.clientPublicKeyHex) body.client_public_key_hex = req.clientPublicKeyHex;
     const { data } = await this._requestJson("POST", "/v1/claims", body, [200, 201]);
@@ -3801,6 +4102,7 @@ export class ActaClient {
     };
     if (req.scope) body.scope = req.scope;
     if (req.id) body.id = req.id;
+    if (req.eraseSecret !== undefined) body.erase_secret = Boolean(req.eraseSecret);
     if (req.clientSignatureHex) body.client_signature_hex = req.clientSignatureHex;
     if (req.clientPublicKeyHex) body.client_public_key_hex = req.clientPublicKeyHex;
     const { data } = await this._requestJson("POST", "/v1/claims/retract", body, [200, 201]);
@@ -3895,6 +4197,8 @@ export class ActaClient {
     const effTenant = this._enforceTenant(params.tenantId);
     const q = [`scope=${encodeURIComponent(scope)}`];
     if (params.upToSeq !== undefined) q.push(`up_to_seq=${Number(params.upToSeq)}`);
+    if (params.evaluatedAt !== undefined) q.push(`evaluated_at=${encodeURIComponent(String(params.evaluatedAt))}`);
+    if (params.stateSchemaVersion !== undefined) q.push(`state_schema_version=${encodeURIComponent(String(params.stateSchemaVersion))}`);
     if (params.includeProofArchive) q.push("include_proof_archive=true");
     const { data } = await this._requestJson(
       "GET",

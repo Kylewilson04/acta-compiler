@@ -26,6 +26,9 @@ pub enum ActaError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("bundle stale at cache time: {0}")]
+    BundleStaleAtCacheTime(String),
+
     #[error("verification failed: {0}")]
     VerificationFailed(String),
 }

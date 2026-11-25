@@ -301,3 +301,119 @@ pub fn verify_client_content_signature(
     let sig = Signature::from_bytes(signature_bytes);
     vk.verify_strict(content_hash, &sig).is_ok()
 }
+
+pub fn host_key_rotation_signing_digest(
+    domain: &[u8],
+    tenant_id: &str,
+    effective_from_seq: i64,
+    old_public_key: &[u8; 32],
+    new_public_key: &[u8; 32],
+    rotation_mode: &str,
+    reason: &str,
+) -> [u8; 32] {
+    let seq_le = effective_from_seq.to_le_bytes();
+    crate::hash::hash_length_delimited(&[
+        domain,
+        tenant_id.as_bytes(),
+        &seq_le,
+        old_public_key,
+        new_public_key,
+        rotation_mode.as_bytes(),
+        reason.as_bytes(),
+    ])
+}
+
+pub fn sign_host_key_rotation_old(
+    old_signing_key: &SigningKey,
+    tenant_id: &str,
+    effective_from_seq: i64,
+    old_public_key: &[u8; 32],
+    new_public_key: &[u8; 32],
+    rotation_mode: &str,
+    reason: &str,
+) -> [u8; 64] {
+    let msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    );
+    old_signing_key.sign(&msg).to_bytes()
+}
+
+pub fn sign_host_key_rotation_new(
+    new_signing_key: &SigningKey,
+    tenant_id: &str,
+    effective_from_seq: i64,
+    old_public_key: &[u8; 32],
+    new_public_key: &[u8; 32],
+    rotation_mode: &str,
+    reason: &str,
+) -> [u8; 64] {
+    let msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    );
+    new_signing_key.sign(&msg).to_bytes()
+}
+
+pub fn verify_host_key_rotation_old(
+    old_verifying_key: &VerifyingKey,
+    tenant_id: &str,
+    effective_from_seq: i64,
+    old_public_key: &[u8; 32],
+    new_public_key: &[u8; 32],
+    rotation_mode: &str,
+    reason: &str,
+    signature_bytes: &[u8; 64],
+) -> bool {
+    if old_verifying_key.is_weak() {
+        return false;
+    }
+    let msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    );
+    let sig = ed25519_dalek::Signature::from_bytes(signature_bytes);
+    old_verifying_key.verify_strict(&msg, &sig).is_ok()
+}
+
+pub fn verify_host_key_rotation_new(
+    new_verifying_key: &VerifyingKey,
+    tenant_id: &str,
+    effective_from_seq: i64,
+    old_public_key: &[u8; 32],
+    new_public_key: &[u8; 32],
+    rotation_mode: &str,
+    reason: &str,
+    signature_bytes: &[u8; 64],
+) -> bool {
+    if new_verifying_key.is_weak() {
+        return false;
+    }
+    let msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    );
+    let sig = ed25519_dalek::Signature::from_bytes(signature_bytes);
+    new_verifying_key.verify_strict(&msg, &sig).is_ok()
+}
+

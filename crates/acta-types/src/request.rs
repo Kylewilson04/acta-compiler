@@ -125,6 +125,8 @@ pub struct CachedAnswerReceipt {
     pub validity_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_dependency_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_ids: Vec<Uuid>,
     pub answer_hash: String,
     pub cache_domain: String,
     pub cache_commitment: String,
@@ -261,6 +263,8 @@ pub struct TraceItemImpactResponse {
 pub struct LedgerStateRebuildResponse {
     pub tenant_id: String,
     pub scope: String,
+    #[serde(default)]
+    pub state_schema_version: String,
     pub verified_up_to_seq: i64,
     pub chain_cryptographically_verified: bool,
     pub write_events_replayed: usize,
@@ -303,6 +307,10 @@ pub struct CacheDependencySpec {
     pub memory_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_claim_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_dependency_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_schema_version: Option<String>,
     #[serde(default)]
     pub empty_knowledge_fallback: bool,
 }

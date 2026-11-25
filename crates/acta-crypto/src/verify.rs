@@ -4,7 +4,8 @@ use acta_types::{
     ClaimStatus, EntryInclusionProof, EvidenceEntry, ExportArchive, KnowledgeClaim,
     LifecycleStatus, ObjectType, ResolverManifest, SignedTreeHead, StateRebuildArchive,
     StoredObject, WriteLedgerSummary, WriteOperationKind, ANSWER_CACHE_DOMAIN_V1,
-    DEFAULT_CORROBORATION_DAMPING, SCHEMA_VERSION, STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    DEFAULT_CORROBORATION_DAMPING, HOST_KEY_ROTATE_DOMAIN_V1, SCHEMA_VERSION_V1,
+    SCHEMA_VERSION_V2, STATE_REBUILD_ARCHIVE_SCHEMA_V1, STATE_REBUILD_ARCHIVE_SCHEMA_V2,
     WRITE_EVENT_DOMAIN_V1,
 };
 use ed25519_dalek::VerifyingKey;
@@ -18,18 +19,21 @@ use crate::{
     claims_share_winning_value_bucket, compute_answer_cache_client_intent_hash,
     compute_answer_cache_summary_commitment, compute_bundle_hash, compute_checkpoint_hash,
     compute_claim_client_intent_hash, compute_claim_content_hash, compute_claim_group_key,
-    compute_evidence_event_hash_v172, compute_logical_claim_group_key,
+    compute_evidence_event_hash_v173,
+    compute_host_key_rotation_commitment, compute_logical_claim_group_key,
     compute_merkle_root_from_leaves, compute_object_client_intent_hash,
     compute_object_content_hash, compute_override_attestation_hash,
     compute_override_client_intent_hash, compute_rebuild_archive_header_hash,
     compute_refusal_metadata_commitment, compute_retract_claim_client_intent_hash,
-    compute_state_commitment, compute_sub_commitment, compute_write_summary_commitment,
-    evidence_event_preimage_bytes_v172, evidence_signing_preimage, evidence_signing_preimage_bytes,
+    compute_state_commitment, compute_sub_commitment_for_schema,
+    compute_write_summary_commitment,
+    evidence_event_preimage_bytes_v173, evidence_signing_preimage, evidence_signing_preimage_bytes,
     legacy_blake3_merkle_empty_root, merkle_empty_root, merkle_leaf_hash,
     merkle_leaf_preimage_bytes, object_content_preimage_bytes, override_attestation_preimage_bytes,
     override_client_intent_preimage_bytes, override_signing_preimage,
     override_signing_preimage_bytes, recompute_winning_bucket_corroboration, to_canonical_bytes,
     verify_checkpoint_signature, verify_client_content_signature, verify_evidence_signature,
+    verify_host_key_rotation_new, verify_host_key_rotation_old,
     verify_merkle_consistency_proof, verify_merkle_inclusion_proof, verify_override_signature,
     verify_rebuild_archive_header_signature, verify_witness_anchor_signature,
     witness_anchor_signing_preimage, witness_anchor_signing_preimage_bytes,
@@ -250,7 +254,7 @@ fn verify_write_ledger_summary(
     )?;
 
     match ws.operation {
-        WriteOperationKind::IngestObject => {
+        WriteOperationKind::IngestObject | WriteOperationKind::LegacyImportObject => {
             let mut snap_obj: StoredObject = serde_json::from_value(ws.record_snapshot.clone())
                 .map_err(|e| format!("{label} invalid StoredObject record_snapshot: {e}"))?;
             if snap_obj.tenant_id != entry.tenant_id
@@ -274,7 +278,7 @@ fn verify_write_ledger_summary(
             snap_obj.client_public_key = ws.client_public_key;
             verify_object_author_signature(&snap_obj, &label)?;
         }
-        WriteOperationKind::IngestClaim | WriteOperationKind::RetractClaim => {
+        WriteOperationKind::IngestClaim | WriteOperationKind::RetractClaim | WriteOperationKind::LegacyImportClaim => {
             let mut snap_claim: KnowledgeClaim =
                 serde_json::from_value(ws.record_snapshot.clone())
                     .map_err(|e| format!("{label} invalid KnowledgeClaim record_snapshot: {e}"))?;
@@ -618,8 +622,115 @@ fn verify_single_evidence_entry(
         }
     }
 
+    if let Some(ref rot) = entry.host_key_rotation_summary {
+        if entry.bundle_hash.is_some()
+            || entry.refusal_metadata.is_some()
+            || entry.override_summary.is_some()
+            || entry.write_summary.is_some()
+            || entry.answer_cache_summary.is_some()
+            || entry.witness_reg_summary.is_some()
+            || entry.witness_revoke_summary.is_some()
+        {
+            return Err(format!(
+                "invalid evidence entry at seq_num={}: host_key_rotation_summary cannot coexist with other entry payloads",
+                entry.seq_num
+            ));
+        }
+        if rot.rotation_domain != HOST_KEY_ROTATE_DOMAIN_V1 {
+            return Err(format!(
+                "unsupported host_key_rotation_summary.rotation_domain '{}' at seq_num={}",
+                rot.rotation_domain, entry.seq_num
+            ));
+        }
+        if rot.effective_from_seq != entry.seq_num {
+            return Err(format!(
+                "host_key_rotation_summary.effective_from_seq ({}) != entry.seq_num ({})",
+                rot.effective_from_seq, entry.seq_num
+            ));
+        }
+        if rot.old_public_key != verifying_key.to_bytes() {
+            return Err(format!(
+                "host_key_rotation_summary.old_public_key mismatch against active host key at seq_num={}",
+                entry.seq_num
+            ));
+        }
+        let new_vk = VerifyingKey::from_bytes(&rot.new_public_key)
+            .map_err(|e| format!("invalid new_public_key in host_key_rotation_summary at seq_num={}: {e}", entry.seq_num))?;
+        if new_vk.is_weak() {
+            return Err(format!(
+                "rejected weak low-order new_public_key in host_key_rotation_summary at seq_num={}",
+                entry.seq_num
+            ));
+        }
+        match rot.rotation_mode.as_str() {
+            "scheduled" => {
+                let Some(ref old_sig_vec) = rot.old_key_signature else {
+                    return Err(format!(
+                        "scheduled host_key_rotation_summary at seq_num={} requires old_key_signature",
+                        entry.seq_num
+                    ));
+                };
+                let old_sig_arr: [u8; 64] = old_sig_vec.as_slice().try_into().map_err(|_| {
+                    format!("old_key_signature at seq_num={} is not 64 bytes", entry.seq_num)
+                })?;
+                if !verify_host_key_rotation_old(
+                    verifying_key,
+                    &entry.tenant_id,
+                    rot.effective_from_seq,
+                    &rot.old_public_key,
+                    &rot.new_public_key,
+                    &rot.rotation_mode,
+                    &rot.reason,
+                    &old_sig_arr,
+                ) {
+                    return Err(format!(
+                        "old_key_signature verification failed on host_key_rotation_summary at seq_num={}",
+                        entry.seq_num
+                    ));
+                }
+            }
+            "compromise_recovery" => {
+                if rot.compromised_from_seq.is_none() {
+                    return Err(format!(
+                        "compromise_recovery host_key_rotation_summary at seq_num={} requires compromised_from_seq",
+                        entry.seq_num
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unsupported host_key_rotation_summary.rotation_mode '{other}' at seq_num={}",
+                    entry.seq_num
+                ));
+            }
+        }
+        if !verify_host_key_rotation_new(
+            &new_vk,
+            &entry.tenant_id,
+            rot.effective_from_seq,
+            &rot.old_public_key,
+            &rot.new_public_key,
+            &rot.rotation_mode,
+            &rot.reason,
+            &rot.new_key_signature,
+        ) {
+            return Err(format!(
+                "new_key_signature verification failed on host_key_rotation_summary at seq_num={}",
+                entry.seq_num
+            ));
+        }
+        let expected_rot_comm = compute_host_key_rotation_commitment(rot)
+            .map_err(|e| format!("host_key_rotation_summary canonicalization failed: {e}"))?;
+        if entry.state_commitment != Some(expected_rot_comm) {
+            return Err(format!(
+                "tampered host_key_rotation_summary at seq_num={}: state_commitment mismatch",
+                entry.seq_num
+            ));
+        }
+    }
+
     let witness_in_v3 = entry.uses_witness_v3_event_domain();
-    let recomputed_event_hash = compute_evidence_event_hash_v172(
+    let recomputed_event_hash = compute_evidence_event_hash_v173(
         &entry.tenant_id,
         entry.seq_num,
         &entry.prev_hash,
@@ -634,6 +745,7 @@ fn verify_single_evidence_entry(
         entry.witness_reg_summary.as_ref(),
         entry.witness_revoke_summary.as_ref(),
         witness_in_v3,
+        entry.host_key_rotation_summary.as_ref(),
     )
     .map_err(|e| format!("evidence event_hash computation failed at seq_num={}: {e}", entry.seq_num))?;
 
@@ -646,14 +758,29 @@ fn verify_single_evidence_entry(
         ));
     }
 
-    if !verify_evidence_signature(
+    let sig_ok = verify_evidence_signature(
         verifying_key,
         &entry.tenant_id,
         entry.seq_num,
         &entry.prev_hash,
         &recomputed_event_hash,
         &entry.host_signature,
-    ) {
+    ) || entry
+        .host_key_rotation_summary
+        .as_ref()
+        .filter(|r| r.rotation_mode == "compromise_recovery")
+        .and_then(|r| VerifyingKey::from_bytes(&r.new_public_key).ok())
+        .is_some_and(|new_vk| {
+            verify_evidence_signature(
+                &new_vk,
+                &entry.tenant_id,
+                entry.seq_num,
+                &entry.prev_hash,
+                &recomputed_event_hash,
+                &entry.host_signature,
+            )
+        });
+    if !sig_ok {
         return Err(format!(
             "Ed25519 host_signature verification failed at evidence seq_num={}",
             entry.seq_num
@@ -777,14 +904,27 @@ pub fn verify_export_archive(
     archive: &ExportArchive,
     expected_pubkey: &[u8; 32],
 ) -> Result<VerificationSummary, String> {
-    if &archive.host_public_key != expected_pubkey {
+    let first_rot_old_pk = archive
+        .evidence_chain
+        .iter()
+        .find_map(|e| e.host_key_rotation_summary.as_ref().map(|r| r.old_public_key))
+        .or_else(|| {
+            archive.merkle_proof.as_ref().and_then(|mp| {
+                mp.rotation_entry_proofs
+                    .iter()
+                    .find_map(|rp| rp.entry.host_key_rotation_summary.as_ref().map(|r| r.old_public_key))
+            })
+        });
+    if &archive.host_public_key != expected_pubkey
+        && first_rot_old_pk.as_ref() != Some(expected_pubkey)
+    {
         return Err(format!(
             "host_public_key mismatch: archive contains {}, expected {}",
             hex::encode(archive.host_public_key),
             hex::encode(expected_pubkey)
         ));
     }
-    let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
+    let verifying_key = VerifyingKey::from_bytes(&archive.host_public_key)
         .map_err(|e| format!("invalid Ed25519 public key: {e}"))?;
     if verifying_key.is_weak() {
         return Err("rejected weak low-order Ed25519 public key".to_string());
@@ -944,13 +1084,24 @@ pub fn verify_export_archive(
                 hex::encode(att.attestation_hash)
             ));
         }
-        if !verify_override_signature(
+        let ovr_sig_ok = verify_override_signature(
             &verifying_key,
             &att.tenant_id,
             att.evidence_seq_num,
             &recomputed_att_hash,
             &att.host_signature,
-        ) {
+        ) || first_rot_old_pk
+            .and_then(|pk| VerifyingKey::from_bytes(&pk).ok())
+            .is_some_and(|gvk| {
+                verify_override_signature(
+                    &gvk,
+                    &att.tenant_id,
+                    att.evidence_seq_num,
+                    &recomputed_att_hash,
+                    &att.host_signature,
+                )
+            });
+        if !ovr_sig_ok {
             return Err(format!(
                 "Ed25519 host_signature verification failed on override_attestation[id={}]",
                 att.id
@@ -1134,6 +1285,11 @@ pub fn verify_export_archive(
     let mut found_matching_bundle_entry = false;
 
     if !archive.evidence_chain.is_empty() {
+        let mut chain_vk = match first_rot_old_pk {
+            Some(old_pk) => VerifyingKey::from_bytes(&old_pk)
+                .map_err(|e| format!("invalid genesis host key in rotation chain: {e}"))?,
+            None => verifying_key,
+        };
         for (idx, entry) in archive.evidence_chain.iter().enumerate() {
             if idx == 0 {
                 if entry.seq_num == 1 && entry.prev_hash != [0u8; 32] {
@@ -1162,7 +1318,11 @@ pub fn verify_export_archive(
             }
 
             let counts =
-                verify_single_evidence_entry(entry, &archive.bundle.tenant_id, &verifying_key)?;
+                verify_single_evidence_entry(entry, &archive.bundle.tenant_id, &chain_vk)?;
+            if let Some(ref rot) = entry.host_key_rotation_summary {
+                chain_vk = VerifyingKey::from_bytes(&rot.new_public_key)
+                    .map_err(|e| format!("invalid rotated host key at seq_num={}: {e}", entry.seq_num))?;
+            }
             if counts.is_refusal {
                 verified_refusals += 1;
             }
@@ -1196,7 +1356,53 @@ pub fn verify_export_archive(
     if let Some(ref mp) = archive.merkle_proof {
         verified_witness_anchors =
             verify_signed_tree_head(&mp.checkpoint, &archive.bundle.tenant_id, &verifying_key)?;
-        verify_entry_inclusion(&mp.bundle_entry_proof, &mp.checkpoint, &verifying_key)?;
+
+        let mut key_epochs: Vec<(i64, VerifyingKey)> = Vec::new();
+        let genesis_vk = match first_rot_old_pk {
+            Some(old_pk) => VerifyingKey::from_bytes(&old_pk)
+                .map_err(|e| format!("invalid genesis host key in merkle rotation schedule: {e}"))?,
+            None => verifying_key,
+        };
+        key_epochs.push((1, genesis_vk));
+        if !mp.rotation_entry_proofs.is_empty() {
+            let mut cur_vk = genesis_vk;
+            for rot_proof in &mp.rotation_entry_proofs {
+                verify_entry_inclusion(rot_proof, &mp.checkpoint, &cur_vk)?;
+                let Some(ref rot) = rot_proof.entry.host_key_rotation_summary else {
+                    return Err(format!(
+                        "merkle_proof.rotation_entry_proofs entry seq_num={} missing host_key_rotation_summary",
+                        rot_proof.entry.seq_num
+                    ));
+                };
+                let next_vk = VerifyingKey::from_bytes(&rot.new_public_key)
+                    .map_err(|e| format!("invalid rotated host key in rotation_entry_proofs: {e}"))?;
+                cur_vk = next_vk;
+                key_epochs.push((rot.effective_from_seq + 1, next_vk));
+            }
+        } else if !archive.evidence_chain.is_empty() {
+            for e in &archive.evidence_chain {
+                if let Some(ref rot) = e.host_key_rotation_summary {
+                    let next_vk = VerifyingKey::from_bytes(&rot.new_public_key)
+                        .map_err(|err| format!("invalid rotated host key at seq_num={}: {err}", e.seq_num))?;
+                    key_epochs.push((rot.effective_from_seq + 1, next_vk));
+                }
+            }
+        }
+        let vk_for_seq = |seq: i64| -> &VerifyingKey {
+            let mut chosen = &key_epochs[0].1;
+            for (start_seq, vk) in &key_epochs {
+                if seq >= *start_seq {
+                    chosen = vk;
+                }
+            }
+            chosen
+        };
+
+        verify_entry_inclusion(
+            &mp.bundle_entry_proof,
+            &mp.checkpoint,
+            vk_for_seq(mp.bundle_entry_proof.entry.seq_num),
+        )?;
 
         if mp.bundle_entry_proof.entry.bundle_hash != Some(recomputed_bundle_hash)
             || mp.bundle_entry_proof.entry.state_commitment != Some(archive.bundle.state_commitment)
@@ -1214,7 +1420,7 @@ pub fn verify_export_archive(
         evidence_by_seq.insert(mp.bundle_entry_proof.entry.seq_num, &mp.bundle_entry_proof.entry);
 
         for ovr_proof in &mp.override_entry_proofs {
-            verify_entry_inclusion(ovr_proof, &mp.checkpoint, &verifying_key)?;
+            verify_entry_inclusion(ovr_proof, &mp.checkpoint, vk_for_seq(ovr_proof.entry.seq_num))?;
             if archive.evidence_chain.is_empty()
                 && !evidence_by_seq.contains_key(&ovr_proof.entry.seq_num)
             {
@@ -1224,7 +1430,7 @@ pub fn verify_export_archive(
         }
 
         for wr_proof in &mp.write_entry_proofs {
-            let counts = verify_entry_inclusion(wr_proof, &mp.checkpoint, &verifying_key)?;
+            let counts = verify_entry_inclusion(wr_proof, &mp.checkpoint, vk_for_seq(wr_proof.entry.seq_num))?;
             if archive.evidence_chain.is_empty()
                 && !evidence_by_seq.contains_key(&wr_proof.entry.seq_num)
             {
@@ -1270,7 +1476,8 @@ pub fn verify_export_archive(
                 ));
             }
             let bridged_anchors =
-                verify_signed_tree_head(anchor_sth, &archive.bundle.tenant_id, &verifying_key)?;
+                verify_signed_tree_head(anchor_sth, &archive.bundle.tenant_id, &verifying_key)
+                    .or_else(|_| verify_signed_tree_head(anchor_sth, &archive.bundle.tenant_id, &genesis_vk))?;
             let cons_nodes = decode_audit_path(&mp.consistency_proof_to_anchor)?;
             if !verify_merkle_consistency_proof(
                 mp.checkpoint.tree_size,
@@ -1612,7 +1819,7 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
 
     let mut evidence_dump = Vec::with_capacity(entries_source.len());
     for entry in entries_source {
-        let (event_domain, ev_preimage) = evidence_event_preimage_bytes_v172(
+        let (event_domain, ev_preimage) = evidence_event_preimage_bytes_v173(
             &entry.tenant_id,
             entry.seq_num,
             &entry.prev_hash,
@@ -1627,6 +1834,7 @@ pub fn dump_archive_preimages(archive: &ExportArchive) -> Result<Value, String> 
             entry.witness_reg_summary.as_ref(),
             entry.witness_revoke_summary.as_ref(),
             entry.uses_witness_v3_event_domain(),
+            entry.host_key_rotation_summary.as_ref(),
         )
         .map_err(|e| format!("evidence preimage error at seq {}: {e}", entry.seq_num))?;
 
@@ -1769,6 +1977,8 @@ pub struct OfflineStateRebuildSummary {
     pub anchored_tree_size: Option<i64>,
     #[serde(default)]
     pub verified_witness_anchors: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_compromised_seqs: Vec<i64>,
 }
 
 /// Standalone offline verifier & state reconstructor (`v1.7.2+`, PPA 1 Claim 1 & §11):
@@ -1783,23 +1993,35 @@ pub fn verify_and_rebuild_scope_state_offline(
     expected_pubkey: &[u8; 32],
     scope_override: Option<&str>,
 ) -> Result<OfflineStateRebuildSummary, String> {
-    if archive.schema_version != STATE_REBUILD_ARCHIVE_SCHEMA_V1 {
+    let bundle_state_schema = match archive.schema_version.as_str() {
+        STATE_REBUILD_ARCHIVE_SCHEMA_V1 => SCHEMA_VERSION_V1,
+        STATE_REBUILD_ARCHIVE_SCHEMA_V2 => SCHEMA_VERSION_V2,
+        other => {
+            return Err(format!(
+                "unsupported StateRebuildArchive schema_version '{other}' (expected '{}' or '{}')",
+                STATE_REBUILD_ARCHIVE_SCHEMA_V1, STATE_REBUILD_ARCHIVE_SCHEMA_V2
+            ));
+        }
+    };
+
+    let genesis_pk = archive.genesis_host_public_key.unwrap_or(archive.host_public_key);
+    if expected_pubkey != &archive.host_public_key && expected_pubkey != &genesis_pk {
         return Err(format!(
-            "unsupported StateRebuildArchive schema_version '{}' (expected '{}')",
-            archive.schema_version, STATE_REBUILD_ARCHIVE_SCHEMA_V1
-        ));
-    }
-    if &archive.host_public_key != expected_pubkey {
-        return Err(format!(
-            "host_public_key mismatch: archive contains {}, expected {}",
+            "host_public_key mismatch: archive tail={} (genesis={}), expected {}",
             hex::encode(archive.host_public_key),
+            hex::encode(genesis_pk),
             hex::encode(expected_pubkey)
         ));
     }
-    let verifying_key = VerifyingKey::from_bytes(expected_pubkey)
-        .map_err(|e| format!("invalid Ed25519 public key: {e}"))?;
-    if verifying_key.is_weak() {
+    let tail_verifying_key = VerifyingKey::from_bytes(&archive.host_public_key)
+        .map_err(|e| format!("invalid tail Ed25519 public key: {e}"))?;
+    if tail_verifying_key.is_weak() {
         return Err("rejected weak low-order Ed25519 public key".to_string());
+    }
+    let mut active_verifying_key = VerifyingKey::from_bytes(&genesis_pk)
+        .map_err(|e| format!("invalid genesis Ed25519 public key: {e}"))?;
+    if active_verifying_key.is_weak() {
+        return Err("rejected weak low-order genesis Ed25519 public key".to_string());
     }
 
     if archive.up_to_seq < 0 {
@@ -1822,7 +2044,7 @@ pub fn verify_and_rebuild_scope_state_offline(
         ));
     }
     if !verify_rebuild_archive_header_signature(
-        &verifying_key,
+        &tail_verifying_key,
         &archive.tenant_id,
         &recomputed_header_hash,
         &archive.host_header_signature,
@@ -1849,7 +2071,7 @@ pub fn verify_and_rebuild_scope_state_offline(
     let mut objects_map: BTreeMap<Uuid, StoredObject> = BTreeMap::new();
     let mut claims_map: BTreeMap<Uuid, KnowledgeClaim> = BTreeMap::new();
     let mut write_events_replayed = 0usize;
-    let mut expected_override_seqs: BTreeMap<i64, (Uuid, [u8; 32])> = BTreeMap::new();
+    let mut expected_override_seqs: BTreeMap<i64, (Uuid, [u8; 32], VerifyingKey)> = BTreeMap::new();
     let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(archive.evidence_chain.len());
 
     for (idx, entry) in archive.evidence_chain.iter().enumerate() {
@@ -1874,14 +2096,19 @@ pub fn verify_and_rebuild_scope_state_offline(
             ));
         }
 
-        verify_single_evidence_entry(entry, &archive.tenant_id, &verifying_key)?;
+        let entry_vk = active_verifying_key;
+        verify_single_evidence_entry(entry, &archive.tenant_id, &entry_vk)?;
+        if let Some(ref rot) = entry.host_key_rotation_summary {
+            active_verifying_key = VerifyingKey::from_bytes(&rot.new_public_key)
+                .map_err(|e| format!("invalid rotated host public key at seq_num={}: {e}", entry.seq_num))?;
+        }
         leaves.push(merkle_leaf_hash(entry.seq_num, &entry.event_hash));
 
         if let Some(ref ws) = entry.write_summary {
             if ws.scope == target_scope {
                 write_events_replayed += 1;
                 match ws.operation {
-                    WriteOperationKind::IngestObject => {
+                    WriteOperationKind::IngestObject | WriteOperationKind::LegacyImportObject => {
                         let obj: StoredObject = serde_json::from_value(ws.record_snapshot.clone())
                             .map_err(|e| {
                                 format!(
@@ -1891,7 +2118,7 @@ pub fn verify_and_rebuild_scope_state_offline(
                             })?;
                         objects_map.insert(obj.id, obj);
                     }
-                    WriteOperationKind::IngestClaim | WriteOperationKind::RetractClaim => {
+                    WriteOperationKind::IngestClaim | WriteOperationKind::RetractClaim | WriteOperationKind::LegacyImportClaim => {
                         let clm: KnowledgeClaim =
                             serde_json::from_value(ws.record_snapshot.clone()).map_err(|e| {
                                 format!(
@@ -1913,9 +2140,17 @@ pub fn verify_and_rebuild_scope_state_offline(
                         entry.seq_num
                     )
                 })?;
-                expected_override_seqs.insert(entry.seq_num, (ovs.attestation_id, att_comm));
+                expected_override_seqs.insert(entry.seq_num, (ovs.attestation_id, att_comm, entry_vk));
             }
         }
+    }
+
+    if archive.up_to_seq > 0 && active_verifying_key.to_bytes() != archive.host_public_key {
+        return Err(format!(
+            "active host key after replaying chain ({}) != archive.host_public_key ({})",
+            hex::encode(active_verifying_key.to_bytes()),
+            hex::encode(archive.host_public_key)
+        ));
     }
 
     // Verify every provided OverrideAttestation in target_scope AND ensure none in evidence_chain were stripped!
@@ -1985,8 +2220,14 @@ pub fn verify_and_rebuild_scope_state_offline(
                 hex::encode(att.attestation_hash)
             ));
         }
+        let Some(&(exp_id, exp_comm, ref ovr_vk)) = expected_override_seqs.get(&att.evidence_seq_num) else {
+            return Err(format!(
+                "unlinked override_attestation[id={}] at evidence_seq_num={} not present in evidence_chain",
+                att.id, att.evidence_seq_num
+            ));
+        };
         if !verify_override_signature(
-            &verifying_key,
+            ovr_vk,
             &att.tenant_id,
             att.evidence_seq_num,
             &recomputed_att_hash,
@@ -1997,12 +2238,7 @@ pub fn verify_and_rebuild_scope_state_offline(
                 att.id
             ));
         }
-        let Some(&(exp_id, exp_comm)) = expected_override_seqs.get(&att.evidence_seq_num) else {
-            return Err(format!(
-                "unlinked override_attestation[id={}] at evidence_seq_num={} not present in evidence_chain",
-                att.id, att.evidence_seq_num
-            ));
-        };
+
         if exp_id != att.id || exp_comm != att.attestation_hash {
             return Err(format!(
                 "override_attestation[id={}] mismatch against evidence_chain seq_num={}",
@@ -2012,7 +2248,7 @@ pub fn verify_and_rebuild_scope_state_offline(
         verified_overrides_by_seq.insert(att.evidence_seq_num, att);
     }
 
-    for (&seq, &(att_id, _)) in &expected_override_seqs {
+    for (&seq, &(att_id, _, _)) in &expected_override_seqs {
         if !verified_overrides_by_seq.contains_key(&seq) {
             return Err(format!(
                 "stripped override_attestation[id={att_id}] notarized at evidence_chain seq_num={seq} is missing from archive.override_attestations"
@@ -2034,7 +2270,7 @@ pub fn verify_and_rebuild_scope_state_offline(
                 ));
             }
             verified_witness_anchors =
-                verify_signed_tree_head(sth, &archive.tenant_id, &verifying_key)?;
+                verify_signed_tree_head(sth, &archive.tenant_id, &tail_verifying_key)?;
             if sth.merkle_root != computed_root {
                 return Err(format!(
                     "checkpoint.merkle_root {} != root {} computed from evidence_chain",
@@ -2053,7 +2289,10 @@ pub fn verify_and_rebuild_scope_state_offline(
 
         if let Some(ref anchor_sth) = archive.latest_anchored_checkpoint {
             let anchor_cnt =
-                verify_signed_tree_head(anchor_sth, &archive.tenant_id, &verifying_key)?;
+                verify_signed_tree_head(anchor_sth, &archive.tenant_id, &tail_verifying_key).or_else(|_| {
+                    let gen_vk = VerifyingKey::from_bytes(&genesis_pk).map_err(|e| e.to_string())?;
+                    verify_signed_tree_head(anchor_sth, &archive.tenant_id, &gen_vk)
+                })?;
             if anchor_cnt == 0 {
                 return Err(
                     "latest_anchored_checkpoint contains zero verified witness_anchors".to_string(),
@@ -2155,11 +2394,11 @@ pub fn verify_and_rebuild_scope_state_offline(
         }
     }
 
-    let intent_root = compute_sub_commitment(&intent_hashes);
-    let memory_root = compute_sub_commitment(&memory_hashes);
-    let knowledge_root = compute_sub_commitment(&claim_hashes);
+    let intent_root = compute_sub_commitment_for_schema(bundle_state_schema, &intent_hashes);
+    let memory_root = compute_sub_commitment_for_schema(bundle_state_schema, &memory_hashes);
+    let knowledge_root = compute_sub_commitment_for_schema(bundle_state_schema, &claim_hashes);
     let state_commitment = compute_state_commitment(
-        SCHEMA_VERSION,
+        bundle_state_schema,
         &archive.tenant_id,
         target_scope,
         &intent_root,
@@ -2167,6 +2406,25 @@ pub fn verify_and_rebuild_scope_state_offline(
         &memory_root,
         &archive.permission_root,
     );
+
+    let mut quarantined_compromised_seqs = Vec::new();
+    for entry in &archive.evidence_chain {
+        if let Some(ref rot) = entry.host_key_rotation_summary {
+            if rot.rotation_mode == "compromise_recovery" {
+                if let Some(comp_start) = rot.compromised_from_seq {
+                    let protected_up_to = anchored_tree_size
+                        .filter(|&m| m < rot.effective_from_seq)
+                        .unwrap_or(0);
+                    let start = comp_start.max(protected_up_to + 1);
+                    for s in start..rot.effective_from_seq {
+                        if !quarantined_compromised_seqs.contains(&s) {
+                            quarantined_compromised_seqs.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(OfflineStateRebuildSummary {
         tenant_id: archive.tenant_id.clone(),
@@ -2190,5 +2448,6 @@ pub fn verify_and_rebuild_scope_state_offline(
         merkle_root_hex,
         anchored_tree_size,
         verified_witness_anchors,
+        quarantined_compromised_seqs,
     })
 }

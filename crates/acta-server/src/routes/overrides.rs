@@ -515,9 +515,10 @@ pub async fn handle_attest_override(
         return Err(ApiError::bad_request(format!("{msg}{suffix}")));
     }
 
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let (att, _ev, was_noop) = overrides_repo::attest_override_tx(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         NewOverrideInput {
             id: req.id.unwrap_or_else(Uuid::new_v4),
             tenant_id: req.tenant_id,

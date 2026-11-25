@@ -500,6 +500,7 @@ impl RichInMemoryStore {
                 answer_cache_summary: None,
                 witness_reg_summary: None,
                 witness_revoke_summary: None,
+                host_key_rotation_summary: None,
                 host_signature,
                 created_at,
             };
@@ -612,6 +613,7 @@ impl RichInMemoryStore {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: ev_sig,
             created_at,
         });
@@ -733,7 +735,7 @@ async fn test_v161_mcp_boundary_rejects_spoofed_adjudicator_weak_witness_and_for
     let whoami_res = mcp_call(&app, &token, "acta_whoami", json!({})).await;
     assert_eq!(whoami_res["result"]["isError"], json!(false));
     let whoami_sc = &whoami_res["result"]["structuredContent"];
-    assert_eq!(whoami_sc["version"], json!("1.7.2"));
+    assert_eq!(whoami_sc["version"], json!("1.7.3"));
     assert!(whoami_sc.get("cached_answer_count").is_some());
     assert!(whoami_sc.get("quarantined_anchor_count").is_some());
     assert!(whoami_sc.get("quarantined_anchors").is_some());
@@ -1448,7 +1450,8 @@ async fn test_v161_rfc6962_sha256_merkle_raw_preimages_lapsed_override_and_why_t
                 .map(hex::encode)
                 .collect(),
         }],
-        write_entry_proofs: vec![],
+        rotation_entry_proofs: vec![],
+            write_entry_proofs: vec![],
         anchored_checkpoint: None,
         consistency_proof_to_anchor: vec![],
     };
@@ -1822,6 +1825,7 @@ async fn test_v166_time_pinned_replay_lapsed_override_margin_and_anchor_refusal_
                 include_resolved_facts_omitted: false,
                 legacy_pre_v171_resolver: false,
                 legacy_v171_bidirectional_contradiction: false,
+                ..SimulationCompat::default()
             },
         )
         .await
@@ -2164,6 +2168,7 @@ async fn test_v167_directives_escaping_validation_budget_and_parity() {
             answer_cache_summary: None,
             witness_reg_summary: None,
             witness_revoke_summary: None,
+            host_key_rotation_summary: None,
             host_signature: acta_crypto::sign_evidence_entry(&host_key, "kylewilson04", 1, &[0u8; 32], &ev1_hash),
             created_at: t0,
         };
@@ -2272,6 +2277,7 @@ async fn test_v167_directives_escaping_validation_budget_and_parity() {
                 include_resolved_facts_omitted: false,
                 legacy_pre_v171_resolver: false,
                 legacy_v171_bidirectional_contradiction: false,
+                ..SimulationCompat::default()
             },
         )
         .await
@@ -2426,6 +2432,7 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature: sign_evidence_entry(&host_key, "kylewilson04", 1, &[0u8; 32], &ev1_hash),
         created_at: t0,
     };
@@ -2533,6 +2540,7 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature: sign_evidence_entry(
             &host_key,
             "kylewilson04",
@@ -2587,6 +2595,7 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
         state_commitment: b_bundle.state_commitment,
         validity_mode: None,
         task_dependency_commitment: None,
+        dependency_ids: Vec::new(),
         answer_hash: a_hash,
         cached_by: "kylewilson04::oauth:kylewilson04".to_string(),
         cacher_auth_kind: "oauth_github_principal".to_string(),
@@ -2629,6 +2638,7 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
         answer_cache_summary: Some(acs),
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature: sign_evidence_entry(
             &host_key,
             "kylewilson04",
@@ -2675,7 +2685,8 @@ async fn test_v170_ppa1_author_sig_write_chain_answer_cache_and_parity_export() 
                 .collect(),
         },
         override_entry_proofs: vec![],
-        write_entry_proofs: vec![
+        rotation_entry_proofs: vec![],
+            write_entry_proofs: vec![
             EntryInclusionProof {
                 entry: ev1.clone(),
                 audit_path: compute_merkle_inclusion_proof(&leaves, 0)

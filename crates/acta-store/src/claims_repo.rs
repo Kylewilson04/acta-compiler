@@ -1,6 +1,6 @@
 use acta_crypto::{
-    compute_claim_content_hash, compute_evidence_event_hash_full, compute_write_summary_commitment,
-    sign_evidence_entry, to_canonical_bytes,
+    compute_claim_content_hash, compute_erasable_claim_commitment, compute_evidence_event_hash_full,
+    compute_write_summary_commitment, sign_evidence_entry, to_canonical_bytes,
 };
 use acta_types::{
     ActaError, ActaResult, ClaimStatus, EvidenceEntry, KnowledgeClaim, OmissionReason,
@@ -160,13 +160,40 @@ pub async fn insert_claim(pool: &PgPool, claim: &KnowledgeClaim) -> ActaResult<(
 /// Atomically ingests or auto-supersedes a `KnowledgeClaim` AND notarizes its strip-proof
 /// `WriteLedgerSummary` (`acta:write_event:v1` -> `acta:evidence_event:v3`) on `evidence_history` (`v1.7.0+`).
 /// Same-source idempotent retries return `(prev_head, existing_evidence, true)` without duplicating ledger entries.
+pub struct ErasableClaimSecretPayload {
+    pub salt_32: [u8; 32],
+    pub erasure_commitment: [u8; 32],
+    pub sensitive_payload: serde_json::Value,
+}
+
 pub async fn insert_or_supersede_claim_with_evidence_tx(
+    pool: &PgPool,
+    host_key: &SigningKey,
+    claim: KnowledgeClaim,
+    allow_auto_supersede: bool,
+    written_by: &str,
+    writer_auth_kind: &str,
+) -> ActaResult<(KnowledgeClaim, Option<EvidenceEntry>, bool)> {
+    insert_or_supersede_claim_with_evidence_tx_v173(
+        pool,
+        host_key,
+        claim,
+        allow_auto_supersede,
+        written_by,
+        writer_auth_kind,
+        None,
+    )
+    .await
+}
+
+pub async fn insert_or_supersede_claim_with_evidence_tx_v173(
     pool: &PgPool,
     host_key: &SigningKey,
     mut claim: KnowledgeClaim,
     allow_auto_supersede: bool,
     written_by: &str,
     writer_auth_kind: &str,
+    erasable_secret: Option<ErasableClaimSecretPayload>,
 ) -> ActaResult<(KnowledgeClaim, Option<EvidenceEntry>, bool)> {
     let lock_key = format!(
         "acta:claim_head:{}\x1f{}\x1f{}\x1f{}\x1f{}",
@@ -319,6 +346,8 @@ pub async fn insert_or_supersede_claim_with_evidence_tx(
     .await
     .map_err(|e| ActaError::Storage(format!("insert claim evidence_history failed: {e}")))?;
 
+    let erasure_comm_opt = erasable_secret.as_ref().map(|s| s.erasure_commitment);
+
     sqlx::query(
         r#"
         INSERT INTO knowledge_claims (
@@ -327,7 +356,7 @@ pub async fn insert_or_supersede_claim_with_evidence_tx(
             source_descriptor, source_commitment, content_hash, status,
             contradiction_ids, valid_from, valid_to, version, predecessor_id,
             client_signature, client_public_key, retraction_reason,
-            written_by, write_domain, evidence_seq_num, created_at
+            written_by, write_domain, evidence_seq_num, erasure_commitment, created_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6,
@@ -335,7 +364,7 @@ pub async fn insert_or_supersede_claim_with_evidence_tx(
             $11, $12, $13, $14,
             $15, $16, $17, $18, $19,
             $20, $21, $22,
-            $23, $24, $25, $26
+            $23, $24, $25, $26, $27
         )
         "#,
     )
@@ -364,10 +393,30 @@ pub async fn insert_or_supersede_claim_with_evidence_tx(
     .bind(claim.written_by.as_deref())
     .bind(WRITE_EVENT_DOMAIN_V1)
     .bind(seq_num)
+    .bind(erasure_comm_opt.as_ref().map(|c| c.as_slice()))
     .bind(claim.created_at)
     .execute(&mut *tx)
     .await
     .map_err(|e| ActaError::Storage(format!("insert_claim in tx failed: {e}")))?;
+
+    if let Some(sec) = erasable_secret {
+        sqlx::query(
+            r#"
+            INSERT INTO erasable_item_secrets (
+                tenant_id, item_id, item_kind, salt_32, sensitive_payload, created_at
+            )
+            VALUES ($1, $2, 'claim', $3, $4, $5)
+            "#,
+        )
+        .bind(&claim.tenant_id)
+        .bind(claim.id)
+        .bind(sec.salt_32.as_slice())
+        .bind(sec.sensitive_payload)
+        .bind(claim.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("insert erasable_item_secrets failed: {e}")))?;
+    }
 
     tx.commit()
         .await
@@ -388,6 +437,7 @@ pub async fn insert_or_supersede_claim_with_evidence_tx(
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature,
         created_at: claim.created_at,
     };
@@ -411,6 +461,39 @@ pub async fn retract_claim_with_evidence_tx(
     client_public_key: Option<[u8; 32]>,
     created_at: DateTime<Utc>,
 ) -> ActaResult<(KnowledgeClaim, EvidenceEntry, bool)> {
+    let (tomb, ev, noop, _) = retract_claim_with_evidence_tx_v173(
+        pool,
+        host_key,
+        tenant_id,
+        target_claim_id,
+        tombstone_id,
+        reason,
+        retracted_by,
+        writer_auth_kind,
+        client_signature,
+        client_public_key,
+        false,
+        created_at,
+    )
+    .await?;
+    Ok((tomb, ev, noop))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn retract_claim_with_evidence_tx_v173(
+    pool: &PgPool,
+    host_key: &SigningKey,
+    tenant_id: &str,
+    target_claim_id: Uuid,
+    tombstone_id: Uuid,
+    reason: &str,
+    retracted_by: &str,
+    writer_auth_kind: &str,
+    client_signature: Option<Vec<u8>>,
+    client_public_key: Option<[u8; 32]>,
+    erase_secret: bool,
+    created_at: DateTime<Utc>,
+) -> ActaResult<(KnowledgeClaim, EvidenceEntry, bool, bool)> {
     let mut tx = pool
         .begin()
         .await
@@ -478,7 +561,7 @@ pub async fn retract_claim_with_evidence_tx(
         {
             if let Some(ex_seq) = succ_claim.evidence_seq_num {
                 if let Some(ex_ev) = fetch_evidence_by_seq(pool, tenant_id, ex_seq).await? {
-                    return Ok((succ_claim, ex_ev, true));
+                    return Ok((succ_claim, ex_ev, true, false));
                 }
             }
         }
@@ -587,6 +670,19 @@ pub async fn retract_claim_with_evidence_tx(
     .await
     .map_err(|e| ActaError::Storage(format!("insert retraction evidence_history failed: {e}")))?;
 
+    let mut secret_erased = false;
+    if erase_secret {
+        let del_res = sqlx::query(
+            "DELETE FROM erasable_item_secrets WHERE tenant_id = $1 AND item_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(target_claim_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("delete erasable_item_secrets failed: {e}")))?;
+        secret_erased = del_res.rows_affected() > 0;
+    }
+
     sqlx::query(
         r#"
         INSERT INTO knowledge_claims (
@@ -595,7 +691,7 @@ pub async fn retract_claim_with_evidence_tx(
             source_descriptor, source_commitment, content_hash, status,
             contradiction_ids, valid_from, valid_to, version, predecessor_id,
             client_signature, client_public_key, retraction_reason,
-            written_by, write_domain, evidence_seq_num, created_at
+            written_by, write_domain, evidence_seq_num, erased_at, created_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6,
@@ -603,7 +699,7 @@ pub async fn retract_claim_with_evidence_tx(
             $11, $12, $13, $14,
             $15, $16, $17, $18, $19,
             $20, $21, $22,
-            $23, $24, $25, $26
+            $23, $24, $25, $26, $27
         )
         "#,
     )
@@ -632,6 +728,7 @@ pub async fn retract_claim_with_evidence_tx(
     .bind(tombstone.written_by.as_deref())
     .bind(WRITE_EVENT_DOMAIN_V1)
     .bind(seq_num)
+    .bind(if secret_erased { Some(created_at) } else { None })
     .bind(tombstone.created_at)
     .execute(&mut *tx)
     .await
@@ -656,11 +753,12 @@ pub async fn retract_claim_with_evidence_tx(
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature,
         created_at,
     };
 
-    Ok((tombstone, ev, false))
+    Ok((tombstone, ev, false, secret_erased))
 }
 
 /// Fetches a single claim by `(tenant_id, id)` for predecessor version lookup.
@@ -833,4 +931,105 @@ pub async fn fetch_all_active_claim_hashes_in_scope(
         hashes.push(arr);
     }
     Ok(hashes)
+}
+
+
+#[derive(Debug, Clone)]
+pub struct ResolvedErasableClaimSecret {
+    pub claim_id: Uuid,
+    pub scope: String,
+    pub is_erasable: bool,
+    pub erased: bool,
+    pub erasure_commitment_hex: Option<String>,
+    pub salt_32_hex: Option<String>,
+    pub object_val: Option<serde_json::Value>,
+    pub source_content: Option<String>,
+    pub commitment_verified: Option<bool>,
+}
+
+/// Resolves and cryptographically verifies an erasable claim's off-chain secret (`erasable_item_secrets`)
+/// while active, or confirms cryptographic erasure (`erased = true`, `object_val = None`) after `erase_secret = true`.
+pub async fn resolve_erasable_claim_secret(
+    pool: &PgPool,
+    tenant_id: &str,
+    claim_id: Uuid,
+) -> ActaResult<ResolvedErasableClaimSecret> {
+    let claim = fetch_claim_by_id(pool, tenant_id, claim_id)
+        .await?
+        .ok_or_else(|| ActaError::NotFound(format!("claim {claim_id} not found")))?;
+
+    let env_hex = claim
+        .object_val
+        .get("$acta_erasable_commitment")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let Some(expected_hex) = env_hex else {
+        return Ok(ResolvedErasableClaimSecret {
+            claim_id,
+            scope: claim.scope,
+            is_erasable: false,
+            erased: false,
+            erasure_commitment_hex: None,
+            salt_32_hex: None,
+            object_val: Some(claim.object_val),
+            source_content: None,
+            commitment_verified: None,
+        });
+    };
+
+    let sec_row: Option<(Vec<u8>, serde_json::Value)> = sqlx::query_as(
+        "SELECT salt_32, sensitive_payload FROM erasable_item_secrets WHERE tenant_id = $1 AND item_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(claim_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ActaError::Storage(format!("query erasable_item_secrets failed: {e}")))?;
+
+    let Some((raw_salt, payload)) = sec_row else {
+        return Ok(ResolvedErasableClaimSecret {
+            claim_id,
+            scope: claim.scope,
+            is_erasable: true,
+            erased: true,
+            erasure_commitment_hex: Some(expected_hex),
+            salt_32_hex: None,
+            object_val: None,
+            source_content: None,
+            commitment_verified: None,
+        });
+    };
+
+    let salt_arr: [u8; 32] = raw_salt.try_into().map_err(|_| {
+        ActaError::Storage("erasable_item_secrets.salt_32 not 32 bytes".to_string())
+    })?;
+    let clear_val = payload
+        .get("object_val")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let clear_src = payload
+        .get("source_content")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let recomputed = compute_erasable_claim_commitment(
+        claim.id,
+        &salt_arr,
+        &clear_val,
+        &claim.source_commitment,
+    )?;
+    let verified = hex::encode(recomputed) == expected_hex;
+
+    Ok(ResolvedErasableClaimSecret {
+        claim_id,
+        scope: claim.scope,
+        is_erasable: true,
+        erased: false,
+        erasure_commitment_hex: Some(expected_hex),
+        salt_32_hex: Some(hex::encode(salt_arr)),
+        object_val: Some(clear_val),
+        source_content: clear_src,
+        commitment_verified: Some(verified),
+    })
 }

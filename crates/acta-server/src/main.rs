@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr = %cfg.bind_addr,
         host_public_key = %pubkey_hex,
         github_oauth_enabled = github_oauth_enabled,
-        "acta-server v1.7.2 Epistemic Notary, PPA 1 Claim 25 Dependency Cache & Offline State-Rebuild gateway listening"
+        "acta-server v1.7.3 Epistemic Notary, PPA 1 Claim 25 Dependency Cache & Offline State-Rebuild gateway listening"
     );
 
     axum::serve(listener, app)

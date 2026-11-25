@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
-use acta_types::{
+use acta_types::{ERASABLE_CLAIM_DOMAIN_V1, HOST_KEY_ROTATE_DOMAIN_V1, HostKeyRotationSummary,
+
     ActaError, ActaResult, AnswerCacheLedgerSummary, ClaimCandidate, ClaimStatus, ContextBundle,
     KnowledgeClaim, LifecycleStatus, ObjectType, OmittedItem, OverriddenClaimRef,
     OverrideLedgerSummary, PolicyResultTag, RefusalMetadata, StoredObject,
@@ -1386,3 +1387,131 @@ pub fn compute_evidence_event_hash_v172(
     )?;
     Ok(*blake3::hash(&preimage).as_bytes())
 }
+
+/// Computes the 32-byte salted commitment for an `erasable: true` claim (`b"acta:erasable_claim:v1"`, `v1.7.3+`).
+pub fn compute_erasable_claim_commitment(
+    id: Uuid,
+    salt_32: &[u8; 32],
+    object_val: &serde_json::Value,
+    source_commitment: &[u8; 32],
+) -> ActaResult<[u8; 32]> {
+    let val_jcs = to_canonical_bytes(object_val)?;
+    Ok(hash_length_delimited(&[
+        ERASABLE_CLAIM_DOMAIN_V1.as_bytes(),
+        id.as_bytes(),
+        salt_32,
+        &val_jcs,
+        source_commitment,
+    ]))
+}
+
+/// Computes `state_commitment` for a `HostKeyRotationSummary` (`b"acta:host_key_rotate:v1"`, `v1.7.3+`).
+pub fn compute_host_key_rotation_commitment(
+    rot: &HostKeyRotationSummary,
+) -> ActaResult<[u8; 32]> {
+    let canonical = to_canonical_bytes(rot)?;
+    Ok(hash_length_delimited(&[
+        HOST_KEY_ROTATE_DOMAIN_V1.as_bytes(),
+        &canonical,
+    ]))
+}
+
+/// Returns `(event_domain, preimage_bytes)` across `v1`, `v2`, 10-part `v3`, 12-part witness `v3`,
+/// and `v1.7.3+` 13-part `host_key_rotation_summary` `v3`.
+#[allow(clippy::too_many_arguments)]
+pub fn evidence_event_preimage_bytes_v173(
+    tenant_id: &str,
+    seq_num: i64,
+    prev_hash: &[u8; 32],
+    bundle_hash: Option<&[u8; 32]>,
+    state_commitment: Option<&[u8; 32]>,
+    policy_result: PolicyResultTag,
+    created_at_micros: i64,
+    refusal_metadata: Option<&RefusalMetadata>,
+    override_summary: Option<&OverrideLedgerSummary>,
+    write_summary: Option<&WriteLedgerSummary>,
+    answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
+    witness_reg_summary: Option<&WitnessRegistrationSummary>,
+    witness_revoke_summary: Option<&WitnessRevocationSummary>,
+    witness_in_v3: bool,
+    host_key_rotation_summary: Option<&HostKeyRotationSummary>,
+) -> ActaResult<(&'static str, Vec<u8>)> {
+    if let Some(rot) = host_key_rotation_summary {
+        let seq_le = seq_num.to_le_bytes();
+        let created_le = created_at_micros.to_le_bytes();
+        let bundle_bytes = encode_opt_hash32(bundle_hash);
+        let state_bytes = encode_opt_hash32(state_commitment);
+        let rot_tagged = encode_opt_jcs(Some(rot))?;
+        let preimage = encode_length_delimited(&[
+            b"acta:evidence_event:v3",
+            tenant_id.as_bytes(),
+            &seq_le,
+            prev_hash,
+            &bundle_bytes,
+            &state_bytes,
+            policy_result.as_str().as_bytes(),
+            &created_le,
+            &[0u8],
+            &[0u8],
+            &[0u8],
+            &[0u8],
+            &rot_tagged,
+        ]);
+        return Ok(("acta:evidence_event:v3", preimage));
+    }
+    evidence_event_preimage_bytes_v172(
+        tenant_id,
+        seq_num,
+        prev_hash,
+        bundle_hash,
+        state_commitment,
+        policy_result,
+        created_at_micros,
+        refusal_metadata,
+        override_summary,
+        write_summary,
+        answer_cache_summary,
+        witness_reg_summary,
+        witness_revoke_summary,
+        witness_in_v3,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_evidence_event_hash_v173(
+    tenant_id: &str,
+    seq_num: i64,
+    prev_hash: &[u8; 32],
+    bundle_hash: Option<&[u8; 32]>,
+    state_commitment: Option<&[u8; 32]>,
+    policy_result: PolicyResultTag,
+    created_at_micros: i64,
+    refusal_metadata: Option<&RefusalMetadata>,
+    override_summary: Option<&OverrideLedgerSummary>,
+    write_summary: Option<&WriteLedgerSummary>,
+    answer_cache_summary: Option<&AnswerCacheLedgerSummary>,
+    witness_reg_summary: Option<&WitnessRegistrationSummary>,
+    witness_revoke_summary: Option<&WitnessRevocationSummary>,
+    witness_in_v3: bool,
+    host_key_rotation_summary: Option<&HostKeyRotationSummary>,
+) -> ActaResult<[u8; 32]> {
+    let (_dom, preimage) = evidence_event_preimage_bytes_v173(
+        tenant_id,
+        seq_num,
+        prev_hash,
+        bundle_hash,
+        state_commitment,
+        policy_result,
+        created_at_micros,
+        refusal_metadata,
+        override_summary,
+        write_summary,
+        answer_cache_summary,
+        witness_reg_summary,
+        witness_revoke_summary,
+        witness_in_v3,
+        host_key_rotation_summary,
+    )?;
+    Ok(*blake3::hash(&preimage).as_bytes())
+}
+

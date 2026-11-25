@@ -1,13 +1,16 @@
 use std::collections::{BTreeSet, HashMap};
 
 use acta_crypto::{
-    compute_rebuild_archive_header_hash, sign_rebuild_archive_header,
+    compute_evidence_event_hash_full, compute_rebuild_archive_header_hash,
+    compute_write_summary_commitment, sign_evidence_entry, sign_rebuild_archive_header,
     verify_and_rebuild_scope_state_offline,
 };
 use acta_types::{
     ActaError, ActaResult, ClaimStatus, ContextBundle, ImpactBundleRecord,
-    ImpactedCachedAnswerRecord, LedgerStateRebuildResponse, LifecycleStatus, ObjectType,
-    StateRebuildArchive, TraceItemImpactResponse, STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    ImpactedCachedAnswerRecord, KnowledgeClaim, LedgerStateRebuildResponse, LifecycleStatus,
+    ObjectType, PolicyResultTag, StateRebuildArchive, StoredObject, TraceItemImpactResponse,
+    WriteLedgerSummary, WriteOperationKind, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V1, STATE_REBUILD_ARCHIVE_SCHEMA_V2, WRITE_EVENT_DOMAIN_V1,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
@@ -17,11 +20,18 @@ use uuid::Uuid;
 
 use crate::{
     answer_cache_repo::{
-        compute_live_scope_state_commitment, compute_scoped_task_dependency_commitment_as_of,
-        CacheDependencySpec,
+        compute_live_scope_state_commitment_for_schema,
+        compute_scoped_task_dependency_commitment_as_of, CacheDependencySpec,
     },
     claims_repo, evidence_repo, objects_repo, overrides_repo,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitRebuildClock {
+    ChainTailDefault,
+    WallClockNow,
+    Explicit(DateTime<Utc>),
+}
 
 #[derive(Debug, Clone)]
 struct DepEdge {
@@ -130,6 +140,7 @@ struct BundleDepRow {
     task_id: String,
     dependency_role: String,
     state_commitment: Vec<u8>,
+    bundle_schema_version: Option<String>,
     bundle_issued_at: DateTime<Utc>,
 }
 
@@ -314,6 +325,12 @@ pub async fn trace_item_impact(
                bd.task_id,
                bd.dependency_role,
                bd.state_commitment,
+               (
+                   SELECT convert_from(cb.bundle_canonical, 'UTF8')::jsonb ->> 'schema_version'
+                   FROM context_bundles cb
+                   WHERE cb.tenant_id = bd.tenant_id
+                     AND cb.bundle_hash = bd.bundle_hash
+               ) AS bundle_schema_version,
                bd.bundle_issued_at
         FROM bundle_dependencies bd
         WHERE bd.tenant_id = $1 AND bd.item_id = $2
@@ -326,22 +343,24 @@ pub async fn trace_item_impact(
     .await
     .map_err(|e| ActaError::Storage(format!("query bundle_dependencies failed: {e}")))?;
 
-    let mut scope_commitments: HashMap<String, [u8; 32]> = HashMap::new();
-    scope_commitments.insert(
-        scope.clone(),
-        compute_live_scope_state_commitment(pool, tenant_id, &scope, permission_root, now).await?,
-    );
+    let mut scope_commitments: HashMap<(String, String), [u8; 32]> = HashMap::new();
     for r in &dep_rows {
-        if !scope_commitments.contains_key(&r.scope) {
-            let live_sc = compute_live_scope_state_commitment(
+        let b_schema = r
+            .bundle_schema_version
+            .clone()
+            .unwrap_or_else(|| SCHEMA_VERSION_V1.to_string());
+        let key = (r.scope.clone(), b_schema.clone());
+        if !scope_commitments.contains_key(&key) {
+            let live_sc = compute_live_scope_state_commitment_for_schema(
                 pool,
+                &b_schema,
                 tenant_id,
                 &r.scope,
                 permission_root,
                 now,
             )
             .await?;
-            scope_commitments.insert(r.scope.clone(), live_sc);
+            scope_commitments.insert(key, live_sc);
         }
     }
 
@@ -359,8 +378,11 @@ pub async fn trace_item_impact(
         let sc_arr: [u8; 32] = r.state_commitment.try_into().map_err(|_| {
             ActaError::Storage("bundle_dependencies.state_commitment not 32 bytes".to_string())
         })?;
+        let b_schema = r
+            .bundle_schema_version
+            .unwrap_or_else(|| SCHEMA_VERSION_V1.to_string());
         let live_sc = scope_commitments
-            .get(&r.scope)
+            .get(&(r.scope.clone(), b_schema))
             .copied()
             .unwrap_or([0u8; 32]);
         let is_stale_now = sc_arr != live_sc;
@@ -412,18 +434,33 @@ pub async fn trace_item_impact(
 
         let mut out = Vec::with_capacity(cache_rows.len());
         for cr in cache_rows {
-            let live_sc = match scope_commitments.get(&cr.scope) {
+            let cache_bundle_schema: String = cr
+                .dependency_spec
+                .as_ref()
+                .and_then(|v| v.get("state_schema_version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if scope_commitments.contains_key(&(cr.scope.clone(), SCHEMA_VERSION_V2.to_string())) {
+                        SCHEMA_VERSION_V2.to_string()
+                    } else {
+                        SCHEMA_VERSION_V1.to_string()
+                    }
+                });
+            let sc_key = (cr.scope.clone(), cache_bundle_schema.clone());
+            let live_sc = match scope_commitments.get(&sc_key) {
                 Some(sc) => *sc,
                 None => {
-                    let computed = compute_live_scope_state_commitment(
+                    let computed = compute_live_scope_state_commitment_for_schema(
                         pool,
+                        &cache_bundle_schema,
                         tenant_id,
                         &cr.scope,
                         permission_root,
                         now,
                     )
                     .await?;
-                    scope_commitments.insert(cr.scope.clone(), computed);
+                    scope_commitments.insert(sc_key, computed);
                     computed
                 }
             };
@@ -518,6 +555,7 @@ pub async fn trace_item_impact(
 /// + host-signed `StateRebuildArchive` header binding `(scope, up_to_seq, evaluated_at, permission_root)`)
 /// via standalone `verify_and_rebuild_scope_state_offline` and optionally returns the portable
 /// `StateRebuildArchive` for third-party offline verification (`acta-verify`, Python/TS SDKs).
+#[allow(clippy::too_many_arguments)]
 pub async fn rebuild_scope_state_from_ledger(
     pool: &PgPool,
     host_key: &SigningKey,
@@ -526,6 +564,34 @@ pub async fn rebuild_scope_state_from_ledger(
     scope: &str,
     permission_root: &[u8; 32],
     up_to_seq: Option<i64>,
+    include_proof_archive: bool,
+) -> ActaResult<LedgerStateRebuildResponse> {
+    rebuild_scope_state_from_ledger_v173(
+        pool,
+        host_key,
+        host_public_key,
+        tenant_id,
+        scope,
+        permission_root,
+        up_to_seq,
+        ExplicitRebuildClock::ChainTailDefault,
+        None,
+        include_proof_archive,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_scope_state_from_ledger_v173(
+    pool: &PgPool,
+    host_key: &SigningKey,
+    host_public_key: &[u8; 32],
+    tenant_id: &str,
+    scope: &str,
+    permission_root: &[u8; 32],
+    up_to_seq: Option<i64>,
+    clock_mode: ExplicitRebuildClock,
+    explicit_state_schema: Option<&str>,
     include_proof_archive: bool,
 ) -> ActaResult<LedgerStateRebuildResponse> {
     let chain = evidence_repo::fetch_tenant_evidence_chain(pool, tenant_id, up_to_seq).await?;
@@ -538,14 +604,91 @@ pub async fn rebuild_scope_state_from_ledger(
         }
     }
 
-    // When `up_to_seq` is specified, deterministically pin `evaluated_at` to `evidence_chain[up_to_seq - 1].created_at`
-    // so historical state rebuilds (`e.g. up_to_seq = 184`) are 100% clock-independent (`v1.7.2+`, Should-Fix 4)!
-    let evaluated_at = match (up_to_seq, chain.last()) {
-        (Some(_), Some(tail)) => tail.created_at.trunc_subsecs(6),
-        _ => Utc::now().trunc_subsecs(6),
+    let effective_seq = chain.len() as i64;
+
+    // v1.7.3 Part A Fix 5: Pin BOTH prefix (`up_to_seq`) AND head exports deterministically
+    // to `evidence_chain.last().created_at` unless an explicit clock (`"now"` or RFC 3339) was requested!
+    let evaluated_at = match clock_mode {
+        ExplicitRebuildClock::ChainTailDefault => match chain.last() {
+            Some(tail) => tail.created_at.trunc_subsecs(6),
+            None => DateTime::<Utc>::UNIX_EPOCH,
+        },
+        ExplicitRebuildClock::WallClockNow => Utc::now().trunc_subsecs(6),
+        ExplicitRebuildClock::Explicit(ts) => ts.trunc_subsecs(6),
     };
 
-    let effective_seq = chain.len() as i64;
+    // v1.7.3 Part A Fix 6: Select `v1` (`acta-state-rebuild-archive/v1`) when explicitly requested OR
+    // when the latest compiled bundle in `(tenant_id, scope)` at `<= effective_seq` used `"acta-context-bundle/v1"`
+    // (preserving `seq 1..219` bit-for-bit, e.g. `d0bf0212...` at `seq 184` and `e44a5111...` at `seq 219`),
+    // and `v2` (`b"acta:state:v2"` + `b"acta:sub_commitment:v2"`) for all new `v1.7.3+` scopes and bundles!
+    let (archive_schema, bundle_state_schema) = match explicit_state_schema
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some("v1")
+        | Some(SCHEMA_VERSION_V1)
+        | Some(STATE_REBUILD_ARCHIVE_SCHEMA_V1) => {
+            (STATE_REBUILD_ARCHIVE_SCHEMA_V1, SCHEMA_VERSION_V1)
+        }
+        Some("v2")
+        | Some(SCHEMA_VERSION_V2)
+        | Some(STATE_REBUILD_ARCHIVE_SCHEMA_V2) => {
+            (STATE_REBUILD_ARCHIVE_SCHEMA_V2, SCHEMA_VERSION_V2)
+        }
+        Some(other) => {
+            return Err(ActaError::Validation(format!(
+                "unsupported state_schema_version '{other}' (expected 'v1' or 'v2')"
+            )));
+        }
+        None => {
+            let latest_bundle_schema: Option<(Option<String>,)> = sqlx::query_as(
+                r#"
+                SELECT convert_from(cb.bundle_canonical, 'UTF8')::jsonb ->> 'schema_version'
+                FROM evidence_history eh
+                INNER JOIN context_bundles cb
+                    ON cb.tenant_id = eh.tenant_id
+                   AND cb.bundle_hash = eh.bundle_hash
+                WHERE eh.tenant_id = $1
+                  AND eh.seq_num <= $2
+                  AND (convert_from(cb.bundle_canonical, 'UTF8')::jsonb ->> 'scope') = $3
+                ORDER BY eh.seq_num DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(effective_seq)
+            .bind(scope)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ActaError::Storage(format!("detect scope bundle schema failed: {e}")))?;
+
+            match latest_bundle_schema.and_then(|(s,)| s).as_deref() {
+                Some(SCHEMA_VERSION_V1) => (STATE_REBUILD_ARCHIVE_SCHEMA_V1, SCHEMA_VERSION_V1),
+                _ => (STATE_REBUILD_ARCHIVE_SCHEMA_V2, SCHEMA_VERSION_V2),
+            }
+        }
+    };
+
+    let genesis_pk_opt = evidence_repo::fetch_tenant_genesis_public_key(pool, tenant_id)
+        .await?
+        .or_else(|| {
+            chain
+                .iter()
+                .find_map(|e| e.host_key_rotation_summary.as_ref().map(|r| r.old_public_key))
+        });
+
+    let effective_tail_pk = if let Some(last_rot) = chain
+        .iter()
+        .rev()
+        .find_map(|e| e.host_key_rotation_summary.as_ref())
+    {
+        last_rot.new_public_key
+    } else {
+        genesis_pk_opt.unwrap_or(*host_public_key)
+    };
+
+    let genesis_host_public_key = genesis_pk_opt.filter(|gpk| gpk != &effective_tail_pk);
+
     let scoped_overrides = overrides_repo::fetch_all_scoped_overrides_up_to_seq(
         pool,
         tenant_id,
@@ -582,7 +725,7 @@ pub async fn rebuild_scope_state_from_ledger(
         };
 
     let header_hash = compute_rebuild_archive_header_hash(
-        STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+        archive_schema,
         tenant_id,
         scope,
         effective_seq,
@@ -592,11 +735,12 @@ pub async fn rebuild_scope_state_from_ledger(
     let host_header_signature = sign_rebuild_archive_header(host_key, tenant_id, &header_hash);
 
     let archive = StateRebuildArchive {
-        schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V1.to_string(),
+        schema_version: archive_schema.to_string(),
         tenant_id: tenant_id.to_string(),
         scope: scope.to_string(),
         up_to_seq: effective_seq,
         evaluated_at,
+        genesis_host_public_key,
         host_public_key: *host_public_key,
         permission_root: *permission_root,
         header_hash,
@@ -611,8 +755,9 @@ pub async fn rebuild_scope_state_from_ledger(
     let offline = verify_and_rebuild_scope_state_offline(&archive, host_public_key, Some(scope))
         .map_err(ActaError::VerificationFailed)?;
 
-    let live_sc = compute_live_scope_state_commitment(
+    let live_sc = compute_live_scope_state_commitment_for_schema(
         pool,
+        bundle_state_schema,
         tenant_id,
         scope,
         permission_root,
@@ -622,26 +767,56 @@ pub async fn rebuild_scope_state_from_ledger(
     let live_sc_hex = hex::encode(live_sc);
 
     let (legacy_objs,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint FROM objects WHERE tenant_id = $1 AND scope = $2 AND evidence_seq_num IS NULL",
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM objects o
+        WHERE o.tenant_id = $1
+          AND o.scope = $2
+          AND o.evidence_seq_num IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM legacy_backfilled_items lb
+              WHERE lb.tenant_id = o.tenant_id
+                AND lb.item_id = o.id
+                AND lb.evidence_seq_num <= $3
+          )
+        "#,
     )
     .bind(tenant_id)
     .bind(scope)
+    .bind(effective_seq)
     .fetch_one(pool)
     .await
     .map_err(|e| ActaError::Storage(format!("count unchained objects failed: {e}")))?;
 
     let (legacy_clms,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint FROM knowledge_claims WHERE tenant_id = $1 AND scope = $2 AND evidence_seq_num IS NULL",
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM knowledge_claims c
+        WHERE c.tenant_id = $1
+          AND c.scope = $2
+          AND c.evidence_seq_num IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM legacy_backfilled_items lb
+              WHERE lb.tenant_id = c.tenant_id
+                AND lb.item_id = c.id
+                AND lb.evidence_seq_num <= $3
+          )
+        "#,
     )
     .bind(tenant_id)
     .bind(scope)
+    .bind(effective_seq)
     .fetch_one(pool)
     .await
     .map_err(|e| ActaError::Storage(format!("count unchained claims failed: {e}")))?;
 
+    // v1.7.3 Part A Fix 1: Exact commitment equality regardless of whether `up_to_seq` was passed!
+    let matches_live_store_bit_for_bit = offline.reconstructed_state_commitment_hex == live_sc_hex;
+
     Ok(LedgerStateRebuildResponse {
         tenant_id: offline.tenant_id,
         scope: offline.scope,
+        state_schema_version: bundle_state_schema.to_string(),
         verified_up_to_seq: offline.verified_up_to_seq,
         chain_cryptographically_verified: true,
         write_events_replayed: offline.write_events_replayed,
@@ -658,9 +833,8 @@ pub async fn rebuild_scope_state_from_ledger(
         reconstructed_memory_root: offline.reconstructed_memory_root_hex,
         permission_root: offline.permission_root_hex,
         reconstructed_state_commitment: offline.reconstructed_state_commitment_hex.clone(),
-        live_store_state_commitment: live_sc_hex.clone(),
-        matches_live_store_bit_for_bit: up_to_seq.is_none()
-            && offline.reconstructed_state_commitment_hex == live_sc_hex,
+        live_store_state_commitment: live_sc_hex,
+        matches_live_store_bit_for_bit,
         evaluated_at,
         header_hash: Some(hex::encode(header_hash)),
         host_header_signature: Some(hex::encode(host_header_signature)),
@@ -671,5 +845,318 @@ pub async fn rebuild_scope_state_from_ledger(
         } else {
             None
         },
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct BackfillLegacyScopeResponse {
+    pub tenant_id: String,
+    pub scope: String,
+    pub imported_objects: usize,
+    pub imported_claims: usize,
+    pub first_evidence_seq_num: Option<i64>,
+    pub last_evidence_seq_num: Option<i64>,
+}
+
+/// Opt-in migration helper (`POST /v1/tenants/:tenant_id/backfill-legacy-scope`, SPEC §10.5):
+/// Appends `WriteOperationKind::LegacyImportObject` and `WriteOperationKind::LegacyImportClaim` entries
+/// onto the tail of `evidence_history` (and `legacy_backfilled_items`) for any unchained pre-`v1.7.0` rows
+/// in `(tenant_id, scope)` WITHOUT issuing UPDATEs against immutable `objects` or `knowledge_claims`.
+pub async fn backfill_legacy_scope_tx(
+    pool: &PgPool,
+    host_key: &SigningKey,
+    tenant_id: &str,
+    scope: &str,
+    imported_by: &str,
+    writer_auth_kind: &str,
+    now: DateTime<Utc>,
+) -> ActaResult<BackfillLegacyScopeResponse> {
+    let now = now.trunc_subsecs(6);
+
+    let obj_ids: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT o.id
+        FROM objects o
+        WHERE o.tenant_id = $1
+          AND o.scope = $2
+          AND o.evidence_seq_num IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM legacy_backfilled_items lb
+              WHERE lb.tenant_id = o.tenant_id AND lb.item_id = o.id
+          )
+        ORDER BY o.created_at ASC, o.version ASC, o.id ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(scope)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ActaError::Storage(format!("query unchained legacy objects failed: {e}")))?;
+
+    let clm_ids: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT c.id
+        FROM knowledge_claims c
+        WHERE c.tenant_id = $1
+          AND c.scope = $2
+          AND c.evidence_seq_num IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM legacy_backfilled_items lb
+              WHERE lb.tenant_id = c.tenant_id AND lb.item_id = c.id
+          )
+        ORDER BY c.created_at ASC, c.version ASC, c.id ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(scope)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ActaError::Storage(format!("query unchained legacy claims failed: {e}")))?;
+
+    if obj_ids.is_empty() && clm_ids.is_empty() {
+        return Ok(BackfillLegacyScopeResponse {
+            tenant_id: tenant_id.to_string(),
+            scope: scope.to_string(),
+            imported_objects: 0,
+            imported_claims: 0,
+            first_evidence_seq_num: None,
+            last_evidence_seq_num: None,
+        });
+    }
+
+    let obj_id_vec: Vec<Uuid> = obj_ids.into_iter().map(|(id,)| id).collect();
+    let clm_id_vec: Vec<Uuid> = clm_ids.into_iter().map(|(id,)| id).collect();
+    let mut legacy_objs: Vec<StoredObject> =
+        objects_repo::fetch_objects_by_ids(pool, tenant_id, &obj_id_vec).await?;
+    legacy_objs.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut legacy_clms: Vec<KnowledgeClaim> =
+        claims_repo::fetch_claims_by_ids(pool, tenant_id, &clm_id_vec).await?;
+    legacy_clms.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ActaError::Storage(format!("begin backfill_legacy_scope tx failed: {e}")))?;
+
+    let (mut cur_seq, mut cur_prev_hash) =
+        evidence_repo::lock_and_read_latest_evidence_tx(&mut tx, tenant_id).await?;
+    let mut first_seq = None;
+    let mut last_seq = None;
+    let mut imported_objects = 0usize;
+    let mut imported_claims = 0usize;
+
+    for mut obj in legacy_objs {
+        obj.embedding = None;
+        let has_sig = obj.client_signature.is_some() && obj.client_public_key.is_some();
+        if !has_sig {
+            obj.client_signature = None;
+            obj.client_public_key = None;
+        }
+        let eff_auth = if has_sig {
+            "ed25519_client_sig"
+        } else {
+            writer_auth_kind
+        };
+        cur_seq += 1;
+        if first_seq.is_none() {
+            first_seq = Some(cur_seq);
+        }
+        last_seq = Some(cur_seq);
+        let snap = serde_json::to_value(&obj)
+            .map_err(|e| ActaError::Storage(format!("serialize legacy StoredObject failed: {e}")))?;
+        let ws = WriteLedgerSummary {
+            write_domain: WRITE_EVENT_DOMAIN_V1.to_string(),
+            operation: WriteOperationKind::LegacyImportObject,
+            item_id: obj.id,
+            scope: obj.scope.clone(),
+            version: obj.version,
+            predecessor_id: obj.predecessor_id,
+            content_hash: obj.content_hash,
+            written_by: imported_by.to_string(),
+            writer_auth_kind: eff_auth.to_string(),
+            client_public_key: obj.client_public_key,
+            client_signature: obj.client_signature.clone(),
+            retraction_reason: None,
+            record_snapshot: snap,
+        };
+        let ws_comm = compute_write_summary_commitment(&ws)?;
+        let ev_hash = compute_evidence_event_hash_full(
+            tenant_id,
+            cur_seq,
+            &cur_prev_hash,
+            None,
+            Some(&ws_comm),
+            PolicyResultTag::Allow,
+            now.timestamp_micros(),
+            None,
+            None,
+            Some(&ws),
+            None,
+        )?;
+        let ev_sig = sign_evidence_entry(host_key, tenant_id, cur_seq, &cur_prev_hash, &ev_hash);
+        let ws_json = serde_json::to_value(&ws).map_err(|e| {
+            ActaError::Storage(format!("serialize legacy write_meta failed: {e}"))
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO evidence_history (
+                tenant_id, seq_num, prev_hash, event_hash,
+                bundle_hash, state_commitment, policy_result,
+                write_meta, host_signature, created_at
+            )
+            VALUES ($1, $2, $3, $4, NULL, $5, 'allow', $6, $7, $8)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(cur_seq)
+        .bind(cur_prev_hash.as_slice())
+        .bind(ev_hash.as_slice())
+        .bind(ws_comm.as_slice())
+        .bind(ws_json)
+        .bind(ev_sig.as_slice())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("insert legacy object evidence failed: {e}")))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO legacy_backfilled_items (
+                tenant_id, item_id, item_kind, scope, evidence_seq_num, created_at
+            )
+            VALUES ($1, $2, 'object', $3, $4, $5)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(obj.id)
+        .bind(&obj.scope)
+        .bind(cur_seq)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("insert legacy_backfilled_items failed: {e}")))?;
+
+        cur_prev_hash = ev_hash;
+        imported_objects += 1;
+    }
+
+    for mut clm in legacy_clms {
+        let has_sig = clm.client_signature.is_some() && clm.client_public_key.is_some();
+        if !has_sig {
+            clm.client_signature = None;
+            clm.client_public_key = None;
+        }
+        let eff_auth = if has_sig {
+            "ed25519_client_sig"
+        } else {
+            writer_auth_kind
+        };
+        cur_seq += 1;
+        if first_seq.is_none() {
+            first_seq = Some(cur_seq);
+        }
+        last_seq = Some(cur_seq);
+        let snap = serde_json::to_value(&clm).map_err(|e| {
+            ActaError::Storage(format!("serialize legacy KnowledgeClaim failed: {e}"))
+        })?;
+        let ws = WriteLedgerSummary {
+            write_domain: WRITE_EVENT_DOMAIN_V1.to_string(),
+            operation: WriteOperationKind::LegacyImportClaim,
+            item_id: clm.id,
+            scope: clm.scope.clone(),
+            version: clm.version,
+            predecessor_id: clm.predecessor_id,
+            content_hash: clm.content_hash,
+            written_by: imported_by.to_string(),
+            writer_auth_kind: eff_auth.to_string(),
+            client_public_key: clm.client_public_key,
+            client_signature: clm.client_signature.clone(),
+            retraction_reason: clm.retraction_reason.clone(),
+            record_snapshot: snap,
+        };
+        let ws_comm = compute_write_summary_commitment(&ws)?;
+        let ev_hash = compute_evidence_event_hash_full(
+            tenant_id,
+            cur_seq,
+            &cur_prev_hash,
+            None,
+            Some(&ws_comm),
+            PolicyResultTag::Allow,
+            now.timestamp_micros(),
+            None,
+            None,
+            Some(&ws),
+            None,
+        )?;
+        let ev_sig = sign_evidence_entry(host_key, tenant_id, cur_seq, &cur_prev_hash, &ev_hash);
+        let ws_json = serde_json::to_value(&ws).map_err(|e| {
+            ActaError::Storage(format!("serialize legacy claim write_meta failed: {e}"))
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO evidence_history (
+                tenant_id, seq_num, prev_hash, event_hash,
+                bundle_hash, state_commitment, policy_result,
+                write_meta, host_signature, created_at
+            )
+            VALUES ($1, $2, $3, $4, NULL, $5, 'allow', $6, $7, $8)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(cur_seq)
+        .bind(cur_prev_hash.as_slice())
+        .bind(ev_hash.as_slice())
+        .bind(ws_comm.as_slice())
+        .bind(ws_json)
+        .bind(ev_sig.as_slice())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("insert legacy claim evidence failed: {e}")))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO legacy_backfilled_items (
+                tenant_id, item_id, item_kind, scope, evidence_seq_num, created_at
+            )
+            VALUES ($1, $2, 'claim', $3, $4, $5)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(clm.id)
+        .bind(&clm.scope)
+        .bind(cur_seq)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ActaError::Storage(format!("insert legacy_backfilled_items failed: {e}")))?;
+
+        cur_prev_hash = ev_hash;
+        imported_claims += 1;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ActaError::Storage(format!("commit backfill_legacy_scope tx failed: {e}")))?;
+
+    Ok(BackfillLegacyScopeResponse {
+        tenant_id: tenant_id.to_string(),
+        scope: scope.to_string(),
+        imported_objects,
+        imported_claims,
+        first_evidence_seq_num: first_seq,
+        last_evidence_seq_num: last_seq,
     })
 }

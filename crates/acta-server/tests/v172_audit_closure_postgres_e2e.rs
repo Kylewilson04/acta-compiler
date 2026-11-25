@@ -78,15 +78,28 @@ fn spec_s25_state_commitment(
     memory_root: &[u8; 32],
     permission_root: &[u8; 32],
 ) -> [u8; 32] {
-    hash_length_delimited(&[
-        schema_version.as_bytes(),
-        tenant_id.as_bytes(),
-        scope.as_bytes(),
-        intent_root,
-        knowledge_root,
-        memory_root,
-        permission_root,
-    ])
+    if schema_version == "acta-context-bundle/v2" {
+        hash_length_delimited(&[
+            b"acta:state:v2",
+            schema_version.as_bytes(),
+            tenant_id.as_bytes(),
+            scope.as_bytes(),
+            intent_root,
+            knowledge_root,
+            memory_root,
+            permission_root,
+        ])
+    } else {
+        hash_length_delimited(&[
+            schema_version.as_bytes(),
+            tenant_id.as_bytes(),
+            scope.as_bytes(),
+            intent_root,
+            knowledge_root,
+            memory_root,
+            permission_root,
+        ])
+    }
 }
 
 #[tokio::test]
@@ -150,7 +163,7 @@ async fn test_v172_all_must_fixes_should_fixes_and_seven_audit_probes_e2e() {
     );
     assert_eq!(
         init_rpc["result"]["serverInfo"]["version"],
-        json!("1.7.2")
+        json!("1.7.3")
     );
     assert_eq!(
         init_rpc["result"]["capabilities"]["tools"]["listChanged"],
@@ -849,8 +862,12 @@ async fn test_v172_all_must_fixes_should_fixes_and_seven_audit_probes_e2e() {
         json!(true)
     );
     assert_eq!(
-        rep_asym["result"]["structuredContent"]["resolver_compat"],
-        json!("v172_current")
+        rep_asym["result"]["structuredContent"]["reproducing_resolver"],
+        json!("v173_current")
+    );
+    assert_eq!(
+        rep_asym["result"]["structuredContent"]["recorded_resolver_version"],
+        json!("v1.7.3")
     );
 
     // =========================================================================

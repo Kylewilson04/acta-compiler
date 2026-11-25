@@ -63,7 +63,7 @@ pub async fn handle_verify_archive(
                 ApiError::bad_request("expected_pubkey_hex must decode to 32 bytes (64 hex chars)")
             })?
         }
-        _ => state.host_public_key,
+        _ => state.public_key_for_tenant(&req.archive.bundle.tenant_id),
     };
 
     match verify_export_archive(&req.archive, &expected_pk) {
@@ -138,7 +138,7 @@ pub async fn handle_tenant_evidence(
 
     Ok(Json(TenantEvidenceResponse {
         tenant_id: clean_tenant.to_string(),
-        host_public_key: hex::encode(state.host_public_key),
+        host_public_key: hex::encode(state.public_key_for_tenant(clean_tenant)),
         total_count,
         entry_count: entries.len(),
         from_seq,

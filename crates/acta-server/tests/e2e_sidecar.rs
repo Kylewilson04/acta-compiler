@@ -173,6 +173,7 @@ async fn test_e2e_ingest_compile_dispute_replay_verify_and_mcp() {
             valid_from: None,
             valid_to: None,
             predecessor_id: None,
+            erasable: None,
             client_signature_hex: None,
             client_public_key_hex: None,
         };

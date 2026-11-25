@@ -996,7 +996,7 @@ class TestActaGitMcpBridge(unittest.TestCase):
                     ]
                     self.assertEqual(len(lines), 4)
                     self.assertEqual(
-                        lines[0]["result"]["serverInfo"]["version"], "1.7.2"
+                        lines[0]["result"]["serverInfo"]["version"], "1.7.3"
                     )
                     self.assertEqual(
                         lines[1]["result"]["structuredContent"]["tenant_id"], "sandbox-ardyn"
@@ -1143,7 +1143,7 @@ class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from acta_sdk import (
-            SCHEMA_VERSION,
+            SCHEMA_VERSION_V1,
             STATE_REBUILD_ARCHIVE_SCHEMA_V1,
             compute_answer_cache_summary_commitment,
             compute_answer_text_hash,
@@ -1407,7 +1407,7 @@ class TestV171Claim25AndOfflineRebuild(unittest.TestCase):
 
         rebuilt = verify_and_rebuild_scope_state_offline(rebuild_archive, host_pk_hex)
         expected_sc = compute_state_commitment(
-            SCHEMA_VERSION,
+            SCHEMA_VERSION_V1,
             tenant,
             scope,
             compute_sub_commitment([obj["content_hash"]]),
@@ -1434,7 +1434,7 @@ class TestV172SpecFidelityCorroborationAndSignedRebuildHeader(unittest.TestCase)
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from acta_sdk import (
-            SCHEMA_VERSION,
+            SCHEMA_VERSION_V1,
             STATE_REBUILD_ARCHIVE_SCHEMA_V1,
             compute_answer_cache_client_intent_hash,
             compute_answer_cache_summary_commitment,
@@ -1511,7 +1511,7 @@ class TestV172SpecFidelityCorroborationAndSignedRebuildHeader(unittest.TestCase)
         self.assertAlmostEqual(eff, 0.72, places=9)
 
         bundle = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION_V1,
             "tenant_id": tenant,
             "task_id": "task-b3",
             "scope": scope,
@@ -1736,3 +1736,230 @@ class TestV172SpecFidelityCorroborationAndSignedRebuildHeader(unittest.TestCase)
         swapped_clock["evaluated_at"] = "2027-06-01T00:00:00.000000Z"
         with self.assertRaisesRegex(ValueError, "tampered StateRebuildArchive header"):
             verify_and_rebuild_scope_state_offline(swapped_clock, host_pk_hex)
+
+
+
+class TestActaV173ProofPolishAndPilotReadiness(unittest.TestCase):
+    def test_v173_state_v2_rotation_erasure_and_dependency_ids(self) -> None:
+        from acta_sdk import (
+            SCHEMA_VERSION_V2,
+            STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+            compute_answer_cache_summary_commitment,
+            compute_answer_text_hash,
+            compute_erasable_claim_commitment,
+            compute_host_key_rotation_commitment,
+            compute_query_text_hash,
+            compute_rebuild_archive_header_hash,
+            compute_state_commitment,
+            compute_sub_commitment_v2,
+            sign_host_key_rotation_new,
+            sign_host_key_rotation_old,
+             sign_rebuild_archive_header,
+            verify_and_rebuild_scope_state_offline,
+            verify_evidence_entry,
+        )
+
+        k0_seed = b"\x21" * 32
+        k1_seed = b"\x22" * 32
+        k2_seed = b"\x23" * 32
+        k0_pk = _raw_pubkey_hex(Ed25519PrivateKey.from_private_bytes(k0_seed))
+        k1_pk = _raw_pubkey_hex(Ed25519PrivateKey.from_private_bytes(k1_seed))
+        k2_pk = _raw_pubkey_hex(Ed25519PrivateKey.from_private_bytes(k2_seed))
+
+        tenant = "tenant-v173"
+        scope = "acta-test/v173-sdk"
+        ts = "2026-11-24T22:00:00.000000Z"
+        perm_root = "3ff40da50dd7f2aa32ce30409426f6d485bcf376caa4ff862f3aeb071410772a"
+
+        # 1. Erasable commitment + legacy_import_claim in v2 state
+        claim_id = "11111111-2222-4333-8444-555555555555"
+        salt_hex = "aa" * 32
+        src_comm = hash_length_delimited([b"acta:source:v1", b"pii-vault"]).hex()
+        erasure_comm = compute_erasable_claim_commitment(
+            claim_id, salt_hex, {"ssn_last4": "9876"}, src_comm
+        ).hex()
+        clm = {
+            "id": claim_id,
+            "tenant_id": tenant,
+            "claim_group_key": compute_logical_claim_group_key(tenant, "cust:1", "pii", scope).hex(),
+            "scope": scope,
+            "subject": "cust:1",
+            "predicate": "pii",
+            "object_val": {"$acta_erasable_commitment": erasure_comm},
+            "object_type": "object",
+            "confidence": 0.95,
+            "source_provenance_class": 2,
+            "source_descriptor": "pii-vault",
+            "source_commitment": src_comm,
+            "status": "active",
+            "contradiction_ids": [],
+            "valid_from": None,
+            "valid_to": None,
+            "version": 1,
+            "predecessor_id": None,
+            "created_at": ts,
+        }
+        clm["content_hash"] = compute_claim_content_hash(clm).hex()
+        ws1 = {
+            "write_domain": "acta:write_event:v1",
+            "operation": "legacy_import_claim",
+            "item_id": claim_id,
+            "scope": scope,
+            "version": 1,
+            "content_hash": clm["content_hash"],
+            "written_by": f"{tenant}::admin",
+            "writer_auth_kind": "tenant_session",
+            "record_snapshot": clm,
+        }
+        ws1_comm = hash_length_delimited([b"acta:write_event:v1", to_canonical_json(ws1).encode()]).hex()
+        ev1_hash = compute_evidence_event_hash(
+            tenant, 1, "00" * 32, None, ws1_comm, "allow", ts, write_summary=ws1
+        ).hex()
+        ev1 = {
+            "tenant_id": tenant,
+            "seq_num": 1,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": "00" * 32,
+            "event_hash": ev1_hash,
+            "bundle_hash": None,
+            "state_commitment": ws1_comm,
+            "policy_result": "allow",
+            "write_summary": ws1,
+            "host_signature": sign_evidence_entry(k0_seed, tenant, 1, "00" * 32, ev1_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev1, k0_pk)
+
+        # 2. Scheduled host key rotation K0 -> K1 at seq 2
+        rot2 = {
+            "rotation_domain": "acta:host_key_rotate:v1",
+            "old_public_key": k0_pk,
+            "new_public_key": k1_pk,
+            "effective_from_seq": 2,
+            "rotation_mode": "scheduled",
+            "reason": "Quarterly key rotation",
+            "rotated_by": f"{tenant}::master-admin",
+            "old_key_signature": sign_host_key_rotation_old(
+                k0_seed, tenant, 2, k0_pk, k1_pk, "scheduled", "Quarterly key rotation"
+            ).hex(),
+            "new_key_signature": sign_host_key_rotation_new(
+                k1_seed, tenant, 2, k0_pk, k1_pk, "scheduled", "Quarterly key rotation"
+            ).hex(),
+        }
+        rot2_comm = compute_host_key_rotation_commitment(rot2).hex()
+        ev2_hash = compute_evidence_event_hash(
+            tenant, 2, ev1_hash, None, rot2_comm, "allow", ts, host_key_rotation_summary=rot2
+        ).hex()
+        ev2 = {
+            "tenant_id": tenant,
+            "seq_num": 2,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev1_hash,
+            "event_hash": ev2_hash,
+            "bundle_hash": None,
+            "state_commitment": rot2_comm,
+            "policy_result": "allow",
+            "host_key_rotation_summary": rot2,
+            "host_signature": sign_evidence_entry(k0_seed, tenant, 2, ev1_hash, ev2_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev2, k0_pk)
+
+        # 3. AnswerCacheLedgerSummary with dependency_ids under K1 at seq 3
+        acs3 = {
+            "cache_domain": "acta:answer_cache:v1",
+            "event_kind": "cached",
+            "cache_id": "22222222-3333-4444-8555-666666666666",
+            "scope": scope,
+            "task_id": "task-1",
+            "query_hash": compute_query_text_hash("q").hex(),
+            "source_bundle_hash": "bb" * 32,
+            "state_commitment": "cc" * 32,
+            "validity_mode": "dependency_subset",
+            "task_dependency_commitment": "dd" * 32,
+            "dependency_ids": [claim_id],
+            "answer_hash": compute_answer_text_hash("a").hex(),
+            "cached_by": f"{tenant}::agent",
+            "cacher_auth_kind": "tenant_session",
+        }
+        acs3_comm = compute_answer_cache_summary_commitment(acs3).hex()
+        ev3_hash = compute_evidence_event_hash(
+            tenant, 3, ev2_hash, None, acs3_comm, "allow", ts, answer_cache_summary=acs3
+        ).hex()
+        ev3 = {
+            "tenant_id": tenant,
+            "seq_num": 3,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev2_hash,
+            "event_hash": ev3_hash,
+            "bundle_hash": None,
+            "state_commitment": acs3_comm,
+            "policy_result": "allow",
+            "answer_cache_summary": acs3,
+            "host_signature": sign_evidence_entry(k1_seed, tenant, 3, ev2_hash, ev3_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev3, k1_pk)
+
+        # 4. Compromise recovery K1 -> K2 at seq 4 (quarantining seq 3)
+        rot4 = {
+            "rotation_domain": "acta:host_key_rotate:v1",
+            "old_public_key": k1_pk,
+            "new_public_key": k2_pk,
+            "effective_from_seq": 4,
+            "rotation_mode": "compromise_recovery",
+            "compromised_from_seq": 3,
+            "reason": "Simulated K1 compromise after seq 2",
+            "rotated_by": f"{tenant}::master-admin",
+            "new_key_signature": sign_host_key_rotation_new(
+                k2_seed, tenant, 4, k1_pk, k2_pk, "compromise_recovery", "Simulated K1 compromise after seq 2"
+            ).hex(),
+        }
+        rot4_comm = compute_host_key_rotation_commitment(rot4).hex()
+        ev4_hash = compute_evidence_event_hash(
+            tenant, 4, ev3_hash, None, rot4_comm, "allow", ts, host_key_rotation_summary=rot4
+        ).hex()
+        ev4 = {
+            "tenant_id": tenant,
+            "seq_num": 4,
+            "event_domain": "acta:evidence_event:v3",
+            "prev_hash": ev3_hash,
+            "event_hash": ev4_hash,
+            "bundle_hash": None,
+            "state_commitment": rot4_comm,
+            "policy_result": "allow",
+            "host_key_rotation_summary": rot4,
+            "host_signature": sign_evidence_entry(k2_seed, tenant, 4, ev3_hash, ev4_hash).hex(),
+            "created_at": ts,
+        }
+        verify_evidence_entry(ev4, k1_pk)
+
+        hdr = compute_rebuild_archive_header_hash(
+            STATE_REBUILD_ARCHIVE_SCHEMA_V2, tenant, scope, 4, ts, perm_root
+        ).hex()
+        reb_v2 = {
+            "schema_version": STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+            "tenant_id": tenant,
+            "scope": scope,
+            "up_to_seq": 4,
+            "evaluated_at": ts,
+            "genesis_host_public_key": k0_pk,
+            "host_public_key": k2_pk,
+            "permission_root": perm_root,
+            "header_hash": hdr,
+            "host_header_signature": sign_rebuild_archive_header(k2_seed, tenant, hdr).hex(),
+            "override_attestations": [],
+            "evidence_chain": [ev1, ev2, ev3, ev4],
+        }
+        out = verify_and_rebuild_scope_state_offline(reb_v2, k2_pk)
+        exp_sc_v2 = compute_state_commitment(
+            SCHEMA_VERSION_V2,
+            tenant,
+            scope,
+            compute_sub_commitment_v2([]),
+            compute_sub_commitment_v2([clm["content_hash"]]),
+            compute_sub_commitment_v2([]),
+            perm_root,
+        ).hex()
+        self.assertEqual(out.reconstructed_state_commitment_hex, exp_sc_v2)
+        self.assertEqual(out.quarantined_compromised_seqs, (3,))

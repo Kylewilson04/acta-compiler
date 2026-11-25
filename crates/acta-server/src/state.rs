@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use acta_crypto::{
@@ -96,6 +96,7 @@ pub struct AppState {
     pub policy_gate: Arc<PolicyGate>,
     pub host_signing_key: Arc<SigningKey>,
     pub host_public_key: [u8; 32],
+    pub tenant_signing_keys: Arc<RwLock<HashMap<String, Arc<SigningKey>>>>,
     pub api_key: Option<String>,
     pub fallback_token_secret: String,
     pub public_sandbox_prefix: String,
@@ -118,13 +119,15 @@ impl AppState {
         ]);
         let fallback_token_secret = format!("acta_derived_{}", hex::encode(fallback_bytes));
 
+        let tenant_signing_keys = Arc::new(RwLock::new(HashMap::new()));
         let store = PgActaStore::new(pool.clone());
         let pipeline = CompilePipeline::new(
             policy_gate.clone(),
             store,
             host_signing_key.clone(),
             pipeline_config,
-        );
+        )
+        .with_tenant_key_map(tenant_signing_keys.clone());
 
         let user_agent = std::env::var("ACTA_HTTP_USER_AGENT")
             .ok()
@@ -143,6 +146,7 @@ impl AppState {
             policy_gate,
             host_signing_key,
             host_public_key,
+            tenant_signing_keys,
             api_key: None,
             fallback_token_secret,
             public_sandbox_prefix: "sandbox".to_string(),
@@ -167,6 +171,27 @@ impl AppState {
         self.api_key
             .as_deref()
             .unwrap_or(self.fallback_token_secret.as_str())
+    }
+
+    pub fn signing_key_for_tenant(&self, tenant_id: &str) -> Arc<SigningKey> {
+        if let Ok(guard) = self.tenant_signing_keys.read() {
+            if let Some(sk) = guard.get(tenant_id) {
+                return sk.clone();
+            }
+        }
+        self.host_signing_key.clone()
+    }
+
+    pub fn public_key_for_tenant(&self, tenant_id: &str) -> [u8; 32] {
+        self.signing_key_for_tenant(tenant_id)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    pub fn set_tenant_signing_key(&self, tenant_id: &str, sk: Arc<SigningKey>) {
+        if let Ok(mut guard) = self.tenant_signing_keys.write() {
+            guard.insert(tenant_id.to_string(), sk);
+        }
     }
 
     pub fn resolve_public_base_url(&self, headers: &HeaderMap) -> String {
@@ -351,9 +376,10 @@ impl AppState {
             signing_domain: None,
             expected_intent_digest_hex: None,
         };
+        let active_sk = self.signing_key_for_tenant(&audit_tenant);
         evidence_repo::append_refusal_metadata_tx(
             &self.pool,
-            &self.host_signing_key,
+            &active_sk,
             &audit_tenant,
             tag,
             meta,
@@ -391,11 +417,49 @@ impl AppState {
             signing_domain: Some(sanitize_refusal_summary(signing_domain)),
             expected_intent_digest_hex: Some(expected_intent_digest),
         };
+        let active_sk = self.signing_key_for_tenant(&audit_tenant);
         evidence_repo::append_refusal_metadata_tx(
             &self.pool,
-            &self.host_signing_key,
+            &active_sk,
             &audit_tenant,
             tag,
+            meta,
+            Utc::now().trunc_subsecs(6),
+        )
+        .await
+        .ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_stale_bundle_refusal_audit(
+        &self,
+        headers: &HeaderMap,
+        fallback_tenant: Option<&str>,
+        operation: &str,
+        reason_code: &str,
+        target_scope: Option<&str>,
+        scope_state_commitment: Option<[u8; 32]>,
+        detail: &str,
+    ) -> Option<EvidenceEntry> {
+        let audit_tenant = self.authenticated_audit_tenant(headers, fallback_tenant)?;
+        let active_sk = self.signing_key_for_tenant(&audit_tenant);
+        let meta = RefusalMetadata {
+            operation: sanitize_refusal_summary(operation),
+            reason_code: sanitize_refusal_summary(reason_code),
+            target_scope: target_scope
+                .map(sanitize_refusal_summary)
+                .filter(|s| !s.is_empty()),
+            summary: sanitize_refusal_summary(detail),
+            scope_state_commitment,
+            attempted_checkpoint_hash: None,
+            signing_domain: None,
+            expected_intent_digest_hex: None,
+        };
+        evidence_repo::append_refusal_metadata_tx(
+            &self.pool,
+            &active_sk,
+            &audit_tenant,
+            PolicyResultTag::Block,
             meta,
             Utc::now().trunc_subsecs(6),
         )

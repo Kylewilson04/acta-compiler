@@ -166,6 +166,11 @@ fn mcp_tools_schema() -> Value {
                         "type": "string",
                         "description": "Optional RFC 3339 UTC timestamp until which this claim is temporally valid (must be >= valid_from)."
                     },
+                    "erasable": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, stores cleartext + CSPRNG 256-bit salt in off-chain erasable_item_secrets and writes only salted BLAKE3 commitment ($acta_erasable_commitment) onto immutable knowledge_claims and evidence_history."
+                    },
                     "client_signature_hex": {
                         "type": "string",
                         "description": "Optional 64-byte Ed25519 author signature (128 hex chars) over compute_claim_client_intent_hash (acta:claim_client_sig:v1) or content_hash."
@@ -196,6 +201,11 @@ fn mcp_tools_schema() -> Value {
                     "reason": {
                         "type": "string",
                         "description": "Single-line evidentiary reason why claim_id is retracted."
+                    },
+                    "erase_secret": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true on an erasable claim, permanently deletes the salt and cleartext from erasable_item_secrets while keeping 100% of evidence_history and StateRebuildArchive verifiable bit-for-bit."
                     },
                     "client_signature_hex": {
                         "type": "string",
@@ -337,7 +347,7 @@ fn mcp_tools_schema() -> Value {
         },
         {
             "name": "acta_verify_state_rebuild",
-            "description": "Cryptographically verifies the tenant's hash-chained evidence_history (v1/v2/v3) from seq 1..=up_to_seq and reconstructs active scope state and state_commitment from signed ledger events alone (PPA 1 Claim 1 & §11). Set include_proof_archive=true to export a portable StateRebuildArchive ('acta-state-rebuild-archive/v1') for standalone offline verification via acta-verify or acta_sdk.",
+            "description": "Cryptographically verifies the tenant's hash-chained evidence_history (v1/v2/v3) from seq 1..=up_to_seq and reconstructs active scope state and state_commitment from signed ledger events alone (PPA 1 Claim 1 & §11), pinning evaluated_at deterministically to the chain tail timestamp by default. Set include_proof_archive=true to export a portable StateRebuildArchive ('acta-state-rebuild-archive/v2' or 'v1' for historical scopes) for standalone offline verification.",
             "inputSchema": {
                 "type": "object",
                 "required": ["scope"],
@@ -348,6 +358,15 @@ fn mcp_tools_schema() -> Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Optional 1-based evidence_history prefix sequence number; defaults to latest ledger head."
+                    },
+                    "evaluated_at": {
+                        "type": "string",
+                        "description": "Optional evaluation clock: omit or pass 'chain' (default) to pin deterministically to evidence_chain[up_to_seq - 1].created_at; pass 'now' or an RFC 3339 timestamp for wall-clock/custom temporal evaluation."
+                    },
+                    "state_schema_version": {
+                        "type": "string",
+                        "enum": ["v1", "v2"],
+                        "description": "Optional state commitment schema override ('v1' for historical pre-v1.7.3 scopes, 'v2' for domain-tagged acta:state:v2)."
                     },
                     "include_proof_archive": {
                         "type": "boolean",
@@ -714,9 +733,9 @@ pub async fn handle_mcp_info(State(state): State<AppState>, headers: HeaderMap) 
         },
         "serverInfo": {
             "name": "acta-compiler-mcp",
-            "version": "1.7.2",
+            "version": "1.7.3",
             "merkle_checkpoint_scheme": "rfc6962-sha256-v1",
-            "host_public_key": hex::encode(state.host_public_key),
+            "host_public_key": hex::encode(locked_tenant.as_deref().map(|t| state.public_key_for_tenant(t)).unwrap_or(state.host_public_key)),
             "permission_root": hex::encode(state.policy_gate.permission_root()),
             "locked_tenant": locked_tenant,
             "verified_principal": verified_principal,
@@ -812,7 +831,7 @@ pub async fn handle_mcp_rpc(
                     },
                     "serverInfo": {
                         "name": "acta-compiler-mcp",
-                        "version": "1.7.2"
+                        "version": "1.7.3"
                     }
                 }),
             )
@@ -948,9 +967,10 @@ async fn dispatch_mcp_tool(
                 )
                 .bind(tid)
                 .fetch_one(&state.pool);
+                let tid_sk = state.signing_key_for_tenant(tid);
                 let cp_fut = evidence_repo::build_signed_tree_head(
                     &state.pool,
-                    &state.host_signing_key,
+                    &tid_sk,
                     tid,
                     None,
                 );
@@ -1038,9 +1058,10 @@ async fn dispatch_mcp_tool(
                 let (cp, h_wit, lat_anch, lat_cons, lat_ok) = match cp_res.ok().flatten() {
                     Some((sth, leaves)) => {
                         let hw = !sth.witness_anchors.is_empty();
+                        let tid_sk = state.signing_key_for_tenant(tid);
                         let (la, lc, lo) = evidence_repo::resolve_latest_anchored_for_head(
                             &state.pool,
-                            &state.host_signing_key,
+                            &tid_sk,
                             tid,
                             &sth,
                             &leaves,
@@ -1066,13 +1087,18 @@ async fn dispatch_mcp_tool(
             let cfg = state.pipeline.config();
             Ok(json!({
                 "connected": true,
-                "version": "1.7.2",
+                "version": "1.7.3",
                 "merkle_checkpoint_scheme": "rfc6962-sha256-v1",
                 "key_kind": key_kind,
                 "locked_tenant": locked_tenant,
                 "verified_principal": verified_principal,
                 "github_oauth_enabled": state.oauth.github_enabled(),
-                "host_public_key": hex::encode(state.host_public_key),
+                "host_public_key": hex::encode(
+                    locked_tenant
+                        .as_deref()
+                        .map(|t| state.public_key_for_tenant(t))
+                        .unwrap_or(state.host_public_key)
+                ),
                 "permission_root": hex::encode(state.policy_gate.permission_root()),
                 "tokenizer": "cl100k_base (tiktoken-rs)",
                 "resolver_defaults": {
@@ -1358,6 +1384,7 @@ async fn dispatch_mcp_tool(
                 .and_then(Value::as_str)
                 .map(str::to_string);
 
+            let erasable = args.get("erasable").and_then(Value::as_bool);
             let req = IngestClaimRequest {
                 id: None,
                 tenant_id,
@@ -1376,6 +1403,7 @@ async fn dispatch_mcp_tool(
                 valid_from,
                 valid_to,
                 predecessor_id,
+                erasable,
                 client_signature_hex,
                 client_public_key_hex,
             };
@@ -1417,12 +1445,14 @@ async fn dispatch_mcp_tool(
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let erase_secret = args.get("erase_secret").and_then(Value::as_bool);
             let req = RetractClaimRequest {
                 id: None,
                 tenant_id,
                 scope,
                 claim_id,
                 reason,
+                erase_secret,
                 client_signature_hex,
                 client_public_key_hex,
             };
@@ -1690,6 +1720,14 @@ async fn dispatch_mcp_tool(
                 }
             };
 
+            let evaluated_at = args
+                .get("evaluated_at")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let state_schema_version = args
+                .get("state_schema_version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let include_proof_archive = args
                 .get("include_proof_archive")
                 .and_then(Value::as_bool);
@@ -1700,6 +1738,8 @@ async fn dispatch_mcp_tool(
                 Query(RebuildStateQueryParams {
                     scope: Some(scope),
                     up_to_seq,
+                    evaluated_at,
+                    state_schema_version,
                     include_proof_archive,
                 }),
                 headers,
@@ -1763,6 +1803,10 @@ async fn dispatch_mcp_tool(
                                 | acta_types::OmissionReason::RetractionTombstone
                         )
                     });
+                let recorded_ver = orig_bundle
+                    .resolver_manifest
+                    .as_ref()
+                    .and_then(|m| m.resolver_version.clone());
                 let compat = acta_engine::SimulationCompat {
                     include_resolver_manifest: orig_bundle.resolver_manifest.is_some(),
                     legacy_pre_v166_disputes: !orig_bundle.dispute_records.is_empty()
@@ -1770,6 +1814,9 @@ async fn dispatch_mcp_tool(
                     include_resolved_facts_omitted: orig_bundle.resolved_facts_omitted.is_some(),
                     legacy_pre_v171_resolver: !has_v171_retraction_reasons,
                     legacy_v171_bidirectional_contradiction: false,
+                    legacy_v1_state_schema: orig_bundle.schema_version
+                        == acta_types::SCHEMA_VERSION_V1,
+                    recorded_resolver_version: recorded_ver,
                 };
                 (
                     orig_bundle.tenant_id,
@@ -1889,8 +1936,11 @@ async fn dispatch_mcp_tool(
                 evaluation_time: pinned_time_opt,
             };
 
-            // Auto-detect whether `source_bundle_hash` was compiled under v1.7.2, v1.7.1 (bidirectional contradiction), or pre-v1.7.1:
-            let mut active_base_compat = base_compat;
+            let recorded_resolver_version = orig_manifest_opt
+                .as_ref()
+                .and_then(|m| m.resolver_version.clone());
+            // Auto-detect whether `source_bundle_hash` was compiled under v1.7.3 (v2), v1.7.2 (v1), v1.7.1, or pre-v1.7.1:
+            let mut active_base_compat = base_compat.clone();
             active_base_compat.legacy_pre_v171_resolver = false;
             active_base_compat.legacy_v171_bidirectional_contradiction = false;
             let mut base_sim = state
@@ -1899,14 +1949,14 @@ async fn dispatch_mcp_tool(
                     base_req.clone(),
                     None,
                     Some(base_res),
-                    active_base_compat,
+                    active_base_compat.clone(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
 
             if let Some(src_hex) = source_hash_opt {
                 if base_sim.bundle_hash.map(hex::encode).as_deref() != Some(src_hex) {
-                    let mut v171_compat = active_base_compat;
+                    let mut v171_compat = active_base_compat.clone();
                     v171_compat.legacy_v171_bidirectional_contradiction = true;
                     let v171_sim = state
                         .pipeline
@@ -1914,7 +1964,7 @@ async fn dispatch_mcp_tool(
                             base_req.clone(),
                             None,
                             Some(base_res),
-                            v171_compat,
+                            v171_compat.clone(),
                         )
                         .await
                         .map_err(|e| e.to_string())?;
@@ -1922,7 +1972,7 @@ async fn dispatch_mcp_tool(
                         base_sim = v171_sim;
                         active_base_compat = v171_compat;
                     } else if base_compat.legacy_pre_v171_resolver {
-                        let mut pre_v171_compat = base_compat;
+                        let mut pre_v171_compat = base_compat.clone();
                         pre_v171_compat.legacy_v171_bidirectional_contradiction = true;
                         let leg_sim = state
                             .pipeline
@@ -1930,7 +1980,7 @@ async fn dispatch_mcp_tool(
                                 base_req,
                                 None,
                                 Some(base_res),
-                                pre_v171_compat,
+                                pre_v171_compat.clone(),
                             )
                             .await
                             .map_err(|e| e.to_string())?;
@@ -1960,11 +2010,18 @@ async fn dispatch_mcp_tool(
                     && active_base_compat.legacy_pre_v171_resolver,
                 legacy_v171_bidirectional_contradiction: no_cf_overrides
                     && active_base_compat.legacy_v171_bidirectional_contradiction,
+                legacy_v1_state_schema: no_cf_overrides
+                    && active_base_compat.legacy_v1_state_schema,
+                recorded_resolver_version: if no_cf_overrides {
+                    active_base_compat.recorded_resolver_version.clone()
+                } else {
+                    Some(acta_types::CURRENT_RESOLVER_VERSION.to_string())
+                },
             };
 
             let cf_sim = state
                 .pipeline
-                .simulate_compile_with_compat(cf_req, None, Some(cf_res), cf_compat)
+                .simulate_compile_with_compat(cf_req, None, Some(cf_res), cf_compat.clone())
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -2084,10 +2141,15 @@ async fn dispatch_mcp_tool(
                 .map(|b| b.dispute_records.clone())
                 .unwrap_or_default();
 
+            let base_reproducing = active_base_compat.resolver_compat_label();
+            let cf_reproducing = cf_compat.resolver_compat_label();
             let mut out_json = json!({
                 "replay_valid": replay_valid,
-                "resolver_compat": active_base_compat.resolver_compat_label(),
-                "counterfactual_resolver_compat": cf_compat.resolver_compat_label(),
+                "recorded_resolver_version": recorded_resolver_version,
+                "reproducing_resolver": base_reproducing,
+                "counterfactual_reproducing_resolver": cf_reproducing,
+                "resolver_compat": base_reproducing,
+                "counterfactual_resolver_compat": cf_reproducing,
                 "pinned_task_id": task_id,
                 "pinned_evaluation_time": effective_issued_at,
                 "baseline_policy_decision": base_sim.policy_decision,
@@ -2250,8 +2312,9 @@ async fn dispatch_mcp_tool(
                 .and_then(Value::as_bool)
                 .unwrap_or(default_include);
 
+            let archive_tenant_pk = state.public_key_for_tenant(&archive.bundle.tenant_id);
             // Cryptographic verification ALWAYS runs over the full 1..=bundle_seq chain in memory!
-            let summary = match verify_export_archive(&archive, &state.host_public_key) {
+            let summary = match verify_export_archive(&archive, &archive_tenant_pk) {
                 Ok(s) => s,
                 Err(err) => {
                     let ev_seq = state
@@ -2305,7 +2368,7 @@ async fn dispatch_mcp_tool(
             let mut out = if include_archive {
                 json!({
                     "verified": true,
-                    "host_public_key": hex::encode(state.host_public_key),
+                    "host_public_key": hex::encode(archive_tenant_pk),
                     "summary": summary,
                     "evidence_chain_total_count": chain_total_count,
                     "evidence_chain_returned_count": chain_returned_count,
@@ -2318,7 +2381,7 @@ async fn dispatch_mcp_tool(
             } else {
                 json!({
                     "verified": true,
-                    "host_public_key": hex::encode(state.host_public_key),
+                    "host_public_key": hex::encode(archive_tenant_pk),
                     "summary": summary,
                     "evidence_chain_total_count": chain_total_count,
                     "evidence_chain_returned_count": chain_returned_count,
@@ -2390,7 +2453,8 @@ async fn dispatch_mcp_tool(
                 _ => None,
             };
 
-            let vk = VerifyingKey::from_bytes(&state.host_public_key)
+            let tid_pk = state.public_key_for_tenant(&tenant_id);
+            let vk = VerifyingKey::from_bytes(&tid_pk)
                 .map_err(|e| format!("host key error: {e}"))?;
             let Json(cp_resp) = handle_get_checkpoint(
                 State(state),

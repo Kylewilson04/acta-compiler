@@ -1,11 +1,14 @@
 use acta_crypto::{
-    compute_claim_client_intent_hash, compute_claim_content_hash, compute_logical_claim_group_key,
-    compute_object_client_intent_hash, compute_object_content_hash,
+    compute_claim_client_intent_hash, compute_claim_content_hash, compute_erasable_claim_commitment,
+    compute_logical_claim_group_key, compute_object_client_intent_hash, compute_object_content_hash,
     compute_retract_claim_client_intent_hash, compute_source_content_commitment,
     hash_length_delimited, verify_client_content_signature,
 };
 use acta_policy::PolicyAction;
-use acta_store::{claims_repo, objects_repo};
+use acta_store::{
+    claims_repo::{self, ErasableClaimSecretPayload},
+    objects_repo,
+};
 use acta_types::{
     validate_claim_value_type, validate_confidence, validate_identifier, validate_importance,
     validate_json_payload_size, validate_justification, validate_priority,
@@ -14,12 +17,14 @@ use acta_types::{
     PolicyResultTag, RetractClaimRequest, RetractClaimResponse, StoredObject,
 };
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{SubsecRound, Utc};
 use ed25519_dalek::VerifyingKey;
+use rand::RngCore;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::routes::ApiError;
@@ -315,9 +320,10 @@ pub async fn handle_ingest_object(
     let (written_by, writer_auth_kind) =
         resolve_writer_identity(&caller_auth, &req.tenant_id, obj.client_signature.is_some());
 
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let (persisted, ev) = objects_repo::insert_object_with_evidence_tx(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         obj,
         &written_by,
         writer_auth_kind,
@@ -512,7 +518,40 @@ pub async fn handle_ingest_claim(
     );
 
     let created_at = Utc::now().trunc_subsecs(6);
-    let allow_auto_supersede = req.predecessor_id.is_none() && parsed_sig_pair.is_none();
+    let is_erasable = req.erasable.unwrap_or(false);
+    let allow_auto_supersede =
+        req.predecessor_id.is_none() && parsed_sig_pair.is_none() && !is_erasable;
+
+    let (stored_object_val, stored_object_type, erasable_secret_opt, erasure_commitment_hex) =
+        if is_erasable {
+            let mut salt_32 = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut salt_32);
+            let er_comm = compute_erasable_claim_commitment(
+                id,
+                &salt_32,
+                &req.object_val,
+                &source_commitment,
+            )?;
+            let er_hex = hex::encode(er_comm);
+            let envelope = json!({ "$acta_erasable_commitment": er_hex });
+            let sensitive_payload = json!({
+                "object_val": req.object_val,
+                "original_object_type": req.object_type,
+                "source_content": req.source_content,
+            });
+            (
+                envelope,
+                "object".to_string(),
+                Some(ErasableClaimSecretPayload {
+                    salt_32,
+                    erasure_commitment: er_comm,
+                    sensitive_payload,
+                }),
+                Some(er_hex),
+            )
+        } else {
+            (req.object_val, req.object_type, None, None)
+        };
 
     let mut claim = KnowledgeClaim {
         id,
@@ -521,8 +560,8 @@ pub async fn handle_ingest_claim(
         scope: req.scope.clone(),
         subject: req.subject,
         predicate: req.predicate,
-        object_val: req.object_val,
-        object_type: req.object_type,
+        object_val: stored_object_val,
+        object_type: stored_object_type,
         confidence: req.confidence,
         source_provenance_class: req.source_provenance_class,
         source_descriptor: req.source_descriptor,
@@ -596,14 +635,16 @@ pub async fn handle_ingest_claim(
     let (written_by, writer_auth_kind) =
         resolve_writer_identity(&caller_auth, &req.tenant_id, claim.client_signature.is_some());
 
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
     let (persisted, ev_opt, was_idempotent_noop) =
-        claims_repo::insert_or_supersede_claim_with_evidence_tx(
+        claims_repo::insert_or_supersede_claim_with_evidence_tx_v173(
             &state.pool,
-            &state.host_signing_key,
+            &active_sk,
             claim,
             allow_auto_supersede,
             &written_by,
             writer_auth_kind,
+            erasable_secret_opt,
         )
         .await?;
 
@@ -631,6 +672,7 @@ pub async fn handle_ingest_claim(
             host_signature: ev_opt.as_ref().map(|e| hex::encode(e.host_signature)),
             client_public_key_hex: persisted.client_public_key.map(hex::encode),
             written_by: persisted.written_by,
+            erasure_commitment_hex,
             was_idempotent_noop,
             created_at: persisted.created_at,
         }),
@@ -760,9 +802,10 @@ pub async fn handle_retract_claim(
     let tombstone_id = req.id.unwrap_or_else(Uuid::new_v4);
     let created_at = Utc::now().trunc_subsecs(6);
 
-    let (tombstone, ev, was_idempotent_noop) = match claims_repo::retract_claim_with_evidence_tx(
+    let active_sk = state.signing_key_for_tenant(&req.tenant_id);
+    let (tombstone, ev, was_idempotent_noop, secret_erased) = match claims_repo::retract_claim_with_evidence_tx_v173(
         &state.pool,
-        &state.host_signing_key,
+        &active_sk,
         &req.tenant_id,
         req.claim_id,
         tombstone_id,
@@ -771,6 +814,7 @@ pub async fn handle_retract_claim(
         writer_auth_kind,
         client_signature,
         client_public_key,
+        req.erase_secret.unwrap_or(false),
         created_at,
     )
     .await
@@ -824,8 +868,55 @@ pub async fn handle_retract_claim(
             host_signature: hex::encode(ev.host_signature),
             client_public_key_hex: tombstone.client_public_key.map(hex::encode),
             retracted_by,
+            secret_erased,
             was_idempotent_noop,
             created_at: tombstone.created_at,
         }),
     ))
+}
+
+/// `GET /v1/tenants/:tenant_id/claims/:claim_id/secret` -> Resolves & verifies an active erasable
+/// claim's off-chain secret (`erasable_item_secrets`) or confirms cryptographic erasure (`erased = true`).
+pub async fn handle_get_claim_secret(
+    State(state): State<AppState>,
+    Path((tenant_id, raw_claim_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let clean_tenant = tenant_id.trim();
+    if clean_tenant.is_empty() {
+        return Err(ApiError::bad_request("tenant_id must be non-empty"));
+    }
+    state
+        .check_tenant_auth_audited(&headers, clean_tenant, "get_claim_secret")
+        .await
+        .map_err(ApiError::unauthorized)?;
+    validate_identifier("tenant_id", clean_tenant)?;
+    let claim_id = Uuid::parse_str(raw_claim_id.trim())
+        .map_err(|e| ApiError::bad_request(format!("invalid claim_id UUID '{raw_claim_id}': {e}")))?;
+
+    let resolved = claims_repo::resolve_erasable_claim_secret(&state.pool, clean_tenant, claim_id).await?;
+    let actor_id = format!("{clean_tenant}::secret-reader");
+    let (decision, _) = state.policy_gate.evaluate_action(
+        clean_tenant,
+        &actor_id,
+        "get_claim_secret",
+        &resolved.scope,
+        PolicyAction::Compile,
+    );
+    if !decision.is_allow() {
+        return Err(ApiError::forbidden("policy denied secret read on claim scope"));
+    }
+
+    Ok(Json(json!({
+        "tenant_id": clean_tenant,
+        "claim_id": resolved.claim_id,
+        "scope": resolved.scope,
+        "is_erasable": resolved.is_erasable,
+        "erased": resolved.erased,
+        "erasure_commitment_hex": resolved.erasure_commitment_hex,
+        "salt_32_hex": resolved.salt_32_hex,
+        "object_val": resolved.object_val,
+        "source_content": resolved.source_content,
+        "commitment_verified": resolved.commitment_verified,
+    })))
 }

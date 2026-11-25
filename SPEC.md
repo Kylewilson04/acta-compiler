@@ -1,6 +1,6 @@
-# Acta Compiler Cryptographic Wire-Format Specification (`v1.7.2`)
+# Acta Compiler Cryptographic Wire-Format Specification (`v1.7.3`)
 
-This specification defines every canonical serialization, domain-separation tag, integer/float byte width, Ed25519 signing preimage, and Merkle tree construction used by Acta Compiler (`v1.0` through `v1.7.2`) so any independent verifier can reproduce every digest, bundle proof, and scope state reconstruction from scratch without consulting the Rust or SDK source code.
+This specification defines every canonical serialization, domain-separation tag, integer/float byte width, Ed25519 signing preimage, and Merkle tree construction used by Acta Compiler (`v1.0` through `v1.7.3`) so any independent verifier can reproduce every digest, bundle proof, and scope state reconstruction from scratch without consulting the Rust or SDK source code.
 
 ---
 
@@ -104,28 +104,37 @@ hash_length_delimited([
 ])
 ```
 
-### 2.5 Omission List & State Commitments (`commitment.rs` Exact Wire Layout)
+### 2.5 Omission List & Versioned State Commitments (`v1` Legacy `seq 1..219` vs `v2` Domain-Tagged `v1.7.3+`)
 * **`full_excluded_hash` (`b"acta:omissions:v1"`)**: `hash_length_delimited([b"acta:omissions:v1", jcs_item_0, jcs_item_1, ...])` where each item is `{"id":"<lowercase-uuid>","reason":"<snake_case_reason>"}`.
-* **Sub-commitment (`compute_sub_commitment` for `intent_root`, `knowledge_root`, `memory_root`, and `dependency_commitment`)**:
-  Sort 32-byte hashes ascending lexicographically (`h_0 <= h_1 <= ...`), then hash them directly via length-delimited framing **with no domain prefix**:
-  ```text
-  compute_sub_commitment([h_0, h_1, ...]) = hash_length_delimited([h_0, h_1, ...])
-  ```
-  * Empty sub-commitment (`0` active items): `BLAKE3-256(b"") == af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262`.
-  * `knowledge_root` hashes all active non-superseded, non-retracted, temporally valid (`valid_from <= eval_ts <= valid_to`) `KnowledgeClaim.content_hash`es **plus** all active non-superseded `OverrideAttestation.attestation_hash`es in `(tenant_id, scope)` sorted ascending together.
-* **`state_commitment` (`compute_state_commitment`, 7 parts, no separate prefix before `schema_version`)**:
-  ```text
-  compute_state_commitment = hash_length_delimited([
-    utf8(schema_version),     // "acta-context-bundle/v1"
-    utf8(tenant_id),
-    utf8(scope),
-    intent_root_32,
-    knowledge_root_32,
-    memory_root_32,
-    permission_root_32,
-  ])
-  ```
-  Commits strictly to the input vault state and Cedar policy root prior to threshold resolution (for example, `kylewilson04` scope `acta-test/v171-audit` at `seq 184` deterministically yields `d0bf021294bc7e0e60cbeeca4ece2c8dcc79bf8b82a4be89c481f9cabd13068a`).
+* **Schema-Selected State & Sub-Commitment Versions**:
+  * **`schema_version == "acta-context-bundle/v2"` (and `"acta-state-rebuild-archive/v2"`, Default in `v1.7.3+`) — Domain-Tagged `b"acta:sub_commitment:v2"` & `b"acta:state:v2"`**:
+    * **Sub-commitment `v2` (`compute_sub_commitment_v2`)**: Sort 32-byte hashes ascending (`h_0 <= h_1 <= ...`), then prepend domain tag `b"acta:sub_commitment:v2"`:
+      ```text
+      compute_sub_commitment_v2([h_0, h_1, ...]) = hash_length_delimited([
+        b"acta:sub_commitment:v2",
+        h_0,
+        h_1,
+        ...
+      ])
+      ```
+      Empty `v2` sub-commitment (`0` active items): `hash_length_delimited([b"acta:sub_commitment:v2"]) == BLAKE3-256(u64_le(22) || b"acta:sub_commitment:v2")`.
+    * **State commitment `v2` (`compute_state_commitment`, `8` parts)**:
+      ```text
+      compute_state_commitment_v2 = hash_length_delimited([
+        b"acta:state:v2",
+        utf8("acta-context-bundle/v2"),
+        utf8(tenant_id),
+        utf8(scope),
+        intent_root_v2_32,
+        knowledge_root_v2_32,
+        memory_root_v2_32,
+        permission_root_32,
+      ])
+      ```
+  * **`schema_version == "acta-context-bundle/v1"` (and `"acta-state-rebuild-archive/v1"`, Preserved for `seq 1..219`)**:
+    * **Sub-commitment `v1` (`compute_sub_commitment`)**: `hash_length_delimited([h_0, h_1, ...])` with no domain prefix (`empty = BLAKE3-256(b"") == af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262`).
+    * **State commitment `v1` (`7` parts)**: `hash_length_delimited([utf8("acta-context-bundle/v1"), utf8(tenant_id), utf8(scope), intent_root_v1_32, knowledge_root_v1_32, memory_root_v1_32, permission_root_32])` (e.g., `d0bf021294bc7e0e60cbeeca4ece2c8dcc79bf8b82a4be89c481f9cabd13068a` at `seq 184` and `e44a51111ad14e95322724fe9f38699186586c3b9f34cda1adab456e61f24072` at `seq 219`).
+  * In both `v1` and `v2`, `knowledge_root` hashes all active non-superseded, non-retracted, temporally valid (`valid_from <= eval_ts <= valid_to`) `KnowledgeClaim.content_hash`es **plus** all active non-superseded `OverrideAttestation.attestation_hash`es in `(tenant_id, scope)` sorted ascending together.
 * **`bundle_hash` (`b"acta:bundle:v1"`)**: `hash_length_delimited([b"acta:bundle:v1", jcs_utf8(bundle)])`.
 
 ---
@@ -240,7 +249,7 @@ Used solely prior to `v1.6.1` (quarantined anchor rows recorded under `v1.6.0` a
 
 ### 6.2 Time-Pinned Counterfactual Replay & Observable `resolver_compat` (`v1.7.2+`)
 * **Strict `as_of` Snapshot & Supersession Cutoff**: Filters `objects`, `knowledge_claims`, `override_attestations`, and active-hash scans to `created_at <= pinned_evaluation_time`, treating any supersession with `succ.created_at > pinned_evaluation_time` as not yet applied.
-* **Observable `resolver_compat`**: Replay responses expose `resolver_compat` (`"legacy_pre_v171"` for pre-`v1.7.1` source bundles, `"legacy_v171"` for `v1.7.1` bidirectional-contradiction bundles such as `seq 171`, or `"v172_current"` for `v1.7.2+` compiles) so legacy compatibility mode is directly observable while reproducing every historical `source_bundle_hash` bit-for-bit.
+* **Recorded Provenance (`ResolverManifest.resolver_version`) vs Reproducing Resolver (`reproducing_resolver`) (`v1.7.3+`)**: New `v1.7.3+` bundles commit `resolver_version: "v1.7.3"` directly inside `bundle.resolver_manifest` (omitted on `seq 1..219` so historical `bundle_hash`es remain unchanged). Replay responses expose `recorded_resolver_version` (`"v1.7.3"` on new bundles, `null` on pre-`v1.7.3` bundles) alongside `reproducing_resolver` (aliased as `resolver_compat` for backwards compatibility: `"legacy_pre_v171"`, `"legacy_v171"`, `"v172_current"` for `v1`-schema bundles reproduced by current resolution, or `"v173_current"` for `v2`-schema bundles).
 
 ---
 
@@ -306,6 +315,7 @@ On any failed client Ed25519 signature (`v1.7.2+`), both the HTTP/MCP error body
     relevant_knowledge_root_32,
   ])
   ```
+  * `intent_root_32`, `selected_memory_root_32`, and `relevant_knowledge_root_32` use the sub-commitment version matching `source_bundle.schema_version` (`compute_sub_commitment_v2` with `b"acta:sub_commitment:v2"` for `"acta-context-bundle/v2"`, and `v1` `compute_sub_commitment` for `"acta-context-bundle/v1"`).
   * When `dependency_ids` is omitted (`pinned_claim_ids` empty), `relevant_knowledge_root_32` hashes all active claims and active overrides in the referenced `claim_group_key`s (plus active incoming `contradiction_ids` targeting them).
   * When `dependency_ids` explicitly narrows to specific claim UUIDs (`pinned_claim_ids` non-empty, `v1.7.2+`), `relevant_knowledge_root_32` hashes only the active claims in `pinned_claim_ids` (plus active incoming `contradiction_ids` targeting `pinned_claim_ids`), so mutations to non-listed claims — even in the same `(subject, predicate)` group — leave `task_dependency_commitment` unchanged and preserve a cache hit.
 
@@ -331,3 +341,29 @@ On any failed client Ed25519 signature (`v1.7.2+`), both the HTTP/MCP error body
   * **Host Rebuild Header Signature (`b"acta:rebuild_sig:v1"`, 3 parts)**:
     Host Ed25519 signs `hash_length_delimited([b"acta:rebuild_sig:v1", utf8(tenant_id), header_hash_32])`.
 * When `up_to_seq` is explicitly specified (`acta_verify_state_rebuild(scope, up_to_seq)`), `evaluated_at` defaults deterministically to `evidence_chain[up_to_seq - 1].created_at` so historical prefix rebuilds (such as `acta-test/v171-audit` at `up_to_seq = 184`) are time-invariant across future wall-clock dates.
+
+---
+
+## 10. `v1.7.3` Cache-Write Freshness, Chain-Clock Rebuild & Pilot-Readiness Lifecycles
+
+### 10.1 Cache-Write Freshness (`bundle_stale_at_cache_time`) & Chained `dependency_ids`
+* **Write-Time Freshness Enforcement (`acta_cache_answer`)**: Before persisting a cached answer (and again under the tenant advisory lock inside `cache_answer_tx`), Acta recomputes the live commitment for the requested `validity_mode` (`live_state_commitment` for `"scope_root"`, or `live_task_dependency_commitment` for `"dependency_subset"`). If it no longer matches the `source_bundle`'s commitment at compile time, `acta_cache_answer` refuses and appends a signed `RefusalMetadata` entry with `reason_code: "bundle_stale_at_cache_time"`, preventing cached answers from being born stale.
+* **Chained `dependency_ids` (`AnswerCacheLedgerSummary.dependency_ids`)**: When `dependency_ids` narrows a `dependency_subset` cache entry, the sorted lowercase UUID list is recorded in `AnswerCacheLedgerSummary.dependency_ids` (on both `"cached"` and `"invalidated"` receipts) and omitted when un-narrowed so `seq 1..219` serialize identically.
+
+### 10.2 Chain-Clock-Pinned `StateRebuildArchive` & `matches_live_store_bit_for_bit`
+* **Chain-Clock Default**: Whenever `evaluated_at` is omitted on `acta_verify_state_rebuild` (for both prefix `up_to_seq` AND head exports), `evaluated_at` defaults deterministically to the tail entry's `created_at` (`evidence_chain[effective_seq - 1].created_at`), making head exports deterministic across wall-clock time. Callers wanting wall-clock or custom-timestamp evaluation pass explicit `evaluated_at` (`"now"` or RFC 3339), which is host-signed in `header_hash`.
+* **Exact Commitment Equality**: `matches_live_store_bit_for_bit` equals literal byte equality `reconstructed_state_commitment == live_store_state_commitment`.
+
+### 10.3 Host Key Rotation (`b"acta:host_key_rotate:v1"`) & Compromise Quarantine
+* **`HostKeyRotationSummary` (`13`-part `b"acta:evidence_event:v3"`)**:
+  * `state_commitment = hash_length_delimited([b"acta:host_key_rotate:v1", rfc8785_jcs_utf8(host_key_rotation_summary)])`.
+  * `event_hash` hashes `[b"acta:evidence_event:v3", utf8(tenant_id), i64_le(seq_num), prev_hash_32, encode_opt_hash32(bundle_hash), encode_opt_hash32(state_commitment), utf8(policy_result), i64_le(created_at_micros), 0x00, 0x00, 0x00, 0x00, encode_opt_jcs(host_key_rotation_summary)]` (`13` parts).
+  * For `rotation_mode == "scheduled"`, `old_key_signature` signs `hash_length_delimited([b"acta:host_key_rotate_old_sig:v1", utf8(tenant_id), i64_le(effective_from_seq), old_pk_32, new_pk_32, utf8(rotation_mode), utf8(reason)])` under `old_sk`, `new_key_signature` signs `hash_length_delimited([b"acta:host_key_rotate_new_sig:v1", utf8(tenant_id), i64_le(effective_from_seq), old_pk_32, new_pk_32, utf8(rotation_mode), utf8(reason)])` under `new_sk`, entry `effective_from_seq` is signed by `old_sk`, and all entries `seq > effective_from_seq` are signed by `new_sk`. Offline verifiers pinned to genesis `K_0` verify the entire multi-key chain seamlessly.
+  * For `rotation_mode == "compromise_recovery"` with `compromised_from_seq = Some(C)`, witness-anchored prefix `1..=M` (`M < C`) and post-recovery entries `seq > R` remain valid while unanchored entries `C..=R-1` signed only by the compromised key are flagged as quarantined.
+
+### 10.4 Salted-Commitment Cryptographic Erasure (`b"acta:erasable_claim:v1"`)
+* Claims ingested with `erasable: true` generate a CSPRNG 256-bit `salt_32`, compute `erasure_commitment = hash_length_delimited([b"acta:erasable_claim:v1", uuid_be_16(id), salt_32, rfc8785_jcs_utf8(object_val), source_commitment_32])`, store `(salt_32, object_val, source_content)` in off-chain `erasable_item_secrets`, and write only `{"$acta_erasable_commitment": "<64-hex>"}` into `knowledge_claims.object_val` and `evidence_history.write_meta`.
+* Active compiles hydrate `object_val` from `erasable_item_secrets`. Calling `acta_retract_claim(..., erase_secret: true)` deletes the `erasable_item_secrets` row (`salt_32` + cleartext permanently destroyed) and appends a `retract_claim` tombstone: sensitive content becomes cryptographically unrecoverable while `100%` of `evidence_history` and `StateRebuildArchive` verify bit-for-bit without mutating `evidence_history`.
+
+### 10.5 Legacy Scopes & Opt-In `legacy_import` Backfill
+* Pilot and production tenants provisioned on `v1.7.0+` start with `0` unchained items from `seq 1`. Pre-`v1.7.0` scopes containing unchained rows (`evidence_seq_num IS NULL`) can opt into `POST /v1/tenants/:tenant_id/backfill-legacy-scope`, appending signed `WriteOperationKind::LegacyImportObject` / `LegacyImportClaim` entries onto the tail of `evidence_history` without mutating historical entries.

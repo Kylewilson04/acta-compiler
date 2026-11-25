@@ -7,10 +7,15 @@ use crate::objects::{SelectedObjectRef, StoredObject};
 use crate::request::ContextBudget;
 use crate::serde_hex::{hex_32, hex_64, opt_hex_32, opt_hex_vec};
 
-pub const SCHEMA_VERSION: &str = "acta-context-bundle/v1";
+pub const SCHEMA_VERSION_V1: &str = "acta-context-bundle/v1";
+pub const SCHEMA_VERSION_V2: &str = "acta-context-bundle/v2";
+pub const SCHEMA_VERSION: &str = SCHEMA_VERSION_V2;
+pub const SUB_COMMITMENT_DOMAIN_V2: &str = "acta:sub_commitment:v2";
+pub const STATE_COMMITMENT_DOMAIN_V2: &str = "acta:state:v2";
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.70;
 pub const DEFAULT_DECISIVENESS_THRESHOLD: f64 = 0.15;
 pub const DEFAULT_CORROBORATION_DAMPING: f64 = 0.50;
+pub const CURRENT_RESOLVER_VERSION: &str = "v1.7.3";
 
 pub const WITNESS_REG_DOMAIN_V1: &str = "acta:witness_reg:v1";
 pub const WITNESS_REG_DOMAIN_V2: &str = "acta:witness_reg:v2";
@@ -21,8 +26,18 @@ pub const WRITE_EVENT_DOMAIN_V1: &str = "acta:write_event:v1";
 pub const ANSWER_CACHE_DOMAIN_V1: &str = "acta:answer_cache:v1";
 pub const CACHE_DEPENDENCY_DOMAIN_V1: &str = "acta:cache_dep_root:v1";
 pub const STATE_REBUILD_ARCHIVE_SCHEMA_V1: &str = "acta-state-rebuild-archive/v1";
+pub const STATE_REBUILD_ARCHIVE_SCHEMA_V2: &str = "acta-state-rebuild-archive/v2";
+pub const STATE_REBUILD_ARCHIVE_SCHEMA: &str = STATE_REBUILD_ARCHIVE_SCHEMA_V2;
 pub const REBUILD_HEADER_DOMAIN_V1: &str = "acta:rebuild_header:v1";
 pub const REBUILD_SIG_DOMAIN_V1: &str = "acta:rebuild_sig:v1";
+pub const HOST_KEY_ROTATE_DOMAIN_V1: &str = "acta:host_key_rotate:v1";
+pub const HOST_KEY_ROTATE_OLD_SIG_DOMAIN_V1: &str = "acta:host_key_rotate_old_sig:v1";
+pub const HOST_KEY_ROTATE_NEW_SIG_DOMAIN_V1: &str = "acta:host_key_rotate_new_sig:v1";
+pub const ERASABLE_CLAIM_DOMAIN_V1: &str = "acta:erasable_claim:v1";
+
+fn default_host_key_rotate_domain() -> String {
+    HOST_KEY_ROTATE_DOMAIN_V1.to_string()
+}
 
 fn default_witness_reg_domain() -> String {
     WITNESS_REG_DOMAIN_V1.to_string()
@@ -121,6 +136,8 @@ pub struct ResolverManifest {
     pub budget: ContextBudget,
     #[serde(with = "hex_32")]
     pub permission_root: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_version: Option<String>,
 }
 
 impl ResolverManifest {
@@ -130,6 +147,24 @@ impl ResolverManifest {
         corroboration_damping: f64,
         budget: ContextBudget,
         permission_root: [u8; 32],
+    ) -> Self {
+        Self::new_with_version(
+            min_confidence,
+            decisiveness_threshold,
+            corroboration_damping,
+            budget,
+            permission_root,
+            Some(CURRENT_RESOLVER_VERSION.to_string()),
+        )
+    }
+
+    pub fn new_with_version(
+        min_confidence: f64,
+        decisiveness_threshold: f64,
+        corroboration_damping: f64,
+        budget: ContextBudget,
+        permission_root: [u8; 32],
+        resolver_version: Option<String>,
     ) -> Self {
         let non_default_thresholds = (min_confidence - DEFAULT_MIN_CONFIDENCE).abs() > 1e-9
             || (decisiveness_threshold - DEFAULT_DECISIVENESS_THRESHOLD).abs() > 1e-9
@@ -141,6 +176,7 @@ impl ResolverManifest {
             non_default_thresholds,
             budget,
             permission_root,
+            resolver_version,
         }
     }
 
@@ -189,6 +225,8 @@ pub enum WriteOperationKind {
     IngestObject,
     IngestClaim,
     RetractClaim,
+    LegacyImportObject,
+    LegacyImportClaim,
 }
 
 impl WriteOperationKind {
@@ -197,6 +235,8 @@ impl WriteOperationKind {
             WriteOperationKind::IngestObject => "ingest_object",
             WriteOperationKind::IngestClaim => "ingest_claim",
             WriteOperationKind::RetractClaim => "retract_claim",
+            WriteOperationKind::LegacyImportObject => "legacy_import_object",
+            WriteOperationKind::LegacyImportClaim => "legacy_import_claim",
         }
     }
 }
@@ -251,6 +291,8 @@ pub struct AnswerCacheLedgerSummary {
     pub validity_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
     pub task_dependency_commitment: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_ids: Vec<Uuid>,
     #[serde(with = "hex_32")]
     pub answer_hash: [u8; 32],
     pub cached_by: String,
@@ -304,6 +346,27 @@ pub struct WitnessRevocationSummary {
     pub revocation_blake3_preimage_hex: String,
 }
 
+/// Chained host Ed25519 key rotation / compromise-recovery summary (`b"acta:host_key_rotate:v1"`, `v1.7.3+`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostKeyRotationSummary {
+    #[serde(default = "default_host_key_rotate_domain")]
+    pub rotation_domain: String,
+    #[serde(with = "hex_32")]
+    pub old_public_key: [u8; 32],
+    #[serde(with = "hex_32")]
+    pub new_public_key: [u8; 32],
+    pub effective_from_seq: i64,
+    pub rotation_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compromised_from_seq: Option<i64>,
+    pub reason: String,
+    pub rotated_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_vec")]
+    pub old_key_signature: Option<Vec<u8>>,
+    #[serde(with = "hex_64")]
+    pub new_key_signature: [u8; 64],
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextBundle {
     pub schema_version: String,
@@ -354,6 +417,8 @@ pub struct EvidenceEntry {
     pub witness_reg_summary: Option<WitnessRegistrationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness_revoke_summary: Option<WitnessRevocationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_rotation_summary: Option<HostKeyRotationSummary>,
     #[serde(with = "hex_64")]
     pub host_signature: [u8; 64],
     pub created_at: DateTime<Utc>,
@@ -406,6 +471,9 @@ impl EvidenceEntry {
     }
 
     pub fn expected_event_domain_str(&self) -> &'static str {
+        if self.host_key_rotation_summary.is_some() {
+            return "acta:evidence_event:v3";
+        }
         Self::inferred_event_domain_v172(
             self.refusal_metadata.is_some(),
             self.override_summary.is_some(),
@@ -576,6 +644,8 @@ pub struct MerkleBundleProof {
     pub override_entry_proofs: Vec<EntryInclusionProof>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_entry_proofs: Vec<EntryInclusionProof>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotation_entry_proofs: Vec<EntryInclusionProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchored_checkpoint: Option<SignedTreeHead>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -630,6 +700,8 @@ pub struct StateRebuildArchive {
     pub scope: String,
     pub up_to_seq: i64,
     pub evaluated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex_32")]
+    pub genesis_host_public_key: Option<[u8; 32]>,
     #[serde(with = "hex_32")]
     pub host_public_key: [u8; 32],
     #[serde(with = "hex_32")]

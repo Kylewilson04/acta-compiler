@@ -2,20 +2,23 @@ use std::collections::BTreeSet;
 
 use acta_crypto::{
     claims_share_winning_value_bucket, compute_checkpoint_hash, compute_evidence_event_hash_v172,
-    compute_evidence_event_hash_with_meta, compute_legacy_blake3_merkle_root_from_events,
+    compute_evidence_event_hash_v173, compute_evidence_event_hash_with_meta,
+    compute_host_key_rotation_commitment, compute_legacy_blake3_merkle_root_from_events,
     compute_merkle_consistency_proof, compute_merkle_inclusion_proof,
     compute_merkle_root_from_leaves, compute_refusal_metadata_commitment,
     compute_witness_registration_by_domain, compute_witness_registration_v3_commitment,
     compute_witness_revocation_by_domain, compute_witness_revocation_v2_commitment,
-    merkle_leaf_hash, sign_checkpoint_head, sign_evidence_entry,
-    witness_registration_preimage_bytes, witness_revocation_preimage_bytes,
+    merkle_leaf_hash, sign_checkpoint_head, sign_evidence_entry, sign_host_key_rotation_new,
+    sign_host_key_rotation_old, witness_registration_preimage_bytes,
+    witness_revocation_preimage_bytes,
 };
 use acta_types::{
     ActaError, ActaResult, AnswerCacheLedgerSummary, ContextBundle, EntryInclusionProof,
-    EvidenceEntry, ExternalWitnessAnchor, KnowledgeClaim, MerkleBundleProof,
-    OverrideLedgerSummary, PolicyResultTag, QuarantinedAnchorRecord, RefusalMetadata,
-    SignedTreeHead, TrustedWitness, WitnessRegistrationSummary, WitnessRevocationSummary,
-    WriteLedgerSummary, WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1,
+    EvidenceEntry, ExternalWitnessAnchor, HostKeyRotationSummary, KnowledgeClaim,
+    MerkleBundleProof, OverrideLedgerSummary, PolicyResultTag, QuarantinedAnchorRecord,
+    RefusalMetadata, SignedTreeHead, TrustedWitness, WitnessRegistrationSummary,
+    WitnessRevocationSummary, WriteLedgerSummary, HOST_KEY_ROTATE_DOMAIN_V1,
+    WITNESS_REG_DOMAIN_V1, WITNESS_REG_DOMAIN_V3, WITNESS_REVOKE_DOMAIN_V1,
     WITNESS_REVOKE_DOMAIN_V2,
 };
 use chrono::{DateTime, SubsecRound, Utc};
@@ -47,6 +50,7 @@ struct EvidenceRow {
     answer_cache_meta: Option<Value>,
     witness_reg_meta: Option<Value>,
     witness_revoke_meta: Option<Value>,
+    host_key_rotation_meta: Option<Value>,
     host_signature: Vec<u8>,
     created_at: DateTime<Utc>,
     witness_reg_id: Option<String>,
@@ -221,7 +225,18 @@ impl EvidenceRow {
             }
         };
 
-        let event_domain = Some(
+        let host_key_rotation_summary: Option<HostKeyRotationSummary> = self
+            .host_key_rotation_meta
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| {
+                    ActaError::Storage(format!("host_key_rotation_meta deserialization failed: {e}"))
+                })
+            })
+            .transpose()?;
+
+        let event_domain = Some(if host_key_rotation_summary.is_some() {
+            "acta:evidence_event:v3".to_string()
+        } else {
             EvidenceEntry::inferred_event_domain_v172(
                 refusal_metadata.is_some(),
                 override_summary.is_some(),
@@ -229,8 +244,8 @@ impl EvidenceRow {
                 answer_cache_summary.is_some(),
                 witness_in_v3,
             )
-            .to_string(),
-        );
+            .to_string()
+        });
 
         Ok(EvidenceEntry {
             tenant_id: self.tenant_id,
@@ -247,6 +262,7 @@ impl EvidenceRow {
             answer_cache_summary,
             witness_reg_summary,
             witness_revoke_summary,
+            host_key_rotation_summary,
             host_signature,
             created_at: self.created_at,
         })
@@ -608,6 +624,7 @@ pub async fn append_evidence_full_tx(
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature,
         created_at,
     })
@@ -687,7 +704,7 @@ pub async fn fetch_evidence_by_seq(
         SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                e.bundle_hash, e.state_commitment, e.policy_result,
                e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-               e.witness_reg_meta, e.witness_revoke_meta,
+               e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                e.host_signature, e.created_at,
                tw.witness_id AS witness_reg_id,
                tw.public_key AS witness_reg_public_key,
@@ -733,7 +750,7 @@ pub async fn fetch_evidence_by_seqs(
         SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                e.bundle_hash, e.state_commitment, e.policy_result,
                e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-               e.witness_reg_meta, e.witness_revoke_meta,
+               e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                e.host_signature, e.created_at,
                tw.witness_id AS witness_reg_id,
                tw.public_key AS witness_reg_public_key,
@@ -779,7 +796,7 @@ pub async fn fetch_tenant_evidence_chain(
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
                        e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                        e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
@@ -815,7 +832,7 @@ pub async fn fetch_tenant_evidence_chain(
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
                        e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                        e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
@@ -894,7 +911,7 @@ pub async fn fetch_tenant_evidence_page(
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
                        e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                        e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
@@ -933,7 +950,7 @@ pub async fn fetch_tenant_evidence_page(
                 SELECT e.tenant_id, e.seq_num, e.prev_hash, e.event_hash,
                        e.bundle_hash, e.state_commitment, e.policy_result,
                        e.refusal_meta, e.override_meta, e.write_meta, e.answer_cache_meta,
-                       e.witness_reg_meta, e.witness_revoke_meta,
+                       e.witness_reg_meta, e.witness_revoke_meta, e.host_key_rotation_meta,
                        e.host_signature, e.created_at,
                        tw.witness_id AS witness_reg_id,
                        tw.public_key AS witness_reg_public_key,
@@ -1426,6 +1443,27 @@ pub async fn fetch_bundle_with_merkle_options_scoped(
         },
         override_entry_proofs,
         write_entry_proofs,
+        rotation_entry_proofs: {
+            let rot_seqs: Vec<(i64,)> = sqlx::query_as(
+                "SELECT effective_from_seq FROM host_key_rotations WHERE tenant_id = $1 AND effective_from_seq <= $2 ORDER BY effective_from_seq ASC",
+            )
+            .bind(&tenant_id)
+            .bind(target_seq)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ActaError::Storage(format!("lookup rotation seqs failed: {e}")))?;
+            let r_seqs: Vec<i64> = rot_seqs.into_iter().map(|(s,)| s).collect();
+            let r_entries = fetch_evidence_by_seqs(pool, &tenant_id, &r_seqs).await?;
+            let mut r_proofs = Vec::with_capacity(r_entries.len());
+            for re in r_entries {
+                let p = compute_merkle_inclusion_proof(&leaves, (re.seq_num - 1) as usize)?
+                    .into_iter()
+                    .map(|h| acta_crypto_hex(&h))
+                    .collect();
+                r_proofs.push(EntryInclusionProof { entry: re, audit_path: p });
+            }
+            r_proofs
+        },
         anchored_checkpoint,
         consistency_proof_to_anchor,
     };
@@ -2322,4 +2360,249 @@ pub async fn resolve_latest_anchored_for_head(
     }
 
     Ok((None, None, None))
+}
+
+
+/// Returns the genesis `old_public_key` for `tenant_id` if at least one `host_key_rotations` row exists.
+pub async fn fetch_tenant_genesis_public_key(
+    pool: &PgPool,
+    tenant_id: &str,
+) -> ActaResult<Option<[u8; 32]>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        r#"
+        SELECT old_public_key
+        FROM host_key_rotations
+        WHERE tenant_id = $1
+        ORDER BY effective_from_seq ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ActaError::Storage(format!("fetch_tenant_genesis_public_key failed: {e}")))?;
+
+    row.map(|(raw,)| {
+        raw.try_into().map_err(|_| {
+            ActaError::Storage("host_key_rotations.old_public_key not 32 bytes".to_string())
+        })
+    })
+    .transpose()
+}
+
+/// Atomically appends a chained `HostKeyRotationSummary` (`b"acta:host_key_rotate:v1"`, 13-part `b"acta:evidence_event:v3"`)
+/// onto `evidence_history` and `host_key_rotations` (`v1.7.3+`, SPEC §10.3).
+#[allow(clippy::too_many_arguments)]
+pub async fn rotate_host_key_tx(
+    pool: &PgPool,
+    old_signing_key: Option<&SigningKey>,
+    expected_old_public_key: &[u8; 32],
+    new_signing_key: &SigningKey,
+    tenant_id: &str,
+    rotation_mode: &str,
+    compromised_from_seq: Option<i64>,
+    reason: &str,
+    rotated_by: &str,
+    created_at: DateTime<Utc>,
+) -> ActaResult<(HostKeyRotationSummary, EvidenceEntry)> {
+    if rotation_mode != "scheduled" && rotation_mode != "compromise_recovery" {
+        return Err(ActaError::Validation(format!(
+            "unsupported rotation_mode '{rotation_mode}' (expected 'scheduled' or 'compromise_recovery')"
+        )));
+    }
+    let new_public_key = new_signing_key.verifying_key().to_bytes();
+    if &new_public_key == expected_old_public_key {
+        return Err(ActaError::Validation(
+            "new_public_key must differ from old_public_key".to_string(),
+        ));
+    }
+
+    let created_at = created_at.trunc_subsecs(6);
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ActaError::Storage(format!("begin rotate_host_key tx failed: {e}")))?;
+
+    let (prev_seq, prev_hash) = lock_and_read_latest_evidence_tx(&mut tx, tenant_id).await?;
+    let seq_num = prev_seq + 1;
+
+    if rotation_mode == "compromise_recovery" {
+        let Some(c_seq) = compromised_from_seq else {
+            tx.rollback().await.ok();
+            return Err(ActaError::Validation(
+                "compromise_recovery requires compromised_from_seq".to_string(),
+            ));
+        };
+        if c_seq < 1 || c_seq > seq_num {
+            tx.rollback().await.ok();
+            return Err(ActaError::Validation(format!(
+                "compromised_from_seq ({c_seq}) must satisfy 1 <= compromised_from_seq <= {seq_num}"
+            )));
+        }
+    }
+
+    let old_key_signature = if rotation_mode == "scheduled" {
+        let Some(old_sk) = old_signing_key else {
+            tx.rollback().await.ok();
+            return Err(ActaError::Validation(
+                "scheduled host key rotation requires active old_signing_key".to_string(),
+            ));
+        };
+        Some(
+            sign_host_key_rotation_old(
+                old_sk,
+                tenant_id,
+                seq_num,
+                expected_old_public_key,
+                &new_public_key,
+                rotation_mode,
+                reason,
+            )
+            .to_vec(),
+        )
+    } else {
+        old_signing_key.map(|old_sk| {
+            sign_host_key_rotation_old(
+                old_sk,
+                tenant_id,
+                seq_num,
+                expected_old_public_key,
+                &new_public_key,
+                rotation_mode,
+                reason,
+            )
+            .to_vec()
+        })
+    };
+
+    let new_key_signature = sign_host_key_rotation_new(
+        new_signing_key,
+        tenant_id,
+        seq_num,
+        expected_old_public_key,
+        &new_public_key,
+        rotation_mode,
+        reason,
+    );
+
+    let summary = HostKeyRotationSummary {
+        rotation_domain: HOST_KEY_ROTATE_DOMAIN_V1.to_string(),
+        old_public_key: *expected_old_public_key,
+        new_public_key,
+        effective_from_seq: seq_num,
+        rotation_mode: rotation_mode.to_string(),
+        compromised_from_seq: if rotation_mode == "compromise_recovery" {
+            compromised_from_seq
+        } else {
+            None
+        },
+        reason: reason.to_string(),
+        rotated_by: rotated_by.to_string(),
+        old_key_signature: old_key_signature.clone(),
+        new_key_signature,
+    };
+
+    let rot_comm = compute_host_key_rotation_commitment(&summary)?;
+    let event_hash = compute_evidence_event_hash_v173(
+        tenant_id,
+        seq_num,
+        &prev_hash,
+        None,
+        Some(&rot_comm),
+        PolicyResultTag::Allow,
+        created_at.timestamp_micros(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        Some(&summary),
+    )?;
+
+    // Entry `effective_from_seq` is signed by `old_signing_key` when available (mandatory for `scheduled`),
+    // or by `new_signing_key` during emergency `compromise_recovery` when `old_signing_key` was destroyed.
+    let entry_signer = old_signing_key.unwrap_or(new_signing_key);
+    let host_signature =
+        sign_evidence_entry(entry_signer, tenant_id, seq_num, &prev_hash, &event_hash);
+    let rot_meta_json = serde_json::to_value(&summary)
+        .map_err(|e| ActaError::Storage(format!("serialize host_key_rotation_meta failed: {e}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO evidence_history (
+            tenant_id, seq_num, prev_hash, event_hash,
+            bundle_hash, state_commitment, policy_result,
+            refusal_meta, override_meta, host_key_rotation_meta,
+            host_signature, created_at
+        )
+        VALUES ($1, $2, $3, $4, NULL, $5, 'allow', NULL, NULL, $6, $7, $8)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(seq_num)
+    .bind(prev_hash.as_slice())
+    .bind(event_hash.as_slice())
+    .bind(rot_comm.as_slice())
+    .bind(rot_meta_json)
+    .bind(host_signature.as_slice())
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ActaError::Storage(format!("insert host_key_rotation evidence failed: {e}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO host_key_rotations (
+            id, tenant_id, old_public_key, new_public_key,
+            effective_from_seq, rotation_mode, compromised_from_seq,
+            reason, old_key_signature, new_key_signature,
+            rotated_by, evidence_seq_num, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(expected_old_public_key.as_slice())
+    .bind(new_public_key.as_slice())
+    .bind(seq_num)
+    .bind(rotation_mode)
+    .bind(summary.compromised_from_seq)
+    .bind(reason)
+    .bind(old_key_signature.as_deref())
+    .bind(new_key_signature.as_slice())
+    .bind(rotated_by)
+    .bind(seq_num)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ActaError::Storage(format!("insert host_key_rotations failed: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ActaError::Storage(format!("commit rotate_host_key tx failed: {e}")))?;
+
+    let ev = EvidenceEntry {
+        tenant_id: tenant_id.to_string(),
+        seq_num,
+        event_domain: Some("acta:evidence_event:v3".to_string()),
+        prev_hash,
+        event_hash,
+        bundle_hash: None,
+        state_commitment: Some(rot_comm),
+        policy_result: PolicyResultTag::Allow,
+        refusal_metadata: None,
+        override_summary: None,
+        write_summary: None,
+        answer_cache_summary: None,
+        witness_reg_summary: None,
+        witness_revoke_summary: None,
+        host_key_rotation_summary: Some(summary.clone()),
+        host_signature,
+        created_at,
+    };
+
+    Ok((summary, ev))
 }

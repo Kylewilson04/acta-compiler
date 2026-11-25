@@ -67,10 +67,14 @@ pub async fn build_export_archive_scoped(
         BundleTenantFilter::UnrestrictedMaster => TenantLookupScope::Any,
     };
 
+    let signing_hint_sk = match &filter {
+        BundleTenantFilter::ExactTenant(tid) => state.signing_key_for_tenant(tid),
+        _ => state.host_signing_key.clone(),
+    };
     let (bundle, evidence_chain, merkle_proof) =
         evidence_repo::fetch_bundle_with_merkle_options_scoped(
             &state.pool,
-            &state.host_signing_key,
+            &signing_hint_sk,
             lookup_scope,
             &bundle_hash,
             &[],
@@ -106,6 +110,7 @@ pub async fn build_export_archive_scoped(
         overrides_repo::fetch_overrides_by_ids(&state.pool, &bundle.tenant_id, &override_ids),
     )?;
 
+    let bundle_tenant_pk = state.public_key_for_tenant(&bundle.tenant_id);
     Ok(ExportArchive {
         bundle_hash,
         bundle,
@@ -114,7 +119,7 @@ pub async fn build_export_archive_scoped(
         override_attestations,
         evidence_chain,
         merkle_proof: Some(merkle_proof),
-        host_public_key: state.host_public_key,
+        host_public_key: bundle_tenant_pk,
     })
 }
 

@@ -1,4 +1,4 @@
-"""Acta Compiler v1.7.2 Cryptographic Primitives, RFC 6962 §2.1 SHA-256 Merkle Verifier & Epistemic Notary.
+"""Acta Compiler v1.7.3 Cryptographic Primitives, RFC 6962 §2.1 SHA-256 Merkle Verifier & Epistemic Notary.
 
 Bit-for-bit compatible with Rust `acta-crypto`:
 - RFC 8785 JSON Canonicalization Scheme (JCS) (`serde_jcs`)
@@ -40,10 +40,20 @@ ED25519_L = (1 << 252) + 27742317777372353535851937790883648493
 DEFAULT_MIN_CONFIDENCE = 0.70
 DEFAULT_DECISIVENESS_THRESHOLD = 0.15
 DEFAULT_CORROBORATION_DAMPING = 0.50
-SCHEMA_VERSION = "acta-context-bundle/v1"
+SCHEMA_VERSION_V1 = "acta-context-bundle/v1"
+SCHEMA_VERSION_V2 = "acta-context-bundle/v2"
+SCHEMA_VERSION = SCHEMA_VERSION_V2
+SUB_COMMITMENT_DOMAIN_V2 = "acta:sub_commitment:v2"
+STATE_COMMITMENT_DOMAIN_V2 = "acta:state:v2"
 STATE_REBUILD_ARCHIVE_SCHEMA_V1 = "acta-state-rebuild-archive/v1"
+STATE_REBUILD_ARCHIVE_SCHEMA_V2 = "acta-state-rebuild-archive/v2"
+STATE_REBUILD_ARCHIVE_SCHEMA = STATE_REBUILD_ARCHIVE_SCHEMA_V2
 REBUILD_HEADER_DOMAIN_V1 = "acta:rebuild_header:v1"
 REBUILD_SIG_DOMAIN_V1 = "acta:rebuild_sig:v1"
+HOST_KEY_ROTATE_DOMAIN_V1 = "acta:host_key_rotate:v1"
+HOST_KEY_ROTATE_OLD_SIG_DOMAIN_V1 = "acta:host_key_rotate_old_sig:v1"
+HOST_KEY_ROTATE_NEW_SIG_DOMAIN_V1 = "acta:host_key_rotate_new_sig:v1"
+ERASABLE_CLAIM_DOMAIN_V1 = "acta:erasable_claim:v1"
 
 _WEAK_ED25519_PUBKEYS: frozenset[bytes] = frozenset(
     bytes.fromhex(h)
@@ -868,9 +878,35 @@ def sign_retract_claim_client_intent(
     return sign_client_content_hash(private_key_seed, digest)
 
 
+def is_v2_state_schema(schema_version: str) -> bool:
+    return str(schema_version) in (
+        "acta-context-bundle/v2",
+        "acta-state-rebuild-archive/v2",
+        "v2",
+    )
+
+
+def canonical_bundle_schema_for_state(schema_version: str) -> str:
+    return SCHEMA_VERSION_V2 if is_v2_state_schema(schema_version) else SCHEMA_VERSION_V1
+
+
 def compute_sub_commitment(hashes: Sequence[bytes | str]) -> bytes:
     sorted_raw = sorted(_as_hash32(h) for h in hashes)
     return hash_length_delimited(sorted_raw)
+
+
+def compute_sub_commitment_v2(hashes: Sequence[bytes | str]) -> bytes:
+    sorted_raw = sorted(_as_hash32(h) for h in hashes)
+    return hash_length_delimited([b"acta:sub_commitment:v2", *sorted_raw])
+
+
+def compute_sub_commitment_for_schema(
+    schema_version: str,
+    hashes: Sequence[bytes | str],
+) -> bytes:
+    if is_v2_state_schema(schema_version):
+        return compute_sub_commitment_v2(hashes)
+    return compute_sub_commitment(hashes)
 
 
 def compute_state_commitment(
@@ -882,15 +918,57 @@ def compute_state_commitment(
     memory_root: bytes | str,
     permission_root: bytes | str,
 ) -> bytes:
+    sv = str(schema_version)
+    if is_v2_state_schema(sv):
+        bundle_schema = (
+            SCHEMA_VERSION_V2
+            if sv in ("acta-state-rebuild-archive/v2", "v2")
+            else sv
+        )
+        return hash_length_delimited(
+            [
+                b"acta:state:v2",
+                bundle_schema.encode("utf-8"),
+                tenant_id.encode("utf-8"),
+                scope.encode("utf-8"),
+                _as_hash32(intent_root),
+                _as_hash32(knowledge_root),
+                _as_hash32(memory_root),
+                _as_hash32(permission_root),
+            ]
+        )
+    bundle_schema = (
+        SCHEMA_VERSION_V1
+        if sv in ("acta-state-rebuild-archive/v1", "v1")
+        else sv
+    )
     return hash_length_delimited(
         [
-            schema_version.encode("utf-8"),
+            bundle_schema.encode("utf-8"),
             tenant_id.encode("utf-8"),
             scope.encode("utf-8"),
             _as_hash32(intent_root),
             _as_hash32(knowledge_root),
             _as_hash32(memory_root),
             _as_hash32(permission_root),
+        ]
+    )
+
+
+def compute_erasable_claim_commitment(
+    claim_id: str | uuid.UUID,
+    salt_32: bytes | str,
+    object_val: Any,
+    source_commitment: bytes | str,
+) -> bytes:
+    uid = claim_id if isinstance(claim_id, uuid.UUID) else uuid.UUID(str(claim_id))
+    return hash_length_delimited(
+        [
+            b"acta:erasable_claim:v1",
+            uid.bytes,
+            _as_hash32(salt_32),
+            to_canonical_bytes(object_val),
+            _as_hash32(source_commitment),
         ]
     )
 
@@ -1035,6 +1113,21 @@ def _normalize_answer_cache_summary(acs: Mapping[str, Any]) -> dict[str, Any]:
         out["validity_mode"] = str(acs["validity_mode"])
     if acs.get("task_dependency_commitment") is not None:
         out["task_dependency_commitment"] = _as_hash32(acs["task_dependency_commitment"]).hex()
+    dep_ids = acs.get("dependency_ids")
+    if dep_ids:
+        out["dependency_ids"] = [str(uuid.UUID(str(u))).lower() for u in dep_ids]
+    dep_ids = acs.get("dependency_ids")
+    if dep_ids:
+        out["dependency_ids"] = [str(uuid.UUID(str(u))).lower() for u in dep_ids]
+    dep_ids = acs.get("dependency_ids")
+    if dep_ids:
+        out["dependency_ids"] = [str(uuid.UUID(str(u))).lower() for u in dep_ids]
+    dep_ids = acs.get("dependency_ids")
+    if dep_ids:
+        out["dependency_ids"] = [str(uuid.UUID(str(u))).lower() for u in dep_ids]
+    dep_ids = acs.get("dependency_ids")
+    if dep_ids:
+        out["dependency_ids"] = [str(uuid.UUID(str(u))).lower() for u in dep_ids]
     if acs.get("client_public_key") is not None:
         out["client_public_key"] = _as_hash32(acs["client_public_key"]).hex()
     if acs.get("client_signature") is not None:
@@ -1087,6 +1180,678 @@ def _normalize_witness_revoke_summary(wrev: Mapping[str, Any]) -> dict[str, Any]
     if wrev.get("effective_from_tree_size") is not None:
         out["effective_from_tree_size"] = int(wrev["effective_from_tree_size"])
     return out
+
+
+def _normalize_host_key_rotation_summary(rot: Mapping[str, Any]) -> dict[str, Any]:
+    new_sig_raw = (
+        bytes.fromhex(rot["new_key_signature"])
+        if isinstance(rot["new_key_signature"], str)
+        else bytes(rot["new_key_signature"])
+    )
+    if len(new_sig_raw) != 64:
+        raise ValueError("new_key_signature must be 64 bytes")
+    out: dict[str, Any] = {
+        "rotation_domain": str(rot.get("rotation_domain") or HOST_KEY_ROTATE_DOMAIN_V1),
+        "old_public_key": _as_hash32(rot["old_public_key"]).hex(),
+        "new_public_key": _as_hash32(rot["new_public_key"]).hex(),
+        "effective_from_seq": int(rot["effective_from_seq"]),
+        "rotation_mode": str(rot["rotation_mode"]),
+        "reason": str(rot["reason"]),
+        "rotated_by": str(rot["rotated_by"]),
+        "new_key_signature": new_sig_raw.hex(),
+    }
+    if rot.get("compromised_from_seq") is not None:
+        out["compromised_from_seq"] = int(rot["compromised_from_seq"])
+    if rot.get("old_key_signature") is not None:
+        old_sig_raw = (
+            bytes.fromhex(rot["old_key_signature"])
+            if isinstance(rot["old_key_signature"], str)
+            else bytes(rot["old_key_signature"])
+        )
+        if len(old_sig_raw) != 64:
+            raise ValueError("old_key_signature must be 64 bytes")
+        out["old_key_signature"] = old_sig_raw.hex()
+    return out
+
+
+def compute_host_key_rotation_commitment(rot: Mapping[str, Any]) -> bytes:
+    canonical = to_canonical_bytes(_normalize_host_key_rotation_summary(rot))
+    return hash_length_delimited([b"acta:host_key_rotate:v1", canonical])
+
+
+def host_key_rotation_signing_digest(
+    domain: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    dom_bytes = domain.encode("utf-8") if isinstance(domain, str) else bytes(domain)
+    return hash_length_delimited(
+        [
+            dom_bytes,
+            tenant_id.encode("utf-8"),
+            struct.pack("<q", int(effective_from_seq)),
+            _as_hash32(old_public_key),
+            _as_hash32(new_public_key),
+            rotation_mode.encode("utf-8"),
+            reason.encode("utf-8"),
+        ]
+    )
+
+
+def sign_host_key_rotation_old(
+    old_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(old_private_key_seed)
+        if isinstance(old_private_key_seed, str)
+        else bytes(old_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def sign_host_key_rotation_new(
+    new_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(new_private_key_seed)
+        if isinstance(new_private_key_seed, str)
+        else bytes(new_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def verify_host_key_rotation_old(
+    old_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(old_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def verify_host_key_rotation_new(
+    new_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(new_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def verify_host_key_rotation_new(
+    new_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(new_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def _normalize_host_key_rotation_summary(rot: Mapping[str, Any]) -> dict[str, Any]:
+    new_sig_raw = (
+        bytes.fromhex(rot["new_key_signature"])
+        if isinstance(rot["new_key_signature"], str)
+        else bytes(rot["new_key_signature"])
+    )
+    if len(new_sig_raw) != 64:
+        raise ValueError("new_key_signature must be 64 bytes")
+    out: dict[str, Any] = {
+        "rotation_domain": str(rot.get("rotation_domain") or HOST_KEY_ROTATE_DOMAIN_V1),
+        "old_public_key": _as_hash32(rot["old_public_key"]).hex(),
+        "new_public_key": _as_hash32(rot["new_public_key"]).hex(),
+        "effective_from_seq": int(rot["effective_from_seq"]),
+        "rotation_mode": str(rot["rotation_mode"]),
+        "reason": str(rot["reason"]),
+        "rotated_by": str(rot["rotated_by"]),
+        "new_key_signature": new_sig_raw.hex(),
+    }
+    if rot.get("compromised_from_seq") is not None:
+        out["compromised_from_seq"] = int(rot["compromised_from_seq"])
+    if rot.get("old_key_signature") is not None:
+        old_sig_raw = (
+            bytes.fromhex(rot["old_key_signature"])
+            if isinstance(rot["old_key_signature"], str)
+            else bytes(rot["old_key_signature"])
+        )
+        if len(old_sig_raw) != 64:
+            raise ValueError("old_key_signature must be 64 bytes")
+        out["old_key_signature"] = old_sig_raw.hex()
+    return out
+
+
+def compute_host_key_rotation_commitment(rot: Mapping[str, Any]) -> bytes:
+    canonical = to_canonical_bytes(_normalize_host_key_rotation_summary(rot))
+    return hash_length_delimited([b"acta:host_key_rotate:v1", canonical])
+
+
+def host_key_rotation_signing_digest(
+    domain: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    dom_bytes = domain.encode("utf-8") if isinstance(domain, str) else bytes(domain)
+    return hash_length_delimited(
+        [
+            dom_bytes,
+            tenant_id.encode("utf-8"),
+            struct.pack("<q", int(effective_from_seq)),
+            _as_hash32(old_public_key),
+            _as_hash32(new_public_key),
+            rotation_mode.encode("utf-8"),
+            reason.encode("utf-8"),
+        ]
+    )
+
+
+def sign_host_key_rotation_old(
+    old_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(old_private_key_seed)
+        if isinstance(old_private_key_seed, str)
+        else bytes(old_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def sign_host_key_rotation_new(
+    new_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(new_private_key_seed)
+        if isinstance(new_private_key_seed, str)
+        else bytes(new_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def verify_host_key_rotation_old(
+    old_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(old_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def verify_host_key_rotation_new(
+    new_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(new_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def _normalize_host_key_rotation_summary(rot: Mapping[str, Any]) -> dict[str, Any]:
+    new_sig_raw = (
+        bytes.fromhex(rot["new_key_signature"])
+        if isinstance(rot["new_key_signature"], str)
+        else bytes(rot["new_key_signature"])
+    )
+    if len(new_sig_raw) != 64:
+        raise ValueError("new_key_signature must be 64 bytes")
+    out: dict[str, Any] = {
+        "rotation_domain": str(rot.get("rotation_domain") or HOST_KEY_ROTATE_DOMAIN_V1),
+        "old_public_key": _as_hash32(rot["old_public_key"]).hex(),
+        "new_public_key": _as_hash32(rot["new_public_key"]).hex(),
+        "effective_from_seq": int(rot["effective_from_seq"]),
+        "rotation_mode": str(rot["rotation_mode"]),
+        "reason": str(rot["reason"]),
+        "rotated_by": str(rot["rotated_by"]),
+        "new_key_signature": new_sig_raw.hex(),
+    }
+    if rot.get("compromised_from_seq") is not None:
+        out["compromised_from_seq"] = int(rot["compromised_from_seq"])
+    if rot.get("old_key_signature") is not None:
+        old_sig_raw = (
+            bytes.fromhex(rot["old_key_signature"])
+            if isinstance(rot["old_key_signature"], str)
+            else bytes(rot["old_key_signature"])
+        )
+        if len(old_sig_raw) != 64:
+            raise ValueError("old_key_signature must be 64 bytes")
+        out["old_key_signature"] = old_sig_raw.hex()
+    return out
+
+
+def compute_host_key_rotation_commitment(rot: Mapping[str, Any]) -> bytes:
+    canonical = to_canonical_bytes(_normalize_host_key_rotation_summary(rot))
+    return hash_length_delimited([b"acta:host_key_rotate:v1", canonical])
+
+
+def host_key_rotation_signing_digest(
+    domain: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    dom_bytes = domain.encode("utf-8") if isinstance(domain, str) else bytes(domain)
+    return hash_length_delimited(
+        [
+            dom_bytes,
+            tenant_id.encode("utf-8"),
+            struct.pack("<q", int(effective_from_seq)),
+            _as_hash32(old_public_key),
+            _as_hash32(new_public_key),
+            rotation_mode.encode("utf-8"),
+            reason.encode("utf-8"),
+        ]
+    )
+
+
+def sign_host_key_rotation_old(
+    old_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(old_private_key_seed)
+        if isinstance(old_private_key_seed, str)
+        else bytes(old_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def sign_host_key_rotation_new(
+    new_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(new_private_key_seed)
+        if isinstance(new_private_key_seed, str)
+        else bytes(new_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def verify_host_key_rotation_old(
+    old_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(old_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def verify_host_key_rotation_new(
+    new_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(new_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def _normalize_host_key_rotation_summary(rot: Mapping[str, Any]) -> dict[str, Any]:
+    new_sig_raw = (
+        bytes.fromhex(rot["new_key_signature"])
+        if isinstance(rot["new_key_signature"], str)
+        else bytes(rot["new_key_signature"])
+    )
+    if len(new_sig_raw) != 64:
+        raise ValueError("new_key_signature must be 64 bytes")
+    out: dict[str, Any] = {
+        "rotation_domain": str(rot.get("rotation_domain") or HOST_KEY_ROTATE_DOMAIN_V1),
+        "old_public_key": _as_hash32(rot["old_public_key"]).hex(),
+        "new_public_key": _as_hash32(rot["new_public_key"]).hex(),
+        "effective_from_seq": int(rot["effective_from_seq"]),
+        "rotation_mode": str(rot["rotation_mode"]),
+        "reason": str(rot["reason"]),
+        "rotated_by": str(rot["rotated_by"]),
+        "new_key_signature": new_sig_raw.hex(),
+    }
+    if rot.get("compromised_from_seq") is not None:
+        out["compromised_from_seq"] = int(rot["compromised_from_seq"])
+    if rot.get("old_key_signature") is not None:
+        old_sig_raw = (
+            bytes.fromhex(rot["old_key_signature"])
+            if isinstance(rot["old_key_signature"], str)
+            else bytes(rot["old_key_signature"])
+        )
+        if len(old_sig_raw) != 64:
+            raise ValueError("old_key_signature must be 64 bytes")
+        out["old_key_signature"] = old_sig_raw.hex()
+    return out
+
+
+def compute_host_key_rotation_commitment(rot: Mapping[str, Any]) -> bytes:
+    canonical = to_canonical_bytes(_normalize_host_key_rotation_summary(rot))
+    return hash_length_delimited([b"acta:host_key_rotate:v1", canonical])
+
+
+def host_key_rotation_signing_digest(
+    domain: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    dom_bytes = domain.encode("utf-8") if isinstance(domain, str) else bytes(domain)
+    return hash_length_delimited(
+        [
+            dom_bytes,
+            tenant_id.encode("utf-8"),
+            struct.pack("<q", int(effective_from_seq)),
+            _as_hash32(old_public_key),
+            _as_hash32(new_public_key),
+            rotation_mode.encode("utf-8"),
+            reason.encode("utf-8"),
+        ]
+    )
+
+
+def sign_host_key_rotation_old(
+    old_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(old_private_key_seed)
+        if isinstance(old_private_key_seed, str)
+        else bytes(old_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def sign_host_key_rotation_new(
+    new_private_key_seed: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+) -> bytes:
+    seed = (
+        bytes.fromhex(new_private_key_seed)
+        if isinstance(new_private_key_seed, str)
+        else bytes(new_private_key_seed)
+    )
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return sk.sign(msg)
+
+
+def verify_host_key_rotation_old(
+    old_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(old_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_old_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
+
+
+def verify_host_key_rotation_new(
+    new_pubkey: bytes | str,
+    tenant_id: str,
+    effective_from_seq: int,
+    old_public_key: bytes | str,
+    new_public_key: bytes | str,
+    rotation_mode: str,
+    reason: str,
+    signature: bytes | str,
+) -> bool:
+    pk_raw = _as_hash32(new_pubkey)
+    sig_raw = bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+    msg = host_key_rotation_signing_digest(
+        b"acta:host_key_rotate_new_sig:v1",
+        tenant_id,
+        effective_from_seq,
+        old_public_key,
+        new_public_key,
+        rotation_mode,
+        reason,
+    )
+    return verify_ed25519_strict(pk_raw, msg, sig_raw)
 
 
 def rebuild_archive_header_preimage_bytes(
@@ -1459,11 +2224,31 @@ def compute_evidence_event_hash(
     witness_reg_summary: Mapping[str, Any] | None = None,
     witness_revoke_summary: Mapping[str, Any] | None = None,
     witness_in_v3: bool = False,
+    host_key_rotation_summary: Mapping[str, Any] | None = None,
 ) -> bytes:
     prev_raw = _as_hash32(prev_hash)
     created_micros = (
         created_at if isinstance(created_at, int) else parse_rfc3339_micros(created_at)
     )
+    if host_key_rotation_summary is not None:
+        rot_tagged = _encode_opt_jcs(_normalize_host_key_rotation_summary(host_key_rotation_summary))
+        return hash_length_delimited(
+            [
+                b"acta:evidence_event:v3",
+                tenant_id.encode("utf-8"),
+                struct.pack("<q", int(seq_num)),
+                prev_raw,
+                _encode_opt_hash32(bundle_hash),
+                _encode_opt_hash32(state_commitment),
+                policy_result.encode("utf-8"),
+                struct.pack("<q", created_micros),
+                b"\x00",
+                b"\x00",
+                b"\x00",
+                b"\x00",
+                rot_tagged,
+            ]
+        )
     if write_summary is not None or answer_cache_summary is not None:
         write_tagged = _encode_opt_jcs(
             _normalize_write_summary(write_summary) if write_summary is not None else None
@@ -1972,6 +2757,11 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
     ometa = entry.get("override_summary")
     wmeta = entry.get("write_summary")
     acmeta = entry.get("answer_cache_summary")
+    rotmeta = entry.get("host_key_rotation_summary")
+    rotmeta = entry.get("host_key_rotation_summary")
+    rotmeta = entry.get("host_key_rotation_summary")
+    rotmeta = entry.get("host_key_rotation_summary")
+    rotmeta = entry.get("host_key_rotation_summary")
 
     if rmeta is not None:
         if entry.get("bundle_hash") is not None or wmeta is not None or acmeta is not None:
@@ -1996,7 +2786,7 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
         (entry.get("witness_reg_summary") is not None or entry.get("witness_revoke_summary") is not None)
         and entry.get("event_domain") == "acta:evidence_event:v3"
     )
-    if wmeta is not None or acmeta is not None or witness_in_v3:
+    if wmeta is not None or acmeta is not None or witness_in_v3 or rotmeta is not None:
         expected_ev_domain = "acta:evidence_event:v3"
     elif rmeta is not None or ometa is not None:
         expected_ev_domain = "acta:evidence_event:v2"
@@ -2031,7 +2821,7 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
         )
         snap = dict(wmeta["record_snapshot"])
         op = str(wmeta["operation"])
-        if op == "ingest_object":
+        if op in ("ingest_object", "legacy_import_object"):
             if (
                 str(snap["tenant_id"]) != str(entry["tenant_id"])
                 or str(uuid.UUID(str(snap["id"]))).lower() != str(uuid.UUID(str(wmeta["item_id"]))).lower()
@@ -2045,7 +2835,7 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
             snap["client_signature"] = wmeta.get("client_signature")
             snap["client_public_key"] = wmeta.get("client_public_key")
             _verify_object_author_signature(snap, lbl)
-        elif op in ("ingest_claim", "retract_claim"):
+        elif op in ("ingest_claim", "retract_claim", "legacy_import_claim"):
             if (
                 str(snap["tenant_id"]) != str(entry["tenant_id"])
                 or str(uuid.UUID(str(snap["id"]))).lower() != str(uuid.UUID(str(wmeta["item_id"]))).lower()
@@ -2233,6 +3023,67 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
                 f"tampered witness_revoke_summary at seq_num={entry['seq_num']}: state_commitment mismatch"
             )
 
+    if rotmeta is not None:
+        if (
+            entry.get("bundle_hash") is not None
+            or rmeta is not None
+            or ometa is not None
+            or wmeta is not None
+            or acmeta is not None
+            or wreg is not None
+            or wrev is not None
+        ):
+            raise ValueError(
+                f"invalid evidence entry at seq_num={entry['seq_num']}: host_key_rotation_summary cannot coexist with other entry payloads"
+            )
+        if str(rotmeta.get("rotation_domain") or HOST_KEY_ROTATE_DOMAIN_V1) != HOST_KEY_ROTATE_DOMAIN_V1:
+            raise ValueError(f"unsupported rotation_domain at seq_num={entry['seq_num']}")
+        if int(rotmeta["effective_from_seq"]) != int(entry["seq_num"]):
+            raise ValueError(f"host_key_rotation_summary.effective_from_seq mismatch at seq_num={entry['seq_num']}")
+        exp_pk_bytes = _as_hash32(expected_pubkey)
+        old_pk_bytes = _as_hash32(rotmeta["old_public_key"])
+        new_pk_bytes = _as_hash32(rotmeta["new_public_key"])
+        if old_pk_bytes != exp_pk_bytes:
+            raise ValueError(f"host_key_rotation_summary.old_public_key mismatch against active host key at seq_num={entry['seq_num']}")
+        if is_weak_ed25519_pubkey(new_pk_bytes):
+            raise ValueError(f"rejected weak low-order new_public_key at seq_num={entry['seq_num']}")
+        rmode = str(rotmeta["rotation_mode"])
+        if rmode == "scheduled":
+            if rotmeta.get("old_key_signature") is None:
+                raise ValueError(f"scheduled host_key_rotation_summary at seq_num={entry['seq_num']} requires old_key_signature")
+            if not verify_host_key_rotation_old(
+                exp_pk_bytes,
+                str(entry["tenant_id"]),
+                int(rotmeta["effective_from_seq"]),
+                old_pk_bytes,
+                new_pk_bytes,
+                rmode,
+                str(rotmeta["reason"]),
+                rotmeta["old_key_signature"],
+            ):
+                raise ValueError(f"old_key_signature verification failed at seq_num={entry['seq_num']}")
+        elif rmode == "compromise_recovery":
+            if rotmeta.get("compromised_from_seq") is None:
+                raise ValueError(f"compromise_recovery at seq_num={entry['seq_num']} requires compromised_from_seq")
+        else:
+            raise ValueError(f"unsupported rotation_mode '{rmode}' at seq_num={entry['seq_num']}")
+        if not verify_host_key_rotation_new(
+            new_pk_bytes,
+            str(entry["tenant_id"]),
+            int(rotmeta["effective_from_seq"]),
+            old_pk_bytes,
+            new_pk_bytes,
+            rmode,
+            str(rotmeta["reason"]),
+            rotmeta["new_key_signature"],
+        ):
+            raise ValueError(f"new_key_signature verification failed at seq_num={entry['seq_num']}")
+        exp_rot_comm = compute_host_key_rotation_commitment(rotmeta).hex()
+        stored_sc = entry.get("state_commitment")
+        stored_sc_hex = _as_hash32(stored_sc).hex() if stored_sc is not None else None
+        if stored_sc_hex != exp_rot_comm:
+            raise ValueError(f"tampered host_key_rotation_summary at seq_num={entry['seq_num']}: state_commitment mismatch")
+
     recomputed_event = compute_evidence_event_hash(
         tenant_id=str(entry["tenant_id"]),
         seq_num=int(entry["seq_num"]),
@@ -2248,6 +3099,7 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
         witness_reg_summary=wreg,
         witness_revoke_summary=wrev,
         witness_in_v3=witness_in_v3,
+        host_key_rotation_summary=rotmeta,
     )
     stored_event_hex = (
         entry["event_hash"].lower()
@@ -2259,14 +3111,26 @@ def verify_evidence_entry(entry: Mapping[str, Any], expected_pubkey: bytes | str
             f"tampered evidence entry at seq_num={entry['seq_num']}: "
             f"recomputed event_hash {recomputed_event.hex()} != stored {stored_event_hex}"
         )
-    if not verify_evidence_signature(
+    sig_ok = verify_evidence_signature(
         expected_pubkey,
         str(entry["tenant_id"]),
         int(entry["seq_num"]),
         entry["prev_hash"],
         recomputed_event,
         entry["host_signature"],
-    ):
+    ) or (
+        rotmeta is not None
+        and str(rotmeta.get("rotation_mode")) == "compromise_recovery"
+        and verify_evidence_signature(
+            rotmeta["new_public_key"],
+            str(entry["tenant_id"]),
+            int(entry["seq_num"]),
+            entry["prev_hash"],
+            recomputed_event,
+            entry["host_signature"],
+        )
+    )
+    if not sig_ok:
         raise ValueError(
             f"Ed25519 host_signature verification failed at evidence seq_num={entry['seq_num']}"
         )
@@ -2421,10 +3285,28 @@ def verify_export_archive(
 ) -> VerificationSummary:
     expected_pk = _as_hash32(expected_pubkey)
     archive_pk = _as_hash32(archive["host_public_key"])
-    if archive_pk != expected_pk:
+    first_rot_old_pk: bytes | None = None
+    for _ev in archive.get("evidence_chain") or []:
+        if _ev.get("host_key_rotation_summary") is not None:
+            first_rot_old_pk = _as_hash32(_ev["host_key_rotation_summary"]["old_public_key"])
+            break
+    if first_rot_old_pk is None and archive.get("merkle_proof") is not None:
+        for _rp in archive["merkle_proof"].get("rotation_entry_proofs") or []:
+            _rot = _rp["entry"].get("host_key_rotation_summary")
+            if _rot is not None:
+                first_rot_old_pk = _as_hash32(_rot["old_public_key"])
+                break
+    if first_rot_old_pk is None and archive.get("merkle_proof") is not None:
+        for _rp in archive["merkle_proof"].get("rotation_entry_proofs") or []:
+            _rot = _rp["entry"].get("host_key_rotation_summary")
+            if _rot is not None:
+                first_rot_old_pk = _as_hash32(_rot["old_public_key"])
+                break
+    if expected_pk != archive_pk and (first_rot_old_pk is None or expected_pk != first_rot_old_pk):
         raise ValueError(
             f"host_public_key mismatch: archive contains {archive_pk.hex()}, expected {expected_pk.hex()}"
         )
+    expected_pk = archive_pk
     if is_weak_ed25519_pubkey(expected_pk):
         raise ValueError("rejected weak low-order Ed25519 public key")
 
@@ -2548,6 +3430,15 @@ def verify_export_archive(
             int(att["evidence_seq_num"]),
             recomputed_att,
             att["host_signature"],
+        ) and not (
+            first_rot_old_pk is not None
+            and verify_override_signature(
+                first_rot_old_pk,
+                str(att["tenant_id"]),
+                int(att["evidence_seq_num"]),
+                recomputed_att,
+                att["host_signature"],
+            )
         ):
             raise ValueError(
                 f"Ed25519 host_signature verification failed on override_attestation[id={aid}]"
@@ -2739,6 +3630,7 @@ def verify_export_archive(
     verified_evidence_entries = 0
     evidence_by_seq: dict[int, Mapping[str, Any]] = {}
     zero_hex = "00" * 32
+    chain_pk = first_rot_old_pk if first_rot_old_pk is not None else expected_pk
 
     for idx, entry in enumerate(evidence_chain):
         if str(entry["tenant_id"]) != str(bundle["tenant_id"]):
@@ -2774,7 +3666,9 @@ def verify_export_archive(
         if entry.get("answer_cache_summary") is not None:
             verified_answer_caches += 1
 
-        verify_evidence_entry(entry, expected_pk)
+        verify_evidence_entry(entry, chain_pk)
+        if entry.get("host_key_rotation_summary") is not None:
+            chain_pk = _as_hash32(entry["host_key_rotation_summary"]["new_public_key"])
         verified_evidence_entries += 1
 
         eb_hash = entry.get("bundle_hash")
@@ -2799,8 +3693,30 @@ def verify_export_archive(
         verified_witness_anchors = verify_signed_tree_head(
             sth, str(bundle["tenant_id"]), expected_pk
         )
+        key_epochs: list[tuple[int, bytes]] = [(1, first_rot_old_pk if first_rot_old_pk is not None else expected_pk)]
+        if merkle_proof.get("rotation_entry_proofs"):
+            cur_pk = key_epochs[0][1]
+            for r_proof in merkle_proof["rotation_entry_proofs"]:
+                _verify_entry_inclusion(r_proof, sth, cur_pk)
+                r_sum = r_proof["entry"]["host_key_rotation_summary"]
+                nxt_pk = _as_hash32(r_sum["new_public_key"])
+                cur_pk = nxt_pk
+                key_epochs.append((int(r_sum["effective_from_seq"]) + 1, nxt_pk))
+        elif evidence_chain:
+            for e_item in evidence_chain:
+                if e_item.get("host_key_rotation_summary") is not None:
+                    r_sum = e_item["host_key_rotation_summary"]
+                    key_epochs.append((int(r_sum["effective_from_seq"]) + 1, _as_hash32(r_sum["new_public_key"])))
+
+        def _pk_for_seq(s: int) -> bytes:
+            chosen = key_epochs[0][1]
+            for st_s, k_b in key_epochs:
+                if s >= st_s:
+                    chosen = k_b
+            return chosen
+
         b_proof = merkle_proof["bundle_entry_proof"]
-        _verify_entry_inclusion(b_proof, sth, expected_pk)
+        _verify_entry_inclusion(b_proof, sth, _pk_for_seq(int(b_proof["entry"]["seq_num"])))
         b_entry = b_proof["entry"]
         if (
             b_entry.get("bundle_hash") is None
@@ -2818,7 +3734,7 @@ def verify_export_archive(
         evidence_by_seq[b_seq] = b_entry
 
         for ovr_proof in merkle_proof.get("override_entry_proofs", []):
-            _verify_entry_inclusion(ovr_proof, sth, expected_pk)
+            _verify_entry_inclusion(ovr_proof, sth, _pk_for_seq(int(ovr_proof["entry"]["seq_num"])))
             o_entry = ovr_proof["entry"]
             o_seq = int(o_entry["seq_num"])
             if not evidence_chain and o_seq not in evidence_by_seq:
@@ -2826,7 +3742,7 @@ def verify_export_archive(
             evidence_by_seq[o_seq] = o_entry
 
         for wr_proof in merkle_proof.get("write_entry_proofs", []):
-            _verify_entry_inclusion(wr_proof, sth, expected_pk)
+            _verify_entry_inclusion(wr_proof, sth, _pk_for_seq(int(wr_proof["entry"]["seq_num"])))
             w_entry = wr_proof["entry"]
             w_seq = int(w_entry["seq_num"])
             if not evidence_chain and w_seq not in evidence_by_seq:
@@ -2988,6 +3904,7 @@ class OfflineStateRebuildSummary:
     verified_witness_anchors: int = 0
     header_hash_hex: str = ""
     header_signature_verified: bool = True
+    quarantined_compromised_seqs: tuple[int, ...] = ()
 
 
 def verify_and_rebuild_scope_state_offline(
@@ -2995,25 +3912,36 @@ def verify_and_rebuild_scope_state_offline(
     expected_pubkey: bytes | str,
     scope_override: str | None = None,
 ) -> OfflineStateRebuildSummary:
-    """Verifies a portable `StateRebuildArchive` (`acta-state-rebuild-archive/v1`) and reconstructs scope `state_commitment` completely offline."""
+    """Verifies a portable `StateRebuildArchive` (`v1` or `v2`) and reconstructs scope `state_commitment` completely offline."""
     archive = (
         archive_or_response["rebuild_proof_archive"]
         if isinstance(archive_or_response.get("rebuild_proof_archive"), Mapping)
         else archive_or_response
     )
     schema_ver = str(archive.get("schema_version") or STATE_REBUILD_ARCHIVE_SCHEMA_V1)
-    if schema_ver != STATE_REBUILD_ARCHIVE_SCHEMA_V1:
+    if schema_ver == STATE_REBUILD_ARCHIVE_SCHEMA_V1:
+        bundle_state_schema = SCHEMA_VERSION_V1
+    elif schema_ver == STATE_REBUILD_ARCHIVE_SCHEMA_V2:
+        bundle_state_schema = SCHEMA_VERSION_V2
+    else:
         raise ValueError(
-            f"unsupported StateRebuildArchive.schema_version '{schema_ver}' (expected '{STATE_REBUILD_ARCHIVE_SCHEMA_V1}')"
+            f"unsupported StateRebuildArchive.schema_version '{schema_ver}' (expected '{STATE_REBUILD_ARCHIVE_SCHEMA_V1}' or '{STATE_REBUILD_ARCHIVE_SCHEMA_V2}')"
         )
-    expected_pk = _as_hash32(expected_pubkey)
+    expected_pk_arg = _as_hash32(expected_pubkey)
     archive_pk = _as_hash32(archive["host_public_key"])
-    if archive_pk != expected_pk:
+    genesis_pk = (
+        _as_hash32(archive["genesis_host_public_key"])
+        if archive.get("genesis_host_public_key") is not None
+        else archive_pk
+    )
+    if expected_pk_arg != archive_pk and expected_pk_arg != genesis_pk:
         raise ValueError(
-            f"host_public_key mismatch: archive contains {archive_pk.hex()}, expected {expected_pk.hex()}"
+            f"host_public_key mismatch: archive tail={archive_pk.hex()} (genesis={genesis_pk.hex()}), expected {expected_pk_arg.hex()}"
         )
-    if is_weak_ed25519_pubkey(expected_pk):
+    expected_pk = archive_pk
+    if is_weak_ed25519_pubkey(expected_pk) or is_weak_ed25519_pubkey(genesis_pk):
         raise ValueError("rejected weak low-order Ed25519 public key")
+    active_pk = genesis_pk
 
     tenant_id = str(archive["tenant_id"])
     target_scope = (
@@ -3062,7 +3990,7 @@ def verify_and_rebuild_scope_state_offline(
     objects_map: dict[str, Mapping[str, Any]] = {}
     claims_map: dict[str, Mapping[str, Any]] = {}
     write_events_replayed = 0
-    expected_override_seqs: dict[int, tuple[str, str]] = {}
+    expected_override_seqs: dict[int, tuple[str, str, bytes]] = {}
     leaves: list[bytes] = []
     zero_hex = "00" * 32
 
@@ -3088,7 +4016,10 @@ def verify_and_rebuild_scope_state_offline(
             if prev_hex != prior_ev_hex:
                 raise ValueError(f"broken prev_hash link at seq_num={seq_num}")
 
-        verify_evidence_entry(entry, expected_pk)
+        entry_pk = active_pk
+        verify_evidence_entry(entry, entry_pk)
+        if entry.get("host_key_rotation_summary") is not None:
+            active_pk = _as_hash32(entry["host_key_rotation_summary"]["new_public_key"])
         leaves.append(merkle_leaf_hash(seq_num, entry["event_hash"]))
 
         ws = entry.get("write_summary")
@@ -3096,9 +4027,9 @@ def verify_and_rebuild_scope_state_offline(
             write_events_replayed += 1
             snap = dict(ws["record_snapshot"])
             op = str(ws["operation"])
-            if op == "ingest_object":
+            if op in ("ingest_object", "legacy_import_object"):
                 objects_map[str(uuid.UUID(str(snap["id"]))).lower()] = snap
-            elif op in ("ingest_claim", "retract_claim"):
+            elif op in ("ingest_claim", "retract_claim", "legacy_import_claim"):
                 claims_map[str(uuid.UUID(str(snap["id"]))).lower()] = snap
 
         ovs = entry.get("override_summary")
@@ -3110,6 +4041,7 @@ def verify_and_rebuild_scope_state_offline(
             expected_override_seqs[seq_num] = (
                 str(uuid.UUID(str(ovs["attestation_id"]))).lower(),
                 _as_hash32(entry["state_commitment"]).hex(),
+                entry_pk,
             )
 
     verified_overrides_by_seq: dict[int, Mapping[str, Any]] = {}
@@ -3152,9 +4084,16 @@ def verify_and_rebuild_scope_state_offline(
             raise ValueError(
                 f"tampered override_attestation[id={aid}]: recomputed {recomputed_att.hex()} != stored {stored_att_raw.hex()}"
             )
+        if up_to_seq > 0 and active_pk != expected_pk:
+            raise ValueError("active host key after replaying chain != archive.host_public_key")
         ev_seq = int(att["evidence_seq_num"])
+        exp_pair = expected_override_seqs.get(ev_seq)
+        if exp_pair is None:
+            raise ValueError(
+                f"unlinked override_attestation[id={aid}] at evidence_seq_num={ev_seq} not present in evidence_chain"
+            )
         if not verify_override_signature(
-            expected_pk,
+            exp_pair[2],
             tenant_id,
             ev_seq,
             recomputed_att,
@@ -3163,18 +4102,16 @@ def verify_and_rebuild_scope_state_offline(
             raise ValueError(
                 f"Ed25519 host_signature verification failed on override_attestation[id={aid}]"
             )
-        exp_pair = expected_override_seqs.get(ev_seq)
-        if exp_pair is None:
-            raise ValueError(
-                f"unlinked override_attestation[id={aid}] at evidence_seq_num={ev_seq} not present in evidence_chain"
-            )
         if exp_pair[0] != aid or exp_pair[1] != stored_att_raw.hex():
             raise ValueError(
                 f"override_attestation[id={aid}] mismatch against evidence_chain seq_num={ev_seq}"
             )
         verified_overrides_by_seq[ev_seq] = att
 
-    for seq_num, (att_id, _) in expected_override_seqs.items():
+    if up_to_seq > 0 and active_pk != expected_pk:
+        raise ValueError("active host key after replaying chain != archive.host_public_key")
+
+    for seq_num, (att_id, _, _) in expected_override_seqs.items():
         if seq_num not in verified_overrides_by_seq:
             raise ValueError(
                 f"stripped override_attestation[id={att_id}] notarized at evidence_chain seq_num={seq_num} is missing from archive.override_attestations"
@@ -3205,7 +4142,10 @@ def verify_and_rebuild_scope_state_offline(
 
         anchor_sth = archive.get("latest_anchored_checkpoint")
         if anchor_sth is not None:
-            anchor_cnt = verify_signed_tree_head(anchor_sth, tenant_id, expected_pk)
+            try:
+                anchor_cnt = verify_signed_tree_head(anchor_sth, tenant_id, expected_pk)
+            except ValueError:
+                anchor_cnt = verify_signed_tree_head(anchor_sth, tenant_id, genesis_pk)
             if anchor_cnt == 0:
                 raise ValueError("latest_anchored_checkpoint contains zero verified witness_anchors")
             a_size = int(anchor_sth["tree_size"])
@@ -3289,11 +4229,11 @@ def verify_and_rebuild_scope_state_offline(
             active_overrides_count += 1
 
     perm_root = _as_hash32(archive["permission_root"])
-    intent_root = compute_sub_commitment(intent_hashes)
-    memory_root = compute_sub_commitment(memory_hashes)
-    knowledge_root = compute_sub_commitment(claim_hashes)
+    intent_root = compute_sub_commitment_for_schema(bundle_state_schema, intent_hashes)
+    memory_root = compute_sub_commitment_for_schema(bundle_state_schema, memory_hashes)
+    knowledge_root = compute_sub_commitment_for_schema(bundle_state_schema, claim_hashes)
     state_commitment = compute_state_commitment(
-        SCHEMA_VERSION,
+        bundle_state_schema,
         tenant_id,
         target_scope,
         intent_root,
@@ -3301,6 +4241,22 @@ def verify_and_rebuild_scope_state_offline(
         memory_root,
         perm_root,
     )
+
+    quarantined_seqs: list[int] = []
+    for entry in evidence_chain:
+        rot = entry.get("host_key_rotation_summary")
+        if rot is not None and str(rot.get("rotation_mode")) == "compromise_recovery":
+            comp_start = rot.get("compromised_from_seq")
+            if comp_start is not None:
+                eff_seq = int(rot["effective_from_seq"])
+                protected = (
+                    anchored_tree_size
+                    if anchored_tree_size is not None and anchored_tree_size < eff_seq
+                    else 0
+                )
+                for s in range(max(int(comp_start), protected + 1), eff_seq):
+                    if s not in quarantined_seqs:
+                        quarantined_seqs.append(s)
 
     return OfflineStateRebuildSummary(
         tenant_id=tenant_id,
@@ -3324,6 +4280,7 @@ def verify_and_rebuild_scope_state_offline(
         verified_witness_anchors=verified_witness_anchors,
         header_hash_hex=recomputed_header.hex(),
         header_signature_verified=True,
+        quarantined_compromised_seqs=tuple(quarantined_seqs),
     )
 
 
@@ -3426,10 +4383,33 @@ def _evidence_event_preimage_bytes(entry: Mapping[str, Any]) -> tuple[str, bytes
     acsumm = entry.get("answer_cache_summary")
     wreg = entry.get("witness_reg_summary")
     wrev = entry.get("witness_revoke_summary")
+    rotsumm = entry.get("host_key_rotation_summary")
     witness_in_v3 = (
         (wreg is not None or wrev is not None)
         and entry.get("event_domain") == "acta:evidence_event:v3"
     )
+    if rotsumm is not None:
+        rot_tagged = _encode_opt_jcs(_normalize_host_key_rotation_summary(rotsumm))
+        return (
+            "acta:evidence_event:v3",
+            encode_length_delimited(
+                [
+                    b"acta:evidence_event:v3",
+                    str(entry["tenant_id"]).encode("utf-8"),
+                    struct.pack("<q", int(entry["seq_num"])),
+                    prev_raw,
+                    _encode_opt_hash32(entry.get("bundle_hash")),
+                    _encode_opt_hash32(entry.get("state_commitment")),
+                    str(entry["policy_result"]).encode("utf-8"),
+                    struct.pack("<q", created_micros),
+                    b"\x00",
+                    b"\x00",
+                    b"\x00",
+                    b"\x00",
+                    rot_tagged,
+                ]
+            ),
+        )
     if wsumm is not None or acsumm is not None:
         write_tagged = _encode_opt_jcs(_normalize_write_summary(wsumm) if wsumm is not None else None)
         cache_tagged = _encode_opt_jcs(

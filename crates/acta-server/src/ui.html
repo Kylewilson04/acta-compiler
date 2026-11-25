@@ -290,7 +290,7 @@
 <header>
   <div class="brand">
     <h1>ACTA COMPILER</h1>
-    <span class="badge">v1.7.2 COMPANY CONTROL PLANE</span>
+    <span class="badge">v1.7.3 COMPANY CONTROL PLANE</span>
     <span id="health-badge" class="badge">CHECKING /v1/health...</span>
     <span id="oauth-badge" class="badge">OAUTH 2.1 READY</span>
   </div>
@@ -545,7 +545,7 @@
           <pre id="onboard-mcp-snippet" style="min-height:140px;"></pre>
         </div>
         <div>
-          <div class="label">Python SDK (acta_sdk v1.7.2) &amp; TypeScript SDK (@acta/sdk v1.7.2)</div>
+          <div class="label">Python SDK (acta_sdk v1.7.3) &amp; TypeScript SDK (@acta/sdk v1.7.3)</div>
           <pre id="onboard-sdk-snippet" style="min-height:140px;"></pre>
         </div>
       </div>
@@ -878,7 +878,7 @@ async function refreshHealth() {
     const badge = document.getElementById('health-badge');
     const oauthBadge = document.getElementById('oauth-badge');
     if (d.status === 'ok') {
-      badge.textContent = 'ONLINE · v' + (d.version || '1.7.2') + ' · PG17 + CEDAR';
+      badge.textContent = 'ONLINE · v' + (d.version || '1.7.3') + ' · PG17 + CEDAR';
       badge.className = 'badge ok';
       document.getElementById('host-pubkey').textContent = d.host_public_key;
       document.getElementById('perm-root').textContent = d.permission_root;
@@ -994,7 +994,7 @@ async function loadVaultExplorer() {
 ' +
     JSON.stringify({ tenant_id: tenant, default_scope: selectedScopeFilter || 'prod/core' }, null, 2);
   document.getElementById('onboard-sdk-snippet').textContent =
-    '# Python (acta_sdk v1.7.2)
+    '# Python (acta_sdk v1.7.3)
 ' +
     'from acta_sdk import ActaClient, ContextBudget
 ' +
@@ -1003,7 +1003,7 @@ async function loadVaultExplorer() {
     'res = client.compile_guarded(actor_id="agent", scope="' + (selectedScopeFilter || 'prod/core') + '", query_text="check policy", budget=ContextBudget.tokens(2048))
 
 ' +
-    '// TypeScript (@acta/sdk v1.7.2)
+    '// TypeScript (@acta/sdk v1.7.3)
 ' +
     'import { ActaClient } from "@acta/sdk";
 ' +

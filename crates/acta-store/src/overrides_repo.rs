@@ -416,6 +416,7 @@ pub async fn attest_override_tx(
         answer_cache_summary: None,
         witness_reg_summary: None,
         witness_revoke_summary: None,
+        host_key_rotation_summary: None,
         host_signature: ev_host_sig,
         created_at: input.created_at,
     };

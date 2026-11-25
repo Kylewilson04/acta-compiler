@@ -1,4 +1,4 @@
-"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.7.2.
+"""Sync and Async Zero-Trust HTTP Clients for Acta Compiler v1.7.3.
 
 Features:
 - Stateless Keyed-BLAKE3 Tenant & OAuth Principal Tokens (`acta_tk_v1:<tenant>[:<login>]:<mac>`) + `X-Acta-Tenant` locking
@@ -119,7 +119,7 @@ def _enforce_guarded_compile(
 
 
 class ActaClient:
-    """Synchronous Zero-Trust client for Acta Compiler v1.7.2."""
+    """Synchronous Zero-Trust client for Acta Compiler v1.7.3."""
 
     def __init__(
         self,
@@ -305,6 +305,7 @@ class ActaClient:
         valid_to: str | None = None,
         predecessor_id: str | None = None,
         claim_id: str | None = None,
+        erasable: bool | None = None,
         client_signature_hex: str | None = None,
         client_public_key_hex: str | None = None,
     ) -> dict[str, Any]:
@@ -334,6 +335,8 @@ class ActaClient:
             req["valid_to"] = valid_to
         if predecessor_id is not None:
             req["predecessor_id"] = predecessor_id
+        if erasable is not None:
+            req["erasable"] = bool(erasable)
         if client_signature_hex is not None:
             req["client_signature_hex"] = client_signature_hex
         if client_public_key_hex is not None:
@@ -350,6 +353,7 @@ class ActaClient:
         scope: str | None = None,
         tenant_id: str | None = None,
         tombstone_id: str | None = None,
+        erase_secret: bool | None = None,
         client_signature_hex: str | None = None,
         client_public_key_hex: str | None = None,
     ) -> dict[str, Any]:
@@ -363,6 +367,8 @@ class ActaClient:
             req["scope"] = scope
         if tombstone_id is not None:
             req["id"] = tombstone_id
+        if erase_secret is not None:
+            req["erase_secret"] = bool(erase_secret)
         if client_signature_hex is not None:
             req["client_signature_hex"] = client_signature_hex
         if client_public_key_hex is not None:
@@ -485,11 +491,72 @@ class ActaClient:
         )
         return data
 
+    def get_claim_secret(
+        self,
+        claim_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
+        _, data = self._request_json(
+            "GET",
+            f"/v1/tenants/{urllib.parse.quote(eff_tenant)}/claims/{urllib.parse.quote(str(claim_id).strip())}/secret",
+            allowed_statuses=(200,),
+        )
+        return data
+
+    def backfill_legacy_scope(
+        self,
+        scope: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        eff_tenant = _enforce_tenant(self.locked_tenant, tenant_id)
+        _, data = self._request_json(
+            "POST",
+            f"/v1/tenants/{urllib.parse.quote(eff_tenant)}/backfill-legacy-scope",
+            {"scope": scope},
+            allowed_statuses=(200, 201),
+        )
+        return data
+
+    def rotate_host_key(
+        self,
+        *,
+        tenant_id: str,
+        new_signing_key_seed_hex: str,
+        reason: str,
+        rotation_mode: str = "scheduled",
+        compromised_from_seq: int | None = None,
+        old_signing_key_lost: bool | None = None,
+    ) -> dict[str, Any]:
+        req: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "new_signing_key_seed_hex": new_signing_key_seed_hex,
+            "rotation_mode": rotation_mode,
+            "reason": reason,
+        }
+        if compromised_from_seq is not None:
+            req["compromised_from_seq"] = int(compromised_from_seq)
+        if old_signing_key_lost is not None:
+            req["old_signing_key_lost"] = bool(old_signing_key_lost)
+        _, data = self._request_json(
+            "POST",
+            "/v1/admin/rotate-host-key",
+            req,
+            allowed_statuses=(200, 201),
+            include_tenant_lock=False,
+        )
+        self._pinned_pubkey = str(data["new_public_key_hex"]).lower()
+        return data
+
     def rebuild_scope_state(
         self,
         scope: str,
         *,
         up_to_seq: int | None = None,
+        evaluated_at: str | None = None,
+        state_schema_version: str | None = None,
         include_proof_archive: bool = False,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
@@ -497,6 +564,10 @@ class ActaClient:
         qparts = [f"scope={urllib.parse.quote(scope)}"]
         if up_to_seq is not None:
             qparts.append(f"up_to_seq={int(up_to_seq)}")
+        if evaluated_at is not None:
+            qparts.append(f"evaluated_at={urllib.parse.quote(evaluated_at)}")
+        if state_schema_version is not None:
+            qparts.append(f"state_schema_version={urllib.parse.quote(state_schema_version)}")
         if include_proof_archive:
             qparts.append("include_proof_archive=true")
         _, data = self._request_json(
@@ -990,7 +1061,7 @@ class ActaClient:
 
 
 class AsyncActaClient:
-    """Asynchronous Zero-Trust client for Acta Compiler v1.7.2 (requires `httpx`)."""
+    """Asynchronous Zero-Trust client for Acta Compiler v1.7.3 (requires `httpx`)."""
 
     def __init__(
         self,

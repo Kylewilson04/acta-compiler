@@ -641,3 +641,23 @@ export declare function recomputeWinningBucketCorroboration(
   bucketClaims: Array<Record<string, any>>,
   damping?: number
 ): { corroboratingCount: number; corroboratingSources: string[]; effectiveConfidence: number };
+
+export declare const SCHEMA_VERSION_V1: string;
+export declare const SCHEMA_VERSION_V2: string;
+export declare const STATE_REBUILD_ARCHIVE_SCHEMA_V1: string;
+export declare const STATE_REBUILD_ARCHIVE_SCHEMA_V2: string;
+export declare const STATE_REBUILD_ARCHIVE_SCHEMA: string;
+export declare const SUB_COMMITMENT_DOMAIN_V2: string;
+export declare const STATE_COMMITMENT_DOMAIN_V2: string;
+export declare const HOST_KEY_ROTATE_DOMAIN_V1: string;
+export declare const ERASABLE_CLAIM_DOMAIN_V1: string;
+export declare function isV2StateSchema(schemaVersion: string): boolean;
+export declare function computeSubCommitmentV2(hashes: Array<string | Uint8Array>): string;
+export declare function computeSubCommitmentForSchema(schemaVersion: string, hashes: Array<string | Uint8Array>): string;
+export declare function computeErasableClaimCommitment(params: {
+  claimId: string;
+  salt32: string | Uint8Array;
+  objectVal: unknown;
+  sourceCommitment: string | Uint8Array;
+}): string;
+export declare function computeHostKeyRotationCommitment(rot: Record<string, any>): string;

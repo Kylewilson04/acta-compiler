@@ -1,4 +1,4 @@
-"""Acta Compiler v1.7.2 Official Python SDK (`acta_sdk`)."""
+"""Acta Compiler v1.7.3 Official Python SDK (`acta_sdk`)."""
 
 from .blake3_pure import PureBlake3Hasher, blake3_hash, blake3_keyed_hash
 from .client import DEFAULT_CLOUDRUN_URL, ActaClient, AsyncActaClient
@@ -6,10 +6,29 @@ from .crypto import (
     DEFAULT_CORROBORATION_DAMPING,
     DEFAULT_DECISIVENESS_THRESHOLD,
     DEFAULT_MIN_CONFIDENCE,
+    ERASABLE_CLAIM_DOMAIN_V1,
+    HOST_KEY_ROTATE_DOMAIN_V1,
     SCHEMA_VERSION,
+    SCHEMA_VERSION_V1,
+    SCHEMA_VERSION_V2,
+    STATE_COMMITMENT_DOMAIN_V2,
+    SUB_COMMITMENT_DOMAIN_V2,
     REBUILD_HEADER_DOMAIN_V1,
     REBUILD_SIG_DOMAIN_V1,
+    STATE_REBUILD_ARCHIVE_SCHEMA,
     STATE_REBUILD_ARCHIVE_SCHEMA_V1,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+    canonical_bundle_schema_for_state,
+    compute_erasable_claim_commitment,
+    compute_host_key_rotation_commitment,
+    compute_sub_commitment_for_schema,
+    compute_sub_commitment_v2,
+    host_key_rotation_signing_digest,
+    is_v2_state_schema,
+    sign_host_key_rotation_new,
+    sign_host_key_rotation_old,
+    verify_host_key_rotation_new,
+    verify_host_key_rotation_old,
     claims_share_winning_value_bucket,
     compute_rebuild_archive_header_hash,
     rebuild_archive_header_preimage_bytes,
@@ -119,7 +138,7 @@ from .errors import (
 from .gemini import ActaGeminiGuard, build_guarded_prompt
 from .models import CompileResult, ContextBudget, GuardedGenerationResult
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 __all__ = [
     "DEFAULT_CLOUDRUN_URL",
@@ -144,10 +163,29 @@ __all__ = [
     "GuardedGenerationResult",
     "PureBlake3Hasher",
     "OfflineStateRebuildSummary",
+    "ERASABLE_CLAIM_DOMAIN_V1",
+    "HOST_KEY_ROTATE_DOMAIN_V1",
     "SCHEMA_VERSION",
+    "SCHEMA_VERSION_V1",
+    "SCHEMA_VERSION_V2",
+    "STATE_COMMITMENT_DOMAIN_V2",
+    "SUB_COMMITMENT_DOMAIN_V2",
     "REBUILD_HEADER_DOMAIN_V1",
     "REBUILD_SIG_DOMAIN_V1",
+    "STATE_REBUILD_ARCHIVE_SCHEMA",
     "STATE_REBUILD_ARCHIVE_SCHEMA_V1",
+    "STATE_REBUILD_ARCHIVE_SCHEMA_V2",
+    "canonical_bundle_schema_for_state",
+    "compute_erasable_claim_commitment",
+    "compute_host_key_rotation_commitment",
+    "compute_sub_commitment_for_schema",
+    "compute_sub_commitment_v2",
+    "host_key_rotation_signing_digest",
+    "is_v2_state_schema",
+    "sign_host_key_rotation_new",
+    "sign_host_key_rotation_old",
+    "verify_host_key_rotation_new",
+    "verify_host_key_rotation_old",
     "claims_share_winning_value_bucket",
     "compute_rebuild_archive_header_hash",
     "rebuild_archive_header_preimage_bytes",

@@ -547,7 +547,7 @@ let forgeSig = false;
 const srv = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "1.7.2", host_public_key: pkHex, permission_root: permRoot }));
+    res.end(JSON.stringify({ status: "ok", version: "1.7.3", host_public_key: pkHex, permission_root: permRoot }));
     return;
   }
   if (req.method === "GET" && req.url.includes("/export")) {
@@ -915,6 +915,7 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
 {
   const {
     SCHEMA_VERSION,
+    SCHEMA_VERSION_V1,
     STATE_REBUILD_ARCHIVE_SCHEMA_V1,
     computeSubCommitment,
     computeStateCommitment,
@@ -1133,7 +1134,8 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
   };
   const rebuilt = verifyAndRebuildScopeStateOffline(rebuildArchive, pkHex);
   const expectedSc = computeStateCommitment({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: SCHEMA_VERSION_V1,
+    SCHEMA_VERSION_V1,
     tenantId: tenant,
     scope,
     intentRoot: computeSubCommitment([obj.content_hash]),
@@ -1159,4 +1161,184 @@ console.log("ALL v1.6.5 WITNESS_REG V1/V2/V3 & REVOCATION VECTORS PASSED!");
   assert.equal(corrob.corroboratingCount, 2);
   assert.ok(Math.abs(corrob.effectiveConfidence - 0.72) < 1e-9);
   console.log("TYPESCRIPT @acta/sdk v1.7.2 OFFLINE STATE REBUILD & CLAIM 25 VECTORS PASSED!");
+}
+
+
+// v1.7.3 domain-tagged state:v2, sub_commitment:v2, host-key rotation, erasure & dependency_ids parity
+{
+  const {
+    SCHEMA_VERSION_V2,
+    STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+    computeSubCommitmentV2,
+    computeStateCommitment,
+    computeErasableClaimCommitment,
+    computeHostKeyRotationCommitment,
+    signHostKeyRotationOld,
+    signHostKeyRotationNew,
+    computeRebuildArchiveHeaderHash,
+    signRebuildArchiveHeader,
+    verifyAndRebuildScopeStateOffline,
+    verifyEvidenceEntry,
+  } = await import("../dist/index.mjs");
+
+  const k0Seed = "21".repeat(32);
+  const k1Seed = "22".repeat(32);
+  const k0Pk = deriveEd25519PublicKeyHex(k0Seed);
+  const k1Pk = deriveEd25519PublicKeyHex(k1Seed);
+  const tenant = "tenant-v173-ts";
+  const scope = "acta-test/v173-ts";
+  const ts = "2026-11-24T22:00:00.000000Z";
+
+  const claimId = "11111111-2222-4333-8444-555555555555";
+  const srcComm = Buffer.from(hashLengthDelimited(["acta:source:v1", "pii-vault"])).toString("hex");
+  const erasureComm = computeErasableClaimCommitment({
+    claimId,
+    salt32: "aa".repeat(32),
+    objectVal: { ssn_last4: "9876" },
+    sourceCommitment: srcComm,
+  });
+  const clm = {
+    id: claimId,
+    tenant_id: tenant,
+    claim_group_key: computeLogicalClaimGroupKey(tenant, "cust:1", "pii", scope),
+    scope,
+    subject: "cust:1",
+    predicate: "pii",
+    object_val: { $acta_erasable_commitment: erasureComm },
+    object_type: "object",
+    confidence: 0.95,
+    source_provenance_class: 2,
+    source_descriptor: "pii-vault",
+    source_commitment: srcComm,
+    status: "active",
+    contradiction_ids: [],
+    valid_from: null,
+    valid_to: null,
+    version: 1,
+    predecessor_id: null,
+    created_at: ts,
+  };
+  clm.content_hash = computeClaimContentHash(clm);
+  const ws1 = {
+    write_domain: "acta:write_event:v1",
+    operation: "legacy_import_claim",
+    item_id: claimId,
+    scope,
+    version: 1,
+    content_hash: clm.content_hash,
+    written_by: `${tenant}::admin`,
+    writer_auth_kind: "tenant_session",
+    record_snapshot: clm,
+  };
+  const ws1Comm = Buffer.from(
+    hashLengthDelimited(["acta:write_event:v1", Buffer.from(toCanonicalJson(ws1), "utf8")])
+  ).toString("hex");
+  const ev1Hash = computeEvidenceEventHash({
+    tenantId: tenant,
+    seqNum: 1,
+    prevHash: "00".repeat(32),
+    stateCommitment: ws1Comm,
+    policyResult: "allow",
+    createdAt: ts,
+    writeSummary: ws1,
+  });
+  const ev1 = {
+    tenant_id: tenant,
+    seq_num: 1,
+    event_domain: "acta:evidence_event:v3",
+    prev_hash: "00".repeat(32),
+    event_hash: ev1Hash,
+    bundle_hash: null,
+    state_commitment: ws1Comm,
+    policy_result: "allow",
+    write_summary: ws1,
+    host_signature: signEvidenceEntry(k0Seed, tenant, 1, "00".repeat(32), ev1Hash),
+    created_at: ts,
+  };
+  verifyEvidenceEntry(ev1, k0Pk);
+
+  const rot2 = {
+    rotation_domain: "acta:host_key_rotate:v1",
+    old_public_key: k0Pk,
+    new_public_key: k1Pk,
+    effective_from_seq: 2,
+    rotation_mode: "scheduled",
+    reason: "Scheduled rotation",
+    rotated_by: `${tenant}::master-admin`,
+    old_key_signature: signHostKeyRotationOld(k0Seed, {
+      tenantId: tenant,
+      effectiveFromSeq: 2,
+      oldPublicKey: k0Pk,
+      newPublicKey: k1Pk,
+      rotationMode: "scheduled",
+      reason: "Scheduled rotation",
+    }),
+    new_key_signature: signHostKeyRotationNew(k1Seed, {
+      tenantId: tenant,
+      effectiveFromSeq: 2,
+      oldPublicKey: k0Pk,
+      newPublicKey: k1Pk,
+      rotationMode: "scheduled",
+      reason: "Scheduled rotation",
+    }),
+  };
+  const rot2Comm = computeHostKeyRotationCommitment(rot2);
+  const ev2Hash = computeEvidenceEventHash({
+    tenantId: tenant,
+    seqNum: 2,
+    prevHash: ev1Hash,
+    stateCommitment: rot2Comm,
+    policyResult: "allow",
+    createdAt: ts,
+    hostKeyRotationSummary: rot2,
+  });
+  const ev2 = {
+    tenant_id: tenant,
+    seq_num: 2,
+    event_domain: "acta:evidence_event:v3",
+    prev_hash: ev1Hash,
+    event_hash: ev2Hash,
+    bundle_hash: null,
+    state_commitment: rot2Comm,
+    policy_result: "allow",
+    host_key_rotation_summary: rot2,
+    host_signature: signEvidenceEntry(k0Seed, tenant, 2, ev1Hash, ev2Hash),
+    created_at: ts,
+  };
+  verifyEvidenceEntry(ev2, k0Pk);
+
+  const hdr2 = computeRebuildArchiveHeaderHash({
+    schemaVersion: STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+    tenantId: tenant,
+    scope,
+    upToSeq: 2,
+    evaluatedAt: ts,
+    permissionRoot: permRoot,
+  });
+  const rebV2 = {
+    schema_version: STATE_REBUILD_ARCHIVE_SCHEMA_V2,
+    tenant_id: tenant,
+    scope,
+    up_to_seq: 2,
+    evaluated_at: ts,
+    genesis_host_public_key: k0Pk,
+    host_public_key: k1Pk,
+    permission_root: permRoot,
+    header_hash: hdr2,
+    host_header_signature: signRebuildArchiveHeader(k1Seed, tenant, hdr2),
+    override_attestations: [],
+    evidence_chain: [ev1, ev2],
+  };
+  const rebuiltV2 = verifyAndRebuildScopeStateOffline(rebV2, k1Pk);
+  const expV2 = computeStateCommitment({
+    schemaVersion: SCHEMA_VERSION_V2,
+    tenantId: tenant,
+    scope,
+    intentRoot: computeSubCommitmentV2([]),
+    knowledgeRoot: computeSubCommitmentV2([clm.content_hash]),
+    memoryRoot: computeSubCommitmentV2([]),
+    permissionRoot: permRoot,
+  });
+  assert.equal(rebuiltV2.reconstructed_state_commitment_hex, expV2);
+  console.log("TYPESCRIPT @acta/sdk v1.7.3 STATE:V2 + KEY ROTATION + ERASURE PARITY PASSED!");
 }

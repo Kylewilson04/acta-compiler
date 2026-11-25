@@ -156,6 +156,7 @@ impl From<ActaError> for ApiError {
             ActaError::BudgetInsufficientForDisputes(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ActaError::Validation(_) => StatusCode::BAD_REQUEST,
             ActaError::NotFound(_) => StatusCode::NOT_FOUND,
+            ActaError::BundleStaleAtCacheTime(_) => StatusCode::CONFLICT,
             ActaError::PolicyEngine(_) | ActaError::Crypto(_) | ActaError::Storage(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -259,6 +260,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/state-rebuild",
             get(answers::handle_rebuild_scope_state),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/backfill-legacy-scope",
+            post(answers::handle_backfill_legacy_scope),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/claims/:claim_id/secret",
+            get(ingest::handle_get_claim_secret),
+        )
+        .route(
+            "/v1/admin/rotate-host-key",
+            post(answers::handle_rotate_host_key),
         )
         .route(
             "/v1/tenants/:tenant_id/vault",

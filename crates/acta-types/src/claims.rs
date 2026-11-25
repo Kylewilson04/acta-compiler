@@ -309,6 +309,8 @@ pub struct IngestClaimRequest {
     #[serde(default)]
     pub predecessor_id: Option<Uuid>,
     #[serde(default)]
+    pub erasable: Option<bool>,
+    #[serde(default)]
     pub client_signature_hex: Option<String>,
     #[serde(default)]
     pub client_public_key_hex: Option<String>,
@@ -345,6 +347,8 @@ pub struct IngestClaimResponse {
     pub client_public_key_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erasure_commitment_hex: Option<String>,
     #[serde(default)]
     pub was_idempotent_noop: bool,
     pub created_at: DateTime<Utc>,
@@ -359,6 +363,8 @@ pub struct RetractClaimRequest {
     pub scope: Option<String>,
     pub claim_id: Uuid,
     pub reason: String,
+    #[serde(default)]
+    pub erase_secret: Option<bool>,
     #[serde(default)]
     pub client_signature_hex: Option<String>,
     #[serde(default)]
@@ -382,6 +388,8 @@ pub struct RetractClaimResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_public_key_hex: Option<String>,
     pub retracted_by: String,
+    #[serde(default)]
+    pub secret_erased: bool,
     pub was_idempotent_noop: bool,
     pub created_at: DateTime<Utc>,
 }

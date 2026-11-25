@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
 use acta_crypto::{
-    compute_bundle_hash, compute_dependency_commitment, compute_state_commitment,
-    compute_sub_commitment,
+    compute_bundle_hash, compute_dependency_commitment_for_schema, compute_state_commitment,
+    compute_sub_commitment_for_schema,
 };
 use acta_policy::{PolicyAction, PolicyGate};
 use acta_store::evidence_repo::BundleWritePayload;
@@ -12,7 +12,7 @@ use acta_types::{
     ActaError, ActaResult, ClaimStatus, CompileRequest, CompileResponse, ContextBudget,
     ContextBundle, DisputeReasonCode, KnowledgeClaim, OmissionReason, OverrideAttestation,
     PolicyDecision, PolicyResultTag, RankedMemory, RefusalMetadata, ResolverManifest, StoredObject,
-    DEFAULT_CORROBORATION_DAMPING, SCHEMA_VERSION,
+    CURRENT_RESOLVER_VERSION, DEFAULT_CORROBORATION_DAMPING, SCHEMA_VERSION, SCHEMA_VERSION_V1,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
@@ -104,13 +104,15 @@ impl Default for PipelineConfig {
 }
 
 /// Compatibility flags for reproducing historical `source_bundle_hash` baselines bit-for-bit (`seq 1..head`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationCompat {
     pub include_resolver_manifest: bool,
     pub legacy_pre_v166_disputes: bool,
     pub include_resolved_facts_omitted: bool,
     pub legacy_pre_v171_resolver: bool,
     pub legacy_v171_bidirectional_contradiction: bool,
+    pub legacy_v1_state_schema: bool,
+    pub recorded_resolver_version: Option<String>,
 }
 
 impl Default for SimulationCompat {
@@ -121,6 +123,8 @@ impl Default for SimulationCompat {
             include_resolved_facts_omitted: true,
             legacy_pre_v171_resolver: false,
             legacy_v171_bidirectional_contradiction: false,
+            legacy_v1_state_schema: false,
+            recorded_resolver_version: Some(CURRENT_RESOLVER_VERSION.to_string()),
         }
     }
 }
@@ -131,8 +135,10 @@ impl SimulationCompat {
             "legacy_pre_v171"
         } else if self.legacy_v171_bidirectional_contradiction {
             "legacy_v171"
-        } else {
+        } else if self.legacy_v1_state_schema {
             "v172_current"
+        } else {
+            "v173_current"
         }
     }
 }
@@ -208,6 +214,7 @@ pub struct CompilePipeline<S: CompileStore> {
     policy_gate: Arc<PolicyGate>,
     store: S,
     host_signing_key: Arc<SigningKey>,
+    tenant_signing_keys: Arc<RwLock<HashMap<String, Arc<SigningKey>>>>,
     config: PipelineConfig,
 }
 
@@ -217,6 +224,7 @@ impl<S: CompileStore + Clone> Clone for CompilePipeline<S> {
             policy_gate: self.policy_gate.clone(),
             store: self.store.clone(),
             host_signing_key: self.host_signing_key.clone(),
+            tenant_signing_keys: self.tenant_signing_keys.clone(),
             config: self.config.clone(),
         }
     }
@@ -233,8 +241,26 @@ impl<S: CompileStore> CompilePipeline<S> {
             policy_gate,
             store,
             host_signing_key,
+            tenant_signing_keys: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
+    }
+
+    pub fn with_tenant_key_map(
+        mut self,
+        tenant_signing_keys: Arc<RwLock<HashMap<String, Arc<SigningKey>>>>,
+    ) -> Self {
+        self.tenant_signing_keys = tenant_signing_keys;
+        self
+    }
+
+    pub fn signing_key_for_tenant(&self, tenant_id: &str) -> Arc<SigningKey> {
+        if let Ok(guard) = self.tenant_signing_keys.read() {
+            if let Some(sk) = guard.get(tenant_id) {
+                return sk.clone();
+            }
+        }
+        self.host_signing_key.clone()
     }
 
     pub fn store(&self) -> &S {
@@ -288,6 +314,8 @@ impl<S: CompileStore> CompilePipeline<S> {
                 include_resolved_facts_omitted: true,
                 legacy_pre_v171_resolver: false,
                 legacy_v171_bidirectional_contradiction: false,
+                legacy_v1_state_schema: false,
+                recorded_resolver_version: Some(CURRENT_RESOLVER_VERSION.to_string()),
             },
         )
         .await
@@ -457,12 +485,19 @@ impl<S: CompileStore> CompilePipeline<S> {
             compat.include_resolved_facts_omitted,
         )?;
 
-        let intent_root = compute_sub_commitment(&object_scan.active_intent_hashes);
-        let memory_root = compute_sub_commitment(&object_scan.active_memory_hashes);
-        let knowledge_root = compute_sub_commitment(&active_claim_hashes);
+        let target_schema = if compat.legacy_v1_state_schema {
+            SCHEMA_VERSION_V1
+        } else {
+            SCHEMA_VERSION
+        };
+        let intent_root =
+            compute_sub_commitment_for_schema(target_schema, &object_scan.active_intent_hashes);
+        let memory_root =
+            compute_sub_commitment_for_schema(target_schema, &object_scan.active_memory_hashes);
+        let knowledge_root = compute_sub_commitment_for_schema(target_schema, &active_claim_hashes);
 
         let state_commitment = compute_state_commitment(
-            SCHEMA_VERSION,
+            target_schema,
             &req.tenant_id,
             &req.scope,
             &intent_root,
@@ -470,22 +505,24 @@ impl<S: CompileStore> CompilePipeline<S> {
             &memory_root,
             &permission_root,
         );
-        let dependency_commitment = compute_dependency_commitment(&evaluated_hashes);
+        let dependency_commitment =
+            compute_dependency_commitment_for_schema(target_schema, &evaluated_hashes);
 
         let resolver_manifest = if compat.include_resolver_manifest {
-            Some(ResolverManifest::new(
+            Some(ResolverManifest::new_with_version(
                 resolver_cfg.min_confidence,
                 resolver_cfg.decisiveness_threshold,
                 DEFAULT_CORROBORATION_DAMPING,
                 req.budget,
                 permission_root,
+                compat.recorded_resolver_version,
             ))
         } else {
             None
         };
 
         let bundle = ContextBundle {
-            schema_version: SCHEMA_VERSION.to_string(),
+            schema_version: target_schema.to_string(),
             tenant_id: req.tenant_id.clone(),
             task_id: req.task_id.clone(),
             scope: req.scope.clone(),
@@ -549,10 +586,11 @@ impl<S: CompileStore> CompilePipeline<S> {
                     signing_domain: None,
                     expected_intent_digest_hex: None,
                 };
+                let active_sk = self.signing_key_for_tenant(&req.tenant_id);
                 let evidence = self
                     .store
                     .append_refusal_metadata(
-                        &self.host_signing_key,
+                        &active_sk,
                         &req.tenant_id,
                         PolicyResultTag::Block,
                         meta,
@@ -585,10 +623,11 @@ impl<S: CompileStore> CompilePipeline<S> {
                     signing_domain: None,
                     expected_intent_digest_hex: None,
                 };
+                let active_sk = self.signing_key_for_tenant(&req.tenant_id);
                 let evidence = self
                     .store
                     .append_refusal_metadata(
-                        &self.host_signing_key,
+                        &active_sk,
                         &req.tenant_id,
                         PolicyResultTag::Escalate,
                         meta,
@@ -708,9 +747,12 @@ impl<S: CompileStore> CompilePipeline<S> {
         // =====================================================================
         // Stage 3: Cryptographic State & Dependency Commitments
         // =====================================================================
-        let intent_root = compute_sub_commitment(&object_scan.active_intent_hashes);
-        let memory_root = compute_sub_commitment(&object_scan.active_memory_hashes);
-        let knowledge_root = compute_sub_commitment(&active_claim_hashes);
+        let intent_root =
+            compute_sub_commitment_for_schema(SCHEMA_VERSION, &object_scan.active_intent_hashes);
+        let memory_root =
+            compute_sub_commitment_for_schema(SCHEMA_VERSION, &object_scan.active_memory_hashes);
+        let knowledge_root =
+            compute_sub_commitment_for_schema(SCHEMA_VERSION, &active_claim_hashes);
 
         let state_commitment = compute_state_commitment(
             SCHEMA_VERSION,
@@ -721,7 +763,8 @@ impl<S: CompileStore> CompilePipeline<S> {
             &memory_root,
             &permission_root,
         );
-        let dependency_commitment = compute_dependency_commitment(&evaluated_hashes);
+        let dependency_commitment =
+            compute_dependency_commitment_for_schema(SCHEMA_VERSION, &evaluated_hashes);
 
         // =====================================================================
         // Stage 4: Deterministic Claim Resolution (+ Signed Overrides)
@@ -762,10 +805,11 @@ impl<S: CompileStore> CompilePipeline<S> {
                     signing_domain: None,
                     expected_intent_digest_hex: None,
                 };
+                let active_sk = self.signing_key_for_tenant(&req.tenant_id);
                 let ev = self
                     .store
                     .append_refusal_metadata(
-                        &self.host_signing_key,
+                        &active_sk,
                         &req.tenant_id,
                         PolicyResultTag::Block,
                         meta,
@@ -819,10 +863,11 @@ impl<S: CompileStore> CompilePipeline<S> {
             bundle_canonical: &bundle_canonical,
         };
 
+        let active_sk = self.signing_key_for_tenant(&req.tenant_id);
         let evidence = self
             .store
             .append_evidence(
-                &self.host_signing_key,
+                &active_sk,
                 &req.tenant_id,
                 PolicyResultTag::Allow,
                 Some(write_payload),
@@ -967,6 +1012,7 @@ mod tests {
                     answer_cache_summary: None,
                     witness_reg_summary: None,
                     witness_revoke_summary: None,
+                    host_key_rotation_summary: None,
                     host_signature,
                     created_at,
                 };
@@ -1021,6 +1067,7 @@ mod tests {
                     answer_cache_summary: None,
                     witness_reg_summary: None,
                     witness_revoke_summary: None,
+                    host_key_rotation_summary: None,
                     host_signature,
                     created_at,
                 };
