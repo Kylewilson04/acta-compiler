@@ -8,14 +8,38 @@ use acta_crypto::{
 };
 use acta_engine::{CompilePipeline, PipelineConfig};
 use acta_policy::PolicyGate;
-use acta_store::{evidence_repo, PgActaStore};
+use acta_store::{
+    evidence_repo,
+    signups_repo::{self, EmailSignupRecord},
+    PgActaStore,
+};
 use acta_types::{EvidenceEntry, PolicyResultTag, RefusalMetadata};
 use axum::http::HeaderMap;
 use chrono::{SubsecRound, Utc};
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 
-use crate::config::OAuthServerConfig;
+use crate::config::{EmailOtpConfig, OAuthServerConfig};
+
+pub const MAX_OTP_VERIFY_ATTEMPTS: u8 = 5;
+pub const OTP_SEND_WINDOW_SECS: i64 = 600;
+pub const MAX_OTP_SENDS_PER_EMAIL: usize = 4;
+pub const MAX_OTP_SENDS_PER_IP: usize = 12;
+
+#[derive(Debug, Clone)]
+pub struct OtpTicketState {
+    pub failed_attempts: u8,
+    pub redeemed: bool,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpVerifyOutcome {
+    Verified,
+    InvalidCode { remaining_attempts: u8 },
+    LockedOut,
+    AlreadyRedeemed,
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -101,8 +125,12 @@ pub struct AppState {
     pub fallback_token_secret: String,
     pub public_sandbox_prefix: String,
     pub oauth: OAuthServerConfig,
+    pub email_otp: EmailOtpConfig,
     pub http_client: reqwest::Client,
     pub used_auth_codes: Arc<Mutex<HashMap<[u8; 32], i64>>>,
+    pub otp_tickets: Arc<Mutex<HashMap<[u8; 32], OtpTicketState>>>,
+    pub otp_send_windows: Arc<Mutex<HashMap<String, Vec<i64>>>>,
+    pub verified_signups_mem: Arc<Mutex<HashMap<String, EmailSignupRecord>>>,
 }
 
 impl AppState {
@@ -151,8 +179,12 @@ impl AppState {
             fallback_token_secret,
             public_sandbox_prefix: "sandbox".to_string(),
             oauth: OAuthServerConfig::default(),
+            email_otp: EmailOtpConfig::default(),
             http_client,
             used_auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            otp_tickets: Arc::new(Mutex::new(HashMap::new())),
+            otp_send_windows: Arc::new(Mutex::new(HashMap::new())),
+            verified_signups_mem: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -164,6 +196,11 @@ impl AppState {
 
     pub fn with_oauth(mut self, oauth: OAuthServerConfig) -> Self {
         self.oauth = oauth;
+        self
+    }
+
+    pub fn with_email_otp(mut self, email_otp: EmailOtpConfig) -> Self {
+        self.email_otp = email_otp;
         self
     }
 
@@ -240,6 +277,238 @@ impl AppState {
         }
         guard.insert(digest, expires_at);
         true
+    }
+
+    pub fn check_otp_send_rate_limit(
+        &self,
+        canonical_email: &str,
+        client_ip: Option<&str>,
+        now_ts: i64,
+    ) -> Result<(), String> {
+        let Ok(mut guard) = self.otp_send_windows.lock() else {
+            return Err("internal rate-limiter lock poisoned".to_string());
+        };
+        let cutoff = now_ts - OTP_SEND_WINDOW_SECS;
+        guard.retain(|_, ts_list| {
+            ts_list.retain(|&t| t >= cutoff);
+            !ts_list.is_empty()
+        });
+
+        let email_key = format!("email:{canonical_email}");
+        if guard
+            .get(&email_key)
+            .map(|v| v.len() >= MAX_OTP_SENDS_PER_EMAIL)
+            .unwrap_or(false)
+        {
+            return Err(
+                "Too many verification codes sent to this email address. Please wait 10 minutes or use your most recent code."
+                    .to_string(),
+            );
+        }
+
+        if let Some(ip) = client_ip.filter(|s| !s.is_empty()) {
+            let ip_key = format!("ip:{ip}");
+            if guard
+                .get(&ip_key)
+                .map(|v| v.len() >= MAX_OTP_SENDS_PER_IP)
+                .unwrap_or(false)
+            {
+                return Err(
+                    "Too many verification requests from this network address. Please wait 10 minutes."
+                        .to_string(),
+                );
+            }
+            guard.entry(ip_key).or_default().push(now_ts);
+        }
+
+        guard.entry(email_key).or_default().push(now_ts);
+        Ok(())
+    }
+
+    pub fn verify_and_consume_otp_attempt(
+        &self,
+        otp_nonce: &str,
+        expires_at: i64,
+        now_ts: i64,
+        code_matched: bool,
+    ) -> OtpVerifyOutcome {
+        let digest = hash_length_delimited(&[b"acta:otp_ticket_nonce:v1", otp_nonce.as_bytes()]);
+        let Ok(mut guard) = self.otp_tickets.lock() else {
+            return OtpVerifyOutcome::LockedOut;
+        };
+        guard.retain(|_, st| st.expires_at >= now_ts);
+
+        let entry = guard.entry(digest).or_insert(OtpTicketState {
+            failed_attempts: 0,
+            redeemed: false,
+            expires_at,
+        });
+
+        if entry.redeemed {
+            return OtpVerifyOutcome::AlreadyRedeemed;
+        }
+        if entry.failed_attempts >= MAX_OTP_VERIFY_ATTEMPTS {
+            return OtpVerifyOutcome::LockedOut;
+        }
+
+        if code_matched {
+            entry.redeemed = true;
+            OtpVerifyOutcome::Verified
+        } else {
+            entry.failed_attempts = entry.failed_attempts.saturating_add(1);
+            if entry.failed_attempts >= MAX_OTP_VERIFY_ATTEMPTS {
+                OtpVerifyOutcome::LockedOut
+            } else {
+                OtpVerifyOutcome::InvalidCode {
+                    remaining_attempts: MAX_OTP_VERIFY_ATTEMPTS - entry.failed_attempts,
+                }
+            }
+        }
+    }
+
+    /// Persists a verified email signup in PostgreSQL `email_signups` (or falls back cleanly to
+    /// in-memory state when `pool` is lazy/offline in unit tests).
+    pub async fn record_verified_signup(
+        &self,
+        email: &str,
+        tenant_id: &str,
+        principal: &str,
+        signup_flow: &str,
+        client_name: &str,
+        marketing_opt_in: bool,
+    ) -> EmailSignupRecord {
+        if let Ok(Ok(rec)) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            signups_repo::upsert_verified_signup(
+                &self.pool,
+                email,
+                tenant_id,
+                principal,
+                signup_flow,
+                client_name,
+                marketing_opt_in,
+            ),
+        )
+        .await
+        {
+            return rec;
+        }
+
+        let now = Utc::now().trunc_subsecs(6);
+        let mut guard = self
+            .verified_signups_mem
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(email.to_string())
+            .and_modify(|existing| {
+                existing.verification_count += 1;
+                existing.last_verified_at = now;
+                if existing.unsubscribed_at.is_some() {
+                    existing.marketing_opt_in = false;
+                } else {
+                    existing.marketing_opt_in = existing.marketing_opt_in && marketing_opt_in;
+                }
+            })
+            .or_insert_with(|| EmailSignupRecord {
+                email: email.to_string(),
+                tenant_id: tenant_id.to_string(),
+                principal: principal.to_string(),
+                first_signup_flow: signup_flow.to_string(),
+                first_client_name: client_name.to_string(),
+                marketing_opt_in,
+                resend_contact_id: None,
+                welcome_sent_at: None,
+                unsubscribed_at: None,
+                verification_count: 1,
+                created_at: now,
+                last_verified_at: now,
+            });
+        entry.clone()
+    }
+
+    pub async fn record_signup_delivery_meta(
+        &self,
+        email: &str,
+        resend_contact_id: Option<&str>,
+        mark_welcome_sent: bool,
+    ) {
+        if let Ok(Ok(())) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            signups_repo::record_signup_delivery_meta(
+                &self.pool,
+                email,
+                resend_contact_id,
+                mark_welcome_sent,
+            ),
+        )
+        .await
+        {
+            return;
+        }
+
+        let now = Utc::now().trunc_subsecs(6);
+        if let Ok(mut guard) = self.verified_signups_mem.lock() {
+            if let Some(rec) = guard.get_mut(email) {
+                if let Some(cid) = resend_contact_id {
+                    rec.resend_contact_id = Some(cid.to_string());
+                }
+                if mark_welcome_sent && rec.welcome_sent_at.is_none() {
+                    rec.welcome_sent_at = Some(now);
+                }
+            }
+        }
+    }
+
+    pub async fn unsubscribe_signup_email(&self, email: &str) -> bool {
+        if let Ok(Ok(updated)) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            signups_repo::mark_email_unsubscribed(&self.pool, email),
+        )
+        .await
+        {
+            return updated;
+        }
+
+        let now = Utc::now().trunc_subsecs(6);
+        if let Ok(mut guard) = self.verified_signups_mem.lock() {
+            if let Some(rec) = guard.get_mut(email) {
+                rec.marketing_opt_in = false;
+                if rec.unsubscribed_at.is_none() {
+                    rec.unsubscribed_at = Some(now);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn list_verified_signups(
+        &self,
+        marketing_only: bool,
+        limit: i64,
+    ) -> Vec<EmailSignupRecord> {
+        if let Ok(Ok(rows)) = tokio::time::timeout(
+            Duration::from_millis(2500),
+            signups_repo::list_email_signups(&self.pool, marketing_only, limit),
+        )
+        .await
+        {
+            return rows;
+        }
+
+        let bounded = limit.clamp(1, 10_000) as usize;
+        let Ok(guard) = self.verified_signups_mem.lock() else {
+            return Vec::new();
+        };
+        let mut items: Vec<EmailSignupRecord> = guard
+            .values()
+            .filter(|r| !marketing_only || (r.marketing_opt_in && r.unsubscribed_at.is_none()))
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        items.truncate(bounded);
+        items
     }
 
     pub fn inspect_caller_auth(&self, headers: &HeaderMap) -> Result<VerifiedKeyInfo, String> {

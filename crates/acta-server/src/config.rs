@@ -37,6 +37,64 @@ impl OAuthServerConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct EmailOtpConfig {
+    pub resend_api_key: Option<String>,
+    pub resend_api_url: String,
+    pub resend_contacts_api_url: Option<String>,
+    pub resend_segment_id: Option<String>,
+    pub sync_resend_contacts: bool,
+    pub email_from: String,
+    pub welcome_email_enabled: bool,
+    pub welcome_email_subject: String,
+    pub signup_webhook_url: Option<String>,
+    pub signup_webhook_bearer: Option<String>,
+    pub webhook_url: Option<String>,
+    pub webhook_bearer: Option<String>,
+    pub allowed_org_domains: Vec<String>,
+}
+
+impl Default for EmailOtpConfig {
+    fn default() -> Self {
+        Self {
+            resend_api_key: None,
+            resend_api_url: "https://api.resend.com/emails".to_string(),
+            resend_contacts_api_url: None,
+            resend_segment_id: None,
+            sync_resend_contacts: true,
+            email_from: "Acta Compiler <onboarding@resend.dev>".to_string(),
+            welcome_email_enabled: true,
+            welcome_email_subject:
+                "Welcome to Acta Compiler — Your Isolated Cryptographic Vault Is Ready".to_string(),
+            signup_webhook_url: None,
+            signup_webhook_bearer: None,
+            webhook_url: None,
+            webhook_bearer: None,
+            allowed_org_domains: Vec::new(),
+        }
+    }
+}
+
+impl EmailOtpConfig {
+    pub fn enabled(&self) -> bool {
+        self.resend_api_key.is_some() || self.webhook_url.is_some()
+    }
+
+    pub fn effective_resend_contacts_url(&self) -> String {
+        if let Some(ref explicit) = self.resend_contacts_api_url {
+            let trimmed = explicit.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let emails_trimmed = self.resend_api_url.trim().trim_end_matches('/');
+        if let Some(base) = emails_trimmed.strip_suffix("/emails") {
+            return format!("{base}/contacts");
+        }
+        "https://api.resend.com/contacts".to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub database_url: String,
     pub host_signing_key: SigningKey,
@@ -47,6 +105,7 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub public_sandbox_prefix: String,
     pub oauth: OAuthServerConfig,
+    pub email_otp: EmailOtpConfig,
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -54,6 +113,17 @@ fn non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn bool_env_default(name: &str, default_val: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            _ => default_val,
+        })
+        .unwrap_or(default_val)
 }
 
 impl ServerConfig {
@@ -120,10 +190,7 @@ impl ServerConfig {
         let public_sandbox_prefix = std::env::var("ACTA_PUBLIC_SANDBOX_PREFIX")
             .unwrap_or_else(|_| "sandbox".to_string());
 
-        let auto_select_single_org = std::env::var("ACTA_OAUTH_AUTO_SELECT_SINGLE_ORG")
-            .ok()
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
+        let auto_select_single_org = bool_env_default("ACTA_OAUTH_AUTO_SELECT_SINGLE_ORG", true);
 
         let oauth = OAuthServerConfig {
             public_base_url: non_empty_env("ACTA_PUBLIC_BASE_URL")
@@ -138,6 +205,37 @@ impl ServerConfig {
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.github.com".to_string()),
             auto_select_single_org,
+        };
+
+        let allowed_org_domains = non_empty_env("ACTA_EMAIL_ORG_DOMAINS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let email_otp = EmailOtpConfig {
+            resend_api_key: non_empty_env("ACTA_RESEND_API_KEY")
+                .or_else(|| non_empty_env("RESEND_API_KEY")),
+            resend_api_url: non_empty_env("ACTA_RESEND_API_URL")
+                .unwrap_or_else(|| "https://api.resend.com/emails".to_string()),
+            resend_contacts_api_url: non_empty_env("ACTA_RESEND_CONTACTS_API_URL"),
+            resend_segment_id: non_empty_env("ACTA_RESEND_SEGMENT_ID"),
+            sync_resend_contacts: bool_env_default("ACTA_RESEND_SYNC_CONTACTS", true),
+            email_from: non_empty_env("ACTA_EMAIL_FROM")
+                .unwrap_or_else(|| "Acta Compiler <onboarding@resend.dev>".to_string()),
+            welcome_email_enabled: bool_env_default("ACTA_WELCOME_EMAIL_ENABLED", true),
+            welcome_email_subject: non_empty_env("ACTA_WELCOME_EMAIL_SUBJECT").unwrap_or_else(
+                || "Welcome to Acta Compiler — Your Isolated Cryptographic Vault Is Ready"
+                    .to_string(),
+            ),
+            signup_webhook_url: non_empty_env("ACTA_SIGNUP_WEBHOOK_URL"),
+            signup_webhook_bearer: non_empty_env("ACTA_SIGNUP_WEBHOOK_BEARER"),
+            webhook_url: non_empty_env("ACTA_EMAIL_WEBHOOK_URL"),
+            webhook_bearer: non_empty_env("ACTA_EMAIL_WEBHOOK_BEARER"),
+            allowed_org_domains,
         };
 
         Ok(Self {
@@ -158,6 +256,7 @@ impl ServerConfig {
             api_key,
             public_sandbox_prefix,
             oauth,
+            email_otp,
         })
     }
 }

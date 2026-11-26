@@ -183,6 +183,11 @@ impl IntoResponse for ApiError {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(ui::handle_index_ui))
+        .route("/signup", get(oauth::handle_signup_page))
+        .route("/signup/send", post(oauth::handle_signup_email_send))
+        .route("/signup/verify", post(oauth::handle_signup_email_verify))
+        .route("/signup/unsubscribe", get(oauth::handle_signup_unsubscribe).post(oauth::handle_signup_unsubscribe))
+        .route("/v1/admin/signups", get(oauth::handle_admin_list_signups))
         .route("/health", get(compile::handle_health))
         .route("/v1/health", get(compile::handle_health))
         .route("/healthz", get(compile::handle_health))
@@ -207,6 +212,8 @@ pub fn build_router(state: AppState) -> Router {
             post(oauth::handle_register_client).options(oauth::handle_oauth_preflight),
         )
         .route("/oauth/authorize", get(oauth::handle_authorize))
+        .route("/oauth/email/send", post(oauth::handle_oauth_email_send))
+        .route("/oauth/email/verify", post(oauth::handle_oauth_email_verify))
         .route(
             "/oauth/github/callback",
             get(oauth::handle_github_callback),
