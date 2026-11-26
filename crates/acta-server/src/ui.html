@@ -300,6 +300,8 @@
       <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
       Sign in with GitHub
     </button>
+    <button class="btn-sm" style="border-color:var(--cyan);color:var(--cyan);font-weight:600;" onclick="startEmailSignIn()">Email 6-Digit Code</button>
+    <a href="/signup" class="btn-sm" style="text-decoration:none;">Get Access Key</a>
   </div>
 
   <div class="auth-bar" id="auth-signed-in" style="display:none;">
@@ -685,7 +687,15 @@ function base64UrlEncode(bytes) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+async function startEmailSignIn() {
+  return startOAuthSignInFlow(null);
+}
+
 async function startGitHubSignIn() {
+  return startOAuthSignInFlow('github');
+}
+
+async function startOAuthSignInFlow(provider) {
   const rand = new Uint8Array(32);
   crypto.getRandomValues(rand);
   const verifier = base64UrlEncode(rand);
@@ -708,9 +718,9 @@ async function startGitHubSignIn() {
     code_challenge: challenge,
     code_challenge_method: 'S256',
     state: state,
-    scope: 'mcp:tools acta:ui',
-    provider: 'github'
+    scope: 'mcp:tools acta:ui'
   });
+  if (provider) params.set('provider', provider);
   window.location.href = '/oauth/authorize?' + params.toString();
 }
 
@@ -801,11 +811,11 @@ function renderAuthHeader() {
   outBar.style.display = 'none';
   inBar.style.display = 'flex';
   banner.style.display = 'none';
-  document.getElementById('gh-user-badge').textContent = 'GITHUB · @' + uiSession.githubLogin;
+  document.getElementById('gh-user-badge').textContent = uiSession.githubLogin.startsWith('em.') ? ('EMAIL · ' + uiSession.githubLogin) : ('GITHUB · @' + uiSession.githubLogin);
 
   const sel = document.getElementById('vault-selector');
   const opts = uiSession.vaults.map(v => {
-    const tag = v.kind === 'github_org' ? 'ORG' : 'PERSONAL';
+    const tag = (v.kind === 'github_org' || v.kind === 'email_org') ? 'ORG' : 'PERSONAL';
     return '<option value="' + escHtml(v.tenant_id) + '">' + escHtml(v.tenant_id + ' (' + tag + ')') + '</option>';
   });
   opts.push('<option value="sandbox-live">sandbox-live (PUBLIC DEMO)</option>');

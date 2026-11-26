@@ -28,10 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let github_oauth_enabled = cfg.oauth.github_enabled();
+    let email_otp_enabled = cfg.email_otp.enabled();
     let host_signing_key = Arc::new(cfg.host_signing_key);
     let state = AppState::new(pool, policy_gate, host_signing_key, cfg.pipeline)
         .with_auth(cfg.api_key, cfg.public_sandbox_prefix)
-        .with_oauth(cfg.oauth);
+        .with_oauth(cfg.oauth)
+        .with_email_otp(cfg.email_otp);
     let pubkey_hex = hex::encode(state.host_public_key);
 
     let app = build_router(state);
@@ -40,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr = %cfg.bind_addr,
         host_public_key = %pubkey_hex,
         github_oauth_enabled = github_oauth_enabled,
+        email_otp_enabled = email_otp_enabled,
         "acta-server v1.7.3 Epistemic Notary, PPA 1 Claim 25 Dependency Cache & Offline State-Rebuild gateway listening"
     );
 

@@ -5,6 +5,7 @@ pub mod impact_repo;
 pub mod objects_repo;
 pub mod overrides_repo;
 pub mod pool;
+pub mod signups_repo;
 
 use std::collections::BTreeMap;
 use std::future::Future;
